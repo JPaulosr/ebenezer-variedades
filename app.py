@@ -12,14 +12,33 @@ SHEET_ID = st.text_input(
 )
 
 ABAS = {
-    "Produtos": ["SKU","EAN","Nome","Categoria","Unidade","Fornecedor","CustoAtual","PreçoVenda","Markup %","Margem %","EstoqueAtual","EstoqueMin","LeadTimeDias","Ativo?"],
-    "Compras": ["Data","NF/Ref","Fornecedor","SKU","Qtd","CustoUnit","FreteRateado","OutrosCustos","Obs"],
-    "Vendas": ["Data","Documento","SKU","Qtd","PreçoUnit","Canal","Pagamento","Taxa %","Desconto R$","Cliente/Obs"],
-    "MovimentosEstoque": ["Data","SKU","Tipo","Qtd","Documento/NF","Origem","Obs","SaldoApós"],
-    "Ajustes": ["Data","SKU","Qtd","Motivo","Responsável","Obs"],
-    "Fornecedores": ["Nome","CNPJ/CPF","Contato","Telefone","Email","PrazoDias","Observações"],
-    "Config": ["Parametro","Valor"],
+    "Produtos": [
+        "ID", "Nome", "Categoria", "Unidade", "Fornecedor",
+        "CustoAtual", "PreçoVenda", "Markup %", "Margem %",
+        "EstoqueAtual", "EstoqueMin", "LeadTimeDias", "Ativo?"
+    ],
+    "Compras": [
+        "Data","NF/Ref","Fornecedor","ID","Qtd","CustoUnit",
+        "FreteRateado","OutrosCustos","Obs"
+    ],
+    "Vendas": [
+        "Data","Documento","ID","Qtd","PreçoUnit","Canal",
+        "Pagamento","Taxa %","Desconto R$","Cliente/Obs"
+    ],
+    "MovimentosEstoque": [
+        "Data","ID","Tipo","Qtd","Documento/NF","Origem","Obs","SaldoApós"
+    ],
+    "Ajustes": [
+        "Data","ID","Qtd","Motivo","Responsável","Obs"
+    ],
+    "Fornecedores": [
+        "Nome","CNPJ/CPF","Contato","Telefone","Email","PrazoDias","Observações"
+    ],
+    "Config": [
+        "Parametro","Valor"
+    ],
 }
+
 CONFIG_INICIAIS = [("taxa_cartao_padrao_pct","0.023"),("margem_alvo_padrao_pct","0.35"),("canal_padrao","balcao")]
 
 def conectar_sheets(sheet_id: str):
