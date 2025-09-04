@@ -1,28 +1,81 @@
-# app.py
+# === EMERGÊNCIA: Criar abas/colunas direto no app.py ===
 import streamlit as st
-from pathlib import Path
+import gspread
+from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Ebenezér Variedades", page_icon="🛒", layout="wide")
-st.title("🛒 Ebenezér Variedades")
+st.subheader("⚙️ Setup rápido da planilha (emergencial)")
 
-st.write("Bem-vindo! Use a navegação da **barra lateral** (Sidebar).")
-st.write("Procure pela página **`00_setup_planilha`** para criar/verificar as abas.")
+SHEET_ID = st.text_input(
+    "Google Sheet ID",
+    value=st.secrets.get("SHEET_ID", ""),
+    help="Cole apenas o ID (trecho entre /d/ e /edit)."
+)
 
-# Verificação amigável da estrutura
-pages_dir = Path(__file__).parent / "pages"
-setup_page = pages_dir / "00_setup_planilha.py"
+ABAS = {
+    "Produtos": ["SKU","EAN","Nome","Categoria","Unidade","Fornecedor","CustoAtual","PreçoVenda","Markup %","Margem %","EstoqueAtual","EstoqueMin","LeadTimeDias","Ativo?"],
+    "Compras": ["Data","NF/Ref","Fornecedor","SKU","Qtd","CustoUnit","FreteRateado","OutrosCustos","Obs"],
+    "Vendas": ["Data","Documento","SKU","Qtd","PreçoUnit","Canal","Pagamento","Taxa %","Desconto R$","Cliente/Obs"],
+    "MovimentosEstoque": ["Data","SKU","Tipo","Qtd","Documento/NF","Origem","Obs","SaldoApós"],
+    "Ajustes": ["Data","SKU","Qtd","Motivo","Responsável","Obs"],
+    "Fornecedores": ["Nome","CNPJ/CPF","Contato","Telefone","Email","PrazoDias","Observações"],
+    "Config": ["Parametro","Valor"],
+}
+CONFIG_INICIAIS = [("taxa_cartao_padrao_pct","0.023"),("margem_alvo_padrao_pct","0.35"),("canal_padrao","balcao")]
 
-if setup_page.exists():
-    st.success("Página encontrada: `pages/00_setup_planilha.py`")
+def conectar_sheets(sheet_id: str):
+    info = st.secrets.get("GCP_SERVICE_ACCOUNT", None)
+    if not info:
+        st.error("🚫 Falta st.secrets['GCP_SERVICE_ACCOUNT'].")
+        st.stop()
+    scopes = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open_by_key(sheet_id)
 
-    # Botão opcional para tentar abrir diretamente (se sua versão do Streamlit suportar)
-    if st.button("➡️ Abrir 'Setup da Planilha'", use_container_width=True):
+def obter_aba(sh, nome):
+    try: return sh.worksheet(nome)
+    except gspread.WorksheetNotFound: return None
+
+def criar_aba(sh, nome, cols):
+    ws = sh.add_worksheet(title=nome, rows=1000, cols=max(len(cols)+3, 8))
+    ws.update("A1", [cols])
+    return ws
+
+def garantir_cabecalhos(ws, cols):
+    vals = ws.get_all_values()
+    if not vals or not vals[0] or all(c.strip()=="" for c in vals[0]) or len(vals[0]) < len(cols):
+        ws.update("A1", [cols])
+        return True
+    return False
+
+def garantir_config_inicial(ws):
+    vals = ws.get_all_values()
+    existentes = {linha[0] for linha in vals[1:] if linha and len(linha)>=1}
+    novas = [[k,v] for k,v in CONFIG_INICIAIS if k not in existentes]
+    if novas: ws.append_rows(novas)
+
+if st.button("🚀 Criar / Verificar Estrutura AGORA", use_container_width=True):
+    if not SHEET_ID:
+        st.error("Cole o Google Sheet ID.")
+    else:
         try:
-            # Nem todas as versões têm switch_page; por isso o try/except
-            st.switch_page("pages/00_setup_planilha.py")
-        except Exception:
-            st.info("Se o botão não abrir, use a barra lateral (Sidebar) para navegar.")
-else:
-    st.error("Não encontrei `pages/00_setup_planilha.py`.")
-    st.caption("Crie a pasta `pages/` na RAIZ do projeto e salve lá o arquivo `00_setup_planilha.py`.")
-    st.code("mkdir -p pages  # depois salve o arquivo dentro desta pasta", language="bash")
+            sh = conectar_sheets(SHEET_ID)
+            criadas, atualizadas, ok = [], [], []
+            for nome, cols in ABAS.items():
+                ws = obter_aba(sh, nome)
+                if ws is None:
+                    criar_aba(sh, nome, cols)
+                    criadas.append(nome)
+                else:
+                    if garantir_cabecalhos(ws, cols): atualizadas.append(nome)
+                    else: ok.append(nome)
+                if nome == "Config":
+                    garantir_config_inicial(obter_aba(sh, "Config"))
+            st.success("✅ Estrutura pronta!")
+            if criadas: st.write("🆕 Criadas:", ", ".join(criadas))
+            if atualizadas: st.write("🔁 Cabeçalhos atualizados:", ", ".join(atualizadas))
+            if ok: st.write("👌 Já estavam corretas:", ", ".join(ok))
+            st.info(f"Abra a planilha: https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
+        except Exception as e:
+            st.error(f"❌ Erro: {e}")
+# === FIM DO BLOCO EMERGENCIAL ===
