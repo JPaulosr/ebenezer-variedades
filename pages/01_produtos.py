@@ -1,6 +1,6 @@
 # pages/01_produtos.py
 # -*- coding: utf-8 -*-
-import re, math, time
+import re, json, math, time
 import pandas as pd
 import streamlit as st
 import gspread
@@ -20,35 +20,59 @@ COLS_PRODUTOS = [
 ]
 
 # =========================
-# HELPERS: SHEET ID
+# HELPERS: SHEET ID (aceita ID ou URL)
 # =========================
-def _extract_sheet_id(url: str) -> str:
-    if not url:
+def _extract_sheet_id(url_or_id: str) -> str:
+    if not url_or_id:
         return ""
-    m = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
-    return m.group(1) if m else ""
+    m = re.search(r"/d/([A-Za-z0-9\-_]+)", url_or_id)
+    return (m.group(1) if m else url_or_id).strip()
 
-def get_sheet_id_from_secrets_or_input(prompt_label="Google Sheet ID"):
-    sid = st.secrets.get("SHEET_ID", "").strip()
-    if not sid:
-        url = st.secrets.get("PLANILHA_URL", "").strip()
-        if url:
-            sid = _extract_sheet_id(url)
-    sid = st.text_input(
-        prompt_label, value=sid,
-        help="Cole apenas o ID (trecho entre /d/ e /edit). Se já existir em SHEET_ID/PLANILHA_URL, deixo preenchido."
-    )
-    return sid.strip()
+def get_sheet_id_from_secrets_or_input():
+    raw = st.secrets.get("SHEET_ID", "") or st.secrets.get("PLANILHA_URL", "")
+    raw = st.text_input("Google Sheet ID ou URL da planilha", value=raw).strip()
+    sid = _extract_sheet_id(raw)
+    return sid
 
 # =========================
-# CONEXÃO GOOGLE SHEETS
+# CONEXÃO GOOGLE SHEETS (robusta p/ private_key)
 # =========================
 @st.cache_resource(show_spinner=False)
 def conectar_sheets(sheet_id: str):
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT", None)
     if not svc:
-        st.error("🚫 Faltam as credenciais em st.secrets['GCP_SERVICE_ACCOUNT'].")
+        st.error("🚫 Faltam credenciais em st.secrets['GCP_SERVICE_ACCOUNT'].")
         st.stop()
+
+    # Aceita dict (TOML) OU string JSON
+    if isinstance(svc, str):
+        try:
+            svc = json.loads(svc)
+        except Exception:
+            st.error("❌ GCP_SERVICE_ACCOUNT está como string mas não é JSON válido.")
+            st.stop()
+
+    # Normaliza private_key: corrige '\\n' literais, trims, valida cabeçalho/rodapé
+    pk = svc.get("private_key", "")
+    if not isinstance(pk, str) or not pk.strip():
+        st.error("❌ 'private_key' ausente nas credenciais.")
+        st.stop()
+    pk = pk.strip()
+    # se vier com '\n' literais (uma linha só), converte
+    if "\\n" in pk and "\n" not in pk:
+        pk = pk.replace("\\n", "\n")
+    # garante que tem cabeçalho/rodapé corretos
+    if "BEGIN PRIVATE KEY" not in pk or "END PRIVATE KEY" not in pk:
+        st.error("❌ Formato da 'private_key' inválido. Cole exatamente o bloco entre BEGIN/END PRIVATE KEY.")
+        st.stop()
+    svc["private_key"] = pk
+
+    # Valida campos essenciais
+    for k in ("client_email", "token_uri", "type"):
+        if k not in svc or not svc[k]:
+            st.error(f"❌ Campo ausente em GCP_SERVICE_ACCOUNT: '{k}'.")
+            st.stop()
+
     scopes = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -73,12 +97,10 @@ def _garantir_estrutura_produtos(sh):
     if ws is None:
         ws = _criar_aba_produtos(sh)
         return ws, True
-    # garante cabeçalhos
     vals = ws.get_all_values()
     if not vals or not vals[0] or len(vals[0]) < len(COLS_PRODUTOS):
         ws.update("A1", [COLS_PRODUTOS])
     else:
-        # Se detectar cabeçalho antigo com SKU/EAN, oferece correção opcional
         old_headers = [h.strip() for h in vals[0]]
         if "SKU" in old_headers or "EAN" in old_headers:
             with st.expander("⚙️ Detectei cabeçalho antigo (SKU/EAN). Clique para ajustar para o novo padrão (ID)."):
@@ -89,44 +111,49 @@ def _garantir_estrutura_produtos(sh):
     return ws, False
 
 def _migrar_cabecalho_produtos(ws):
-    """Reescreve cabeçalhos de Produtos para COLS_PRODUTOS e tenta mapear dados antigos."""
     raw = ws.get_all_values()
     if not raw:
         ws.update("A1", [COLS_PRODUTOS])
         return
     old_cols = raw[0]
     df_old = pd.DataFrame(raw[1:], columns=old_cols)
-
-    # Monta df_new na ordem desejada
     df_new = pd.DataFrame(columns=COLS_PRODUTOS)
-
-    # ID: usa 'ID' se existir; senão 'SKU'; se vazio, gera depois
+    # ID preferindo 'ID', senão 'SKU', senão vazio
     if "ID" in df_old.columns:
         df_new["ID"] = df_old["ID"].astype(str)
     elif "SKU" in df_old.columns:
         df_new["ID"] = df_old["SKU"].astype(str)
     else:
         df_new["ID"] = ""
-
-    # cópias diretas quando existir
     simple_map = {
-        "Nome":"Nome", "Categoria":"Categoria", "Unidade":"Unidade", "Fornecedor":"Fornecedor",
-        "CustoAtual":"CustoAtual", "PreçoVenda":"PreçoVenda",
-        "Markup %":"Markup %", "Margem %":"Margem %",
-        "EstoqueAtual":"EstoqueAtual", "EstoqueMin":"EstoqueMin",
-        "LeadTimeDias":"LeadTimeDias", "Ativo?":"Ativo?"
+        "Nome":"Nome","Categoria":"Categoria","Unidade":"Unidade","Fornecedor":"Fornecedor",
+        "CustoAtual":"CustoAtual","PreçoVenda":"PreçoVenda","Markup %":"Markup %","Margem %":"Margem %",
+        "EstoqueAtual":"EstoqueAtual","EstoqueMin":"EstoqueMin","LeadTimeDias":"LeadTimeDias","Ativo?":"Ativo?"
     }
     for old, new in simple_map.items():
         df_new[new] = df_old[old] if old in df_old.columns else ""
-
-    # gera IDs vazios
-    gen = proximo_id(df_new)
-    df_new["ID"] = [x if str(x).strip() not in ("", "nan", "None") else gen for x in df_new["ID"]]
-
-    # escreve de volta
+    # Gera IDs ausentes
+    new_ids = _sequenciar_ids(df_new["ID"].tolist())
+    df_new["ID"] = [x if str(x).strip() not in ("", "nan", "None") else next(new_ids) for x in df_new["ID"]]
+    # Escreve de volta
     values = [df_new.columns.tolist()] + df_new.fillna("").astype(str).values.tolist()
     ws.clear()
     ws.update("A1", values)
+
+def _sequenciar_ids(existing_ids):
+    pad = re.compile(r"PRO-(\d{4})$")
+    usados = []
+    for x in existing_ids:
+        m = pad.match(str(x).strip()) if x else None
+        if m:
+            try: usados.append(int(m.group(1)))
+            except: pass
+    base = max(usados) if usados else 0
+    def _next():
+        nonlocal base
+        base += 1
+        return f"PRO-{base:04d}"
+    return _next()
 
 @st.cache_data(show_spinner=False)
 def carregar_df_produtos(sheet_id: str) -> pd.DataFrame:
@@ -136,32 +163,25 @@ def carregar_df_produtos(sheet_id: str) -> pd.DataFrame:
     if not data:
         return pd.DataFrame(columns=COLS_PRODUTOS)
     df = pd.DataFrame(data[1:], columns=data[0] if data[0] else COLS_PRODUTOS)
-    # garante colunas
     for c in COLS_PRODUTOS:
         if c not in df.columns:
             df[c] = ""
-    # numéricos
-    num_cols = ["CustoAtual", "PreçoVenda", "Markup %", "Margem %", "EstoqueAtual", "EstoqueMin", "LeadTimeDias"]
+    num_cols = ["CustoAtual","PreçoVenda","Markup %","Margem %","EstoqueAtual","EstoqueMin","LeadTimeDias"]
     for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Ativo?
     df["Ativo?"] = df["Ativo?"].fillna("").astype(str).str.upper().str.strip()
     return df[COLS_PRODUTOS]
 
 def proximo_id(df: pd.DataFrame) -> str:
-    """Gera o próximo ID no padrão PRO-0001 baseado no maior existente."""
-    import re as _re
     if df.empty or "ID" not in df.columns:
         return "PRO-0001"
-    padrao = _re.compile(r"PRO-(\d{4})$")
+    padrao = re.compile(r"PRO-(\d{4})$")
     numeros = []
     for x in df["ID"].dropna().astype(str):
         m = padrao.match(x.strip())
         if m:
-            try:
-                numeros.append(int(m.group(1)))
-            except ValueError:
-                pass
+            try: numeros.append(int(m.group(1)))
+            except: pass
     n = (max(numeros) + 1) if numeros else 1
     return f"PRO-{n:04d}"
 
@@ -182,7 +202,7 @@ def user_entered_append(ws, row_values):
     ws.append_row(row_values, value_input_option="USER_ENTERED")
 
 # =========================
-# ENTRADA DO SHEET
+# SHEET_ID
 # =========================
 SHEET_ID = get_sheet_id_from_secrets_or_input()
 if not SHEET_ID:
@@ -195,10 +215,8 @@ if not SHEET_ID:
 df = carregar_df_produtos(SHEET_ID)
 
 c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("Itens cadastrados", len(df))
-with c2:
-    st.metric("Ativos", int((df["Ativo?"] == "SIM").sum() if not df.empty else 0))
+with c1: st.metric("Itens cadastrados", len(df))
+with c2: st.metric("Ativos", int((df["Ativo?"] == "SIM").sum() if not df.empty else 0))
 with c3:
     crit = 0
     if not df.empty:
@@ -267,14 +285,9 @@ with st.form("form_add_prod"):
     mg = pct_margem(float(custo), float(preco)) if (custo or preco) else float("nan")
 
     e, f, g = st.columns([1,1,1])
-    with e:
-        st.caption("Markup % (auto)")
-        st.write("**" + (f"{mk*100:.2f} %" if not math.isnan(mk) else "—") + "**")
-    with f:
-        st.caption("Margem % (auto)")
-        st.write("**" + (f"{mg*100:.2f} %" if not math.isnan(mg) else "—") + "**")
-    with g:
-        ativo_flag = st.checkbox("Ativo?", value=True)
+    with e: st.caption("Markup % (auto)"); st.write("**" + (f"{mk*100:.2f} %" if not math.isnan(mk) else "—") + "**")
+    with f: st.caption("Margem % (auto)"); st.write("**" + (f"{mg*100:.2f} %" if not math.isnan(mg) else "—") + "**")
+    with g: ativo_flag = st.checkbox("Ativo?", value=True)
 
     erro = None
     if st.form_submit_button("Salvar produto", use_container_width=True):
@@ -282,9 +295,8 @@ with st.form("form_add_prod"):
             erro = "Informe o **Nome**."
         elif float(preco) <= 0 or float(custo) < 0:
             erro = "Preencha **CustoAtual** e **PreçoVenda** válidos (Preço > 0)."
-        else:
-            if not df.empty and (df["Nome"].str.lower().str.strip() == nome.lower().strip()).any():
-                erro = "Já existe um produto com esse **Nome**. Altere o nome ou edite o existente."
+        elif not df.empty and (df["Nome"].str.lower().str.strip() == nome.lower().strip()).any():
+            erro = "Já existe um produto com esse **Nome**. Altere o nome ou edite o existente."
 
         if erro:
             st.error(erro)
@@ -292,31 +304,43 @@ with st.form("form_add_prod"):
             try:
                 sh = conectar_sheets(SHEET_ID)
                 ws, _ = _garantir_estrutura_produtos(sh)
-
-                # recarrega para pegar último ID
                 df_atual = carregar_df_produtos(SHEET_ID)
                 novo_id = proximo_id(df_atual)
-
                 linha = [
-                    novo_id,
-                    nome.strip(),
-                    categoria_n.strip(),
-                    unidade,
-                    fornecedor.strip(),
-                    float(custo),
-                    float(preco),
+                    novo_id, nome.strip(), categoria_n.strip(), unidade, fornecedor.strip(),
+                    float(custo), float(preco),
                     (pct_markup(float(custo), float(preco)) if float(custo) > 0 else ""),
                     (pct_margem(float(custo), float(preco)) if float(preco) > 0 else ""),
-                    float(estoque_atual),
-                    float(estoque_min),
-                    int(leadtime),
+                    float(estoque_atual), float(estoque_min), int(leadtime),
                     "SIM" if ativo_flag else "NÃO",
                 ]
-
-                user_entered_append(ws, linha)
+                ws.append_row(linha, value_input_option="USER_ENTERED")
                 st.success(f"✅ Produto **{nome}** salvo com ID **{novo_id}**.")
                 carregar_df_produtos.clear()
                 time.sleep(0.3)
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ Erro ao salvar: {e}")
+
+# =========================
+# DIAGNÓSTICO (para depurar chave/planilha)
+# =========================
+with st.expander("🔎 Diagnóstico de credenciais e acesso"):
+    if st.button("Testar credenciais e listar abas"):
+        try:
+            svc = st.secrets.get("GCP_SERVICE_ACCOUNT", {})
+            fmt_ok = isinstance(svc, (dict, str))
+            st.write("Formato GCP_SERVICE_ACCOUNT é dict/JSON?", fmt_ok)
+            if isinstance(svc, dict):
+                pk = svc.get("private_key", "")
+            elif isinstance(svc, str):
+                pk = json.loads(svc).get("private_key", "")
+            else:
+                pk = ""
+            st.write("private_key começa com '-----BEGIN'?", str(pk).strip().startswith("-----BEGIN"))
+            st.write("private_key termina com 'END PRIVATE KEY-----'?", str(pk).strip().endswith("END PRIVATE KEY-----"))
+            sh = conectar_sheets(SHEET_ID)
+            st.success("Conexão com Sheets ✅")
+            st.write("Abas:", [w.title for w in sh.worksheets()])
+        except Exception as e:
+            st.error(f"Falhou: {e}")
