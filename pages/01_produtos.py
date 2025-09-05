@@ -1,6 +1,8 @@
 # pages/01_produtos.py
 # -*- coding: utf-8 -*-
 import re, json, math, time
+from collections.abc import Mapping
+
 import pandas as pd
 import streamlit as st
 import gspread
@@ -35,41 +37,44 @@ def get_sheet_id_from_secrets_or_input():
     return sid
 
 # =========================
-# CONEXÃO GOOGLE SHEETS (robusta p/ private_key)
+# CONEXÃO GOOGLE SHEETS (sem alterar st.secrets)
 # =========================
 @st.cache_resource(show_spinner=False)
 def conectar_sheets(sheet_id: str):
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT", None)
-    if not svc:
+    svc_raw = st.secrets.get("GCP_SERVICE_ACCOUNT", None)
+    if not svc_raw:
         st.error("🚫 Faltam credenciais em st.secrets['GCP_SERVICE_ACCOUNT'].")
         st.stop()
 
-    # Aceita dict (TOML) OU string JSON
-    if isinstance(svc, str):
+    # Aceita dict (TOML) ou string JSON; sempre cria uma CÓPIA mutável
+    if isinstance(svc_raw, str):
         try:
-            svc = json.loads(svc)
+            svc = json.loads(svc_raw)  # -> dict
         except Exception:
-            st.error("❌ GCP_SERVICE_ACCOUNT está como string mas não é JSON válido.")
+            st.error("❌ GCP_SERVICE_ACCOUNT está como string, mas não é JSON válido.")
             st.stop()
+    elif isinstance(svc_raw, Mapping):
+        svc = dict(svc_raw)           # -> cópia mutável
+    else:
+        st.error("❌ Formato inválido em GCP_SERVICE_ACCOUNT.")
+        st.stop()
 
-    # Normaliza private_key: corrige '\\n' literais, trims, valida cabeçalho/rodapé
+    # Normaliza private_key (corrige '\\n' literais -> quebras reais)
     pk = svc.get("private_key", "")
     if not isinstance(pk, str) or not pk.strip():
         st.error("❌ 'private_key' ausente nas credenciais.")
         st.stop()
     pk = pk.strip()
-    # se vier com '\n' literais (uma linha só), converte
     if "\\n" in pk and "\n" not in pk:
         pk = pk.replace("\\n", "\n")
-    # garante que tem cabeçalho/rodapé corretos
     if "BEGIN PRIVATE KEY" not in pk or "END PRIVATE KEY" not in pk:
-        st.error("❌ Formato da 'private_key' inválido. Cole exatamente o bloco entre BEGIN/END PRIVATE KEY.")
+        st.error("❌ Formato da 'private_key' inválido. Use o bloco completo BEGIN/END com quebras de linha reais.")
         st.stop()
-    svc["private_key"] = pk
+    svc["private_key"] = pk  # em 'svc' (cópia), não em st.secrets
 
-    # Valida campos essenciais
-    for k in ("client_email", "token_uri", "type"):
-        if k not in svc or not svc[k]:
+    # Campos essenciais
+    for k in ("type", "client_email", "token_uri"):
+        if not svc.get(k):
             st.error(f"❌ Campo ausente em GCP_SERVICE_ACCOUNT: '{k}'.")
             st.stop()
 
@@ -323,14 +328,14 @@ with st.form("form_add_prod"):
                 st.error(f"❌ Erro ao salvar: {e}")
 
 # =========================
-# DIAGNÓSTICO (para depurar chave/planilha)
+# DIAGNÓSTICO
 # =========================
 with st.expander("🔎 Diagnóstico de credenciais e acesso"):
     if st.button("Testar credenciais e listar abas"):
         try:
             svc = st.secrets.get("GCP_SERVICE_ACCOUNT", {})
             fmt_ok = isinstance(svc, (dict, str))
-            st.write("Formato GCP_SERVICE_ACCOUNT é dict/JSON?", fmt_ok)
+            st.write("GCP_SERVICE_ACCOUNT é dict/JSON válido?", fmt_ok)
             if isinstance(svc, dict):
                 pk = svc.get("private_key", "")
             elif isinstance(svc, str):
