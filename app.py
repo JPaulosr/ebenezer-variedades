@@ -1,140 +1,131 @@
 # app.py — Dashboard Ebenezér Variedades
 # -*- coding: utf-8 -*-
 import json, unicodedata
+from collections.abc import Mapping
 from typing import Optional
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-
 import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 
-# ------------------------
-# CONFIG
-# ------------------------
 st.set_page_config(page_title="Ebenezér Variedades — Dashboard", page_icon="🧮", layout="wide")
 st.title("🧮 Dashboard — Ebenezér Variedades")
 
 # ------------------------
-# HELPERS (auth + sheets)
+# Helpers p/ Secrets & Auth
 # ------------------------
 def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str):
-        return key
+    if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
+    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
     return key
 
-def _load_service_account_from_secrets() -> Optional[dict]:
+def _load_service_account_from_secrets() -> dict:
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None:
-        return None
+        st.error("🛑 Segredo GCP_SERVICE_ACCOUNT ausente em Settings → Secrets.")
+        st.stop()
+
+    # Se vier string (formato JSON em string), converte
     if isinstance(svc, str):
         try:
             svc = json.loads(svc)
         except Exception as e:
-            st.error("🛑 GCP_SERVICE_ACCOUNT é uma string inválida (JSON).")
-            st.caption(str(e));  return None
-    if not isinstance(svc, dict):
-        st.error("🛑 GCP_SERVICE_ACCOUNT precisa ser um objeto JSON.");  return None
+            st.error("🛑 GCP_SERVICE_ACCOUNT é uma string, mas não é JSON válido."); st.caption(str(e)); st.stop()
 
-    required = ["type","project_id","private_key_id","private_key","client_email","token_uri"]
+    if not isinstance(svc, Mapping):
+        st.error("🛑 GCP_SERVICE_ACCOUNT precisa ser um objeto JSON/TOML (tabela).")
+        st.stop()
+
+    required = ["type", "project_id", "private_key_id", "private_key", "client_email", "token_uri"]
     missing = [k for k in required if k not in svc]
     if missing:
-        st.error("🛑 Faltam campos no Service Account: " + ", ".join(missing));  return None
+        st.error("🛑 Faltam campos no Service Account: " + ", ".join(missing)); st.stop()
 
-    svc = {**svc, "private_key": _normalize_private_key(svc["private_key"])}
+    # Bloqueia placeholders
+    pk = str(svc["private_key"])
+    if "COLE AQUI" in pk or "..." in pk:
+        st.error("🛑 O campo private_key contém placeholder. Cole a CHAVE REAL completa (BEGIN/END).")
+        st.stop()
+
+    svc = {**svc, "private_key": _normalize_private_key(pk)}
     return svc
 
 @st.cache_resource(show_spinner=True)
 def conectar_sheets():
     svc = _load_service_account_from_secrets()
-    if not svc:
-        raise ValueError("Segredo GCP_SERVICE_ACCOUNT ausente/ inválido.")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = Credentials.from_service_account_info(svc, scopes=scopes)
     gc = gspread.authorize(creds)
 
     url_or_id = st.secrets.get("PLANILHA_URL", "")
     if not url_or_id:
-        raise ValueError("PLANILHA_URL não definido em Secrets.")
-    if url_or_id.startswith("http"):
-        return gc.open_by_url(url_or_id)
-    else:
-        return gc.open_by_key(url_or_id)
+        st.error("🛑 PLANILHA_URL não está no Secrets."); st.stop()
+
+    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
 
 @st.cache_data(show_spinner=True)
 def carregar_aba(nome_aba: str) -> pd.DataFrame:
-    try:
-        sh = conectar_sheets()
-        ws = sh.worksheet(nome_aba)
-        df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
-        df = df.dropna(how="all")
-        return df
-    except Exception as e:
-        raise
+    sh = conectar_sheets()
+    ws = sh.worksheet(nome_aba)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    return df
 
 # ------------------------
-# CARREGAR PRODUTOS
+# Carregar Produtos
 # ------------------------
 ABA_PRODUTOS = "Produtos"
 try:
     df = carregar_aba(ABA_PRODUTOS)
 except Exception as e:
     st.error("Não consegui abrir a planilha. Verifique Secrets e compartilhamento.")
-    with st.expander("Detalhes técnicos"):
-        st.code(str(e))
+    with st.expander("Detalhes técnicos"): st.code(str(e))
     st.stop()
 
 if df.empty:
-    st.warning(f"A aba **{ABA_PRODUTOS}** está vazia.")
-    st.stop()
+    st.warning(f"A aba **{ABA_PRODUTOS}** está vazia."); st.stop()
 
-# normalizar nomes de colunas esperadas
+# Normalização de colunas
 df.columns = [c.strip() for c in df.columns]
-m = {
-    "ID":"ID", "Nome":"Nome", "Categoria":"Categoria", "Unidade":"Unidade",
-    "Fornecedor":"Fornecedor", "CustoAtual":"CustoAtual", "PreçoVenda":"PrecoVenda",
-    "Preço Venda":"PrecoVenda", "PrecoVenda":"PrecoVenda",
-    "Markup %":"MarkupPct", "Margem %":"MargemPct",
-    "EstoqueAtual":"EstoqueAtual", "EstoqueMin":"EstoqueMin",
-    "LeadTimeDias":"LeadTimeDias", "Ativo?":"Ativo"
+ren = {
+    "ID":"ID","Nome":"Nome","Categoria":"Categoria","Unidade":"Unidade","Fornecedor":"Fornecedor",
+    "CustoAtual":"CustoAtual","PreçoVenda":"PrecoVenda","Preço Venda":"PrecoVenda","PrecoVenda":"PrecoVenda",
+    "Markup %":"MarkupPct","Margem %":"MargemPct",
+    "EstoqueAtual":"EstoqueAtual","EstoqueMin":"EstoqueMin","LeadTimeDias":"LeadTimeDias","Ativo?":"Ativo"
 }
-for k,v in m.items():
+for k,v in ren.items():
     if k in df.columns: df.rename(columns={k:v}, inplace=True)
 
-# garantir colunas
+# Garantir colunas
 for c in ["CustoAtual","PrecoVenda","MarkupPct","MargemPct","EstoqueAtual","EstoqueMin","LeadTimeDias"]:
     if c not in df.columns: df[c] = None
-for c in ["Categoria","Fornecedor","Ativo","Nome"]:
+for c in ["Categoria","Fornecedor","Ativo","Nome","ID"]:
     if c not in df.columns: df[c] = None
 
-# tipos
+# Tipos
 num_cols = ["CustoAtual","PrecoVenda","MarkupPct","MargemPct","EstoqueAtual","EstoqueMin","LeadTimeDias"]
-for c in num_cols:
-    df[c] = pd.to_numeric(df[c], errors="coerce")
+for c in num_cols: df[c] = pd.to_numeric(df[c], errors="coerce")
 df["Ativo"] = df["Ativo"].astype(str).str.strip().str.lower()
 df["Ativo"] = df["Ativo"].map({"sim":"sim","true":"sim","1":"sim"}).fillna(df["Ativo"])
 
-# derivadas
-# margem e markup se faltarem
+# Derivadas
 df["MargemPct"] = df["MargemPct"].where(df["MargemPct"].notna(),
-    ((df["PrecoVenda"] - df["CustoAtual"]) / df["PrecoVenda"] * 100).replace([pd.NA, pd.NaT], 0))
+    ((df["PrecoVenda"] - df["CustoAtual"]) / df["PrecoVenda"] * 100))
 df["MarkupPct"] = df["MarkupPct"].where(df["MarkupPct"].notna(),
     ((df["PrecoVenda"] / df["CustoAtual"] - 1) * 100))
-
 df["ValorEstoque"] = (df["CustoAtual"].fillna(0) * df["EstoqueAtual"].fillna(0))
 df["AbaixoMin"] = (df["EstoqueAtual"].fillna(0) <= df["EstoqueMin"].fillna(0))
 
 # Filtros
 st.sidebar.header("Filtros")
-cat_sel = st.sidebar.multiselect(
-    "Categoria", sorted([x for x in df["Categoria"].dropna().astype(str).unique()]))
-forn_sel = st.sidebar.multiselect(
-    "Fornecedor", sorted([x for x in df["Fornecedor"].dropna().astype(str).unique()]))
+cat_sel = st.sidebar.multiselect("Categoria", sorted([x for x in df["Categoria"].dropna().astype(str).unique()]))
+forn_sel = st.sidebar.multiselect("Fornecedor", sorted([x for x in df["Fornecedor"].dropna().astype(str).unique()]))
 apenas_ativos = st.sidebar.checkbox("Somente ativos", value=True)
 busca = st.sidebar.text_input("Buscar por nome/ID")
 
@@ -145,7 +136,6 @@ if apenas_ativos: mask &= (df["Ativo"].fillna("") == "sim")
 if busca:
     s = busca.lower()
     mask &= df.apply(lambda r: s in " ".join([str(x).lower() for x in r.values]), axis=1)
-
 dfv = df[mask].copy()
 
 # KPIs
@@ -162,37 +152,36 @@ k4.metric("⚠️ Itens abaixo do mínimo", f"{abaixo_min}")
 
 st.divider()
 
-# Alertas: ruptura e sugestão de compra
+# Alertas
 st.subheader("⚠️ Alerta de ruptura / Sugestão de compra")
 df_alerta = dfv[dfv["AbaixoMin"]].copy()
 df_alerta["SugestaoCompra"] = (df_alerta["EstoqueMin"].fillna(0)*2 - df_alerta["EstoqueAtual"].fillna(0)).clip(lower=0).round()
 cols_alerta = ["ID","Nome","Categoria","Fornecedor","EstoqueAtual","EstoqueMin","SugestaoCompra","LeadTimeDias"]
-st.dataframe(df_alerta[ [c for c in cols_alerta if c in df_alerta.columns] ],
+st.dataframe(df_alerta[[c for c in cols_alerta if c in df_alerta.columns]],
              use_container_width=True, hide_index=True)
 
 st.divider()
 
 # Top valor em estoque
-st.subheader("🏆 Top 10 — Valor em estoque (custo x quantidade)")
+st.subheader("🏆 Top 10 — Valor em estoque")
 df_top = dfv.sort_values("ValorEstoque", ascending=False).head(10)
 c1,c2 = st.columns([1.2,1])
-
 with c1:
     if not df_top.empty:
-        fig = px.bar(df_top, x="Nome", y="ValorEstoque", hover_data=["EstoqueAtual","CustoAtual","Categoria"])
+        fig = px.bar(df_top, x="Nome", y="ValorEstoque",
+                     hover_data=["EstoqueAtual","CustoAtual","Categoria"])
         fig.update_layout(xaxis_title="", yaxis_title="R$ em estoque")
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Sem dados para o gráfico.")
-
 with c2:
-    st.caption("Tabela Top 10 (detalhes)")
+    st.caption("Tabela Top 10")
     st.dataframe(df_top[["ID","Nome","Categoria","EstoqueAtual","CustoAtual","ValorEstoque"]],
                  use_container_width=True, hide_index=True, height=420)
 
 st.divider()
 
-# Distribuição por categoria (Valor em estoque)
+# Distribuição por categoria
 st.subheader("📦 Valor em estoque por categoria")
 df_cat = dfv.groupby("Categoria", dropna=False)["ValorEstoque"].sum().reset_index().sort_values("ValorEstoque", ascending=False)
 if not df_cat.empty:
@@ -208,8 +197,6 @@ else:
     st.info("Sem categorias para sumarizar.")
 
 st.divider()
-
-# Lista completa (filtrada)
 st.subheader("📋 Lista de produtos (filtrada)")
 mostrar_cols = ["ID","Nome","Categoria","Fornecedor","CustoAtual","PrecoVenda","MargemPct","EstoqueAtual","EstoqueMin","ValorEstoque","Ativo"]
 mostrar_cols = [c for c in mostrar_cols if c in dfv.columns]
