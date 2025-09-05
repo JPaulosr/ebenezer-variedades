@@ -18,11 +18,20 @@ def _normalize_private_key(key: str) -> str:
 
 def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None:
-        st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
+if svc is None:
+    st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+
+# Se vier string (JSON em string), converte
+if isinstance(svc, str):
+    svc = json.loads(svc)
+
+# Garante cópia mutável (dict normal)
+svc = dict(svc)
+
+# Normaliza a chave privada
+svc["private_key"] = _normalize_private_key(svc["private_key"])
+return svc
+
 
 @st.cache_resource
 def conectar_sheets():
