@@ -1,4 +1,4 @@
-# pages/01_produtos.py — Catálogo de Produtos
+# pages/01_produtos.py — Catálogo de Produtos (com EstoqueAtual calculado)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 import streamlit as st
@@ -10,9 +10,9 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Produtos — Ebenezér Variedades", page_icon="📦", layout="wide")
 st.title("📦 Produtos — Catálogo & Busca")
 
-# -----------------------------
-# Funções auxiliares
-# -----------------------------
+# =========================
+# Utilitários
+# =========================
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str):
         return key
@@ -24,15 +24,9 @@ def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None:
         st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-
-    # Se vier string (JSON bruto), converte
     if isinstance(svc, str):
         svc = json.loads(svc)
-
-    # Garante cópia mutável
     svc = dict(svc)
-
-    # Normaliza a chave privada
     svc["private_key"] = _normalize_private_key(svc["private_key"])
     return svc
 
@@ -43,58 +37,239 @@ def conectar_sheets():
               "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(svc, scopes=scopes)
     gc = gspread.authorize(creds)
-
     url_or_id = st.secrets.get("PLANILHA_URL")
     if not url_or_id:
         st.error("🛑 PLANILHA_URL ausente."); st.stop()
-
-    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
+    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
 @st.cache_data
 def carregar_aba(nome_aba: str) -> pd.DataFrame:
     sh = conectar_sheets()
     ws = sh.worksheet(nome_aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
     return df
 
-# -----------------------------
-# Principal
-# -----------------------------
-ABA = "Produtos"
+def _first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # tenta procurando case-insensitive
+    lower_map = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    return None
+
+def _to_num(s):
+    if s is None:
+        return 0.0
+    if isinstance(s, (int, float)):
+        return float(s)
+    s = str(s).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return 0.0
+    # troca vírgula por ponto e remove separadores supostos
+    s = s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".") > 1 else s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+# =========================
+# Carrega abas
+# =========================
+ABA_PRODUTOS = "Produtos"
+ABA_COMPRAS  = "Compras"
+ABA_VENDAS   = "Vendas"
+ABA_AJUSTES  = "Ajustes"   # opcional
+
 try:
-    df = carregar_aba(ABA)
+    df_prod = carregar_aba(ABA_PRODUTOS)
 except Exception as e:
     st.error("Erro ao abrir a aba Produtos.")
     with st.expander("Detalhes técnicos"):
         st.code(str(e))
     st.stop()
 
-df.columns = [c.strip() for c in df.columns]
-col_cat  = "Categoria" if "Categoria" in df.columns else None
-col_forn = "Fornecedor" if "Fornecedor" in df.columns else None
+# Tenta carregar Compras/Vendas/Ajustes (Ajustes pode não existir)
+try:
+    df_comp = carregar_aba(ABA_COMPRAS)
+except Exception:
+    df_comp = pd.DataFrame()
 
-# Barra de busca e filtros
-l, c, r = st.columns([2, 1.2, 1.2])
-with l:
+try:
+    df_vend = carregar_aba(ABA_VENDAS)
+except Exception:
+    df_vend = pd.DataFrame()
+
+try:
+    df_aj = carregar_aba(ABA_AJUSTES)
+except Exception:
+    df_aj = pd.DataFrame()
+
+# =========================
+# Identifica colunas importantes
+# =========================
+# Produtos
+col_id_prod    = _first_col(df_prod, ["ID", "Id", "Codigo", "Código", "SKU"])
+col_nome       = _first_col(df_prod, ["Nome", "Produto", "Descrição"])
+col_cat        = _first_col(df_prod, ["Categoria"])
+col_forn_prod  = _first_col(df_prod, ["Fornecedor"])
+col_estq_min   = _first_col(df_prod, ["EstoqueMin", "Estoque Mínimo", "EstqMin"])
+col_estq_atual = _first_col(df_prod, ["EstoqueAtual", "Estoque Atual", "EstqAtual"])
+col_custo_atual= _first_col(df_prod, ["CustoAtual", "Custo Médio", "CustoMedio"])
+col_preco      = _first_col(df_prod, ["PreçoVenda", "PrecoVenda", "Preço", "Preco"])
+
+# Compras
+col_comp_idprod = _first_col(df_comp, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto"])
+col_comp_qtd    = _first_col(df_comp, ["Qtd", "Quantidade", "Qtde", "Qde"])
+col_comp_custo  = _first_col(df_comp, ["Custo Unitário", "CustoUnitário", "CustoUnit", "Custo Unit", "Custo"])
+
+# Vendas
+col_vend_idprod = _first_col(df_vend, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto"])
+col_vend_qtd    = _first_col(df_vend, ["Qtd", "Quantidade", "Qtde", "Qde"])
+
+# Ajustes (opcional)
+col_aj_idprod = _first_col(df_aj, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto"])
+col_aj_qtd    = _first_col(df_aj, ["Qtd", "Quantidade", "Qtde", "Qde", "Ajuste"])
+
+# =========================
+# Calcula entradas/saídas/ajustes e custo médio
+# =========================
+entradas = pd.Series(dtype=float)
+custo_medio = pd.Series(dtype=float)
+
+if not df_comp.empty and col_comp_idprod and col_comp_qtd:
+    comp = df_comp[[col_comp_idprod, col_comp_qtd]].copy()
+    comp[col_comp_qtd] = comp[col_comp_qtd].map(_to_num)
+    entradas = comp.groupby(col_comp_idprod, dropna=True)[col_comp_qtd].sum()
+
+    # custo médio ponderado = sum(qtd * custo) / sum(qtd)
+    if col_comp_custo:
+        comp_cost = df_comp[[col_comp_idprod, col_comp_qtd, col_comp_custo]].copy()
+        comp_cost[col_comp_qtd]  = comp_cost[col_comp_qtd].map(_to_num)
+        comp_cost[col_comp_custo]= comp_cost[col_comp_custo].map(_to_num)
+        comp_cost["parcial"] = comp_cost[col_comp_qtd] * comp_cost[col_comp_custo]
+        soma_parcial = comp_cost.groupby(col_comp_idprod)["parcial"].sum()
+        soma_qtd     = comp_cost.groupby(col_comp_idprod)[col_comp_qtd].sum().replace(0, pd.NA)
+        custo_medio = (soma_parcial / soma_qtd).fillna(0.0)
+
+saidas = pd.Series(dtype=float)
+if not df_vend.empty and col_vend_idprod and col_vend_qtd:
+    vend = df_vend[[col_vend_idprod, col_vend_qtd]].copy()
+    vend[col_vend_qtd] = vend[col_vend_qtd].map(_to_num)
+    saidas = vend.groupby(col_vend_idprod, dropna=True)[col_vend_qtd].sum()
+
+ajustes = pd.Series(dtype=float)
+if not df_aj.empty and col_aj_idprod and col_aj_qtd:
+    aj = df_aj[[col_aj_idprod, col_aj_qtd]].copy()
+    aj[col_aj_qtd] = aj[col_aj_qtd].map(_to_num)  # positivos entram, negativos saem
+    ajustes = aj.groupby(col_aj_idprod, dropna=True)[col_aj_qtd].sum()
+
+# Monta dataframe com cálculos por IDProduto
+calc = pd.DataFrame({
+    "Entradas": entradas,
+    "Saidas":   saidas,
+    "Ajustes":  ajustes
+}).fillna(0.0)
+
+if not custo_medio.empty:
+    calc["CustoMedio"] = custo_medio
+else:
+    calc["CustoMedio"] = 0.0
+
+calc["EstoqueCalc"] = calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
+calc = calc.reset_index().rename(columns={"index": "ID_join"})
+
+# =========================
+# Merge com Produtos
+# =========================
+if not col_id_prod:
+    st.error("Não encontrei a coluna de ID na aba Produtos (ex.: 'ID')."); st.stop()
+
+df_prod["_ID_join"] = df_prod[col_id_prod].astype(str)
+df_merge = df_prod.merge(calc, how="left", left_on="_ID_join", right_on="ID_join").drop(columns=["ID_join"])
+df_merge["EstoqueCalc"] = df_merge["EstoqueCalc"].fillna(0.0).map(lambda x: float(x))
+
+# Sobrescreve/Cria colunas calculadas
+df_merge["EstoqueAtual_calc"] = df_merge["EstoqueCalc"]
+df_merge["CustoAtual_calc"]   = df_merge["CustoMedio"].fillna(0.0)
+
+# Se existirem colunas originais de estoque/custo, cria uma visão amigável priorizando o calculado
+if col_estq_atual:
+    df_merge[col_estq_atual] = df_merge["EstoqueAtual_calc"]
+if col_custo_atual:
+    df_merge[col_custo_atual] = df_merge["CustoAtual_calc"]
+
+# =========================
+# Filtros de busca
+# =========================
+col_cat  = col_cat or _first_col(df_merge, ["Categoria"])
+col_forn = col_forn_prod or _first_col(df_merge, ["Fornecedor"])
+
+top, mid = st.columns([2.5, 1.5])
+with top:
     termo = st.text_input("🔎 Buscar", placeholder="ID, nome, fornecedor, categoria...").strip()
-with c:
-    cat = st.selectbox("Categoria", ["(todas)"] + sorted(df[col_cat].dropna().astype(str).unique()) if col_cat else ["(todas)"])
-with r:
-    forn = st.selectbox("Fornecedor", ["(todos)"] + sorted(df[col_forn].dropna().astype(str).unique()) if col_forn else ["(todos)"])
+with mid:
+    only_low = st.checkbox("⚠️ Somente baixo estoque", value=False,
+                           help="Mostra itens com EstoqueAtual ≤ EstoqueMin (se a coluna EstoqueMin existir).")
 
-# Aplicar filtros
-mask = pd.Series(True, index=df.index)
+cat_col, forn_col = st.columns(2)
+with cat_col:
+    if col_cat and col_cat in df_merge.columns:
+        cats = ["(todas)"] + sorted(pd.Series(df_merge[col_cat].dropna().astype(str).unique()).tolist())
+        cat = st.selectbox("Categoria", cats)
+    else:
+        cat = "(todas)"
+with forn_col:
+    if col_forn and col_forn in df_merge.columns:
+        forns = ["(todos)"] + sorted(pd.Series(df_merge[col_forn].dropna().astype(str).unique()).tolist())
+        forn = st.selectbox("Fornecedor", forns)
+    else:
+        forn = "(todos)"
+
+mask = pd.Series(True, index=df_merge.index)
 if termo:
     t = termo.lower()
-    mask &= df.apply(lambda r: t in " ".join([str(x).lower() for x in r.values]), axis=1)
-if col_cat and cat != "(todas)":
-    mask &= (df[col_cat].astype(str) == cat)
-if col_forn and forn != "(todos)":
-    mask &= (df[col_forn].astype(str) == forn)
+    mask &= df_merge.apply(lambda r: t in " ".join([str(x).lower() for x in r.values]), axis=1)
+if col_cat and cat != "(todas)" and col_cat in df_merge.columns:
+    mask &= (df_merge[col_cat].astype(str) == cat)
+if col_forn and forn != "(todos)" and col_forn in df_merge.columns:
+    mask &= (df_merge[col_forn].astype(str) == forn)
 
-dfv = df[mask].reset_index(drop=True)
+# Filtro de baixo estoque
+if only_low and col_estq_min:
+    try:
+        estq_min_num = df_merge[col_estq_min].map(_to_num)
+        estq_atual_num = df_merge["EstoqueAtual_calc"]
+        mask &= (estq_atual_num <= estq_min_num)
+    except Exception:
+        pass
 
-# Mostrar tabela final
-st.dataframe(dfv, use_container_width=True, hide_index=True)
+dfv = df_merge[mask].reset_index(drop=True)
 
-st.caption("Use a página **Dashboard** para ver KPIs, alertas e gráficos.")
+# =========================
+# Exibição
+# =========================
+# Seleciona um conjunto de colunas úteis para mostrar
+cols_show = []
+for c in [col_id_prod, col_nome, col_cat, col_forn, col_preco,
+          col_estq_min, "EstoqueAtual_calc", "Entradas", "Saidas", "Ajustes", "CustoAtual_calc"]:
+    if c and c in dfv.columns:
+        cols_show.append(c)
+
+if "EstoqueAtual_calc" in cols_show:
+    # Renomeia para exibir bonito
+    dfv = dfv.rename(columns={
+        "EstoqueAtual_calc": "EstoqueAtual",
+        "CustoAtual_calc": "CustoAtual"
+    })
+
+st.dataframe(dfv[cols_show] if cols_show else dfv, use_container_width=True, hide_index=True)
+
+st.caption("""
+• **EstoqueAtual** = Compras − Vendas ± Ajustes (calculado em tempo real).  
+• **CustoAtual** = custo médio ponderado das compras.  
+• Use a aba **Compras** e **Vendas** para registrar movimentos; **Ajustes** é opcional (quebra, perda, acerto).
+""")
