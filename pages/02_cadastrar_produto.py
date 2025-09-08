@@ -123,29 +123,70 @@ st.divider()
 # Modo: Editar existente
 # -----------------------------
 if modo == "Editar existente":
-    # Campo de busca e seleção
-    l, r = st.columns([2,1])
-    with l:
-        termo = st.text_input("🔎 Buscar produto", placeholder="Nome, fornecedor, categoria, código de barras...")
-    with r:
+    # Controles principais
+    cc1, cc2, cc3 = st.columns([1.6, 1, 1])
+    with cc1:
+        usar_lista = st.checkbox("Selecionar da lista (auto-sugestão)", value=True)
+    with cc2:
         apenas_ativos = st.checkbox("Apenas ativos", value=True)
+    with cc3:
+        so_estoque = st.checkbox("Somente com estoque (>0)", value=False)
 
-    mask = pd.Series(True, index=df.index)
-    if termo:
-        t = termo.lower()
-        mask &= df.apply(lambda row: t in " ".join([str(x).lower() for x in row.values]), axis=1)
-    if apenas_ativos and "Ativo" in df.columns:
-        mask &= df["Ativo"].astype(str).str.strip().str.lower().isin(["1","true","sim","ativo","yes"])
+    # Base para filtros comuns
+    base = df.copy()
+    if "Ativo" in base.columns and apenas_ativos:
+        base = base[base["Ativo"].astype(str).str.strip().str.lower().isin(["1","true","sim","ativo","yes"])]
+    if "Estoque" in base.columns and so_estoque:
+        def _gt0(x):
+            try:
+                return float(str(x).replace(",", ".").strip()) > 0
+            except:
+                return False
+        base = base[base["Estoque"].apply(_gt0)]
 
-    dfe = df[mask].copy().reset_index(drop=True)
-    if dfe.empty:
-        st.info("Nada encontrado para os filtros atuais.")
-        st.stop()
+    if usar_lista:
+        # Labels amigáveis: "Nome — Fornecedor — R$ Preço"
+        if base.empty:
+            st.info("Nada encontrado para os filtros atuais."); st.stop()
 
-    nomes_fmt = dfe.apply(lambda r: f'{r.get("Nome","(sem nome)")} — {r.get("Fornecedor","(s/ forn)")} — R$ {r.get("Preço","")}', axis=1).tolist()
-    idx = st.selectbox("Selecione um produto para editar", options=range(len(dfe)), format_func=lambda i: nomes_fmt[i])
-    sel = dfe.iloc[idx].to_dict()
+        def _fmt_row(r):
+            nome = str(r.get("Nome","(sem nome)"))
+            forn = str(r.get("Fornecedor","(s/ forn)"))
+            preco = str(r.get("Preço","")).strip()
+            return f"{nome} — {forn}" + (f" — R$ {preco}" if preco else "")
 
+        labels = base.apply(_fmt_row, axis=1).tolist()
+        idx_label = st.selectbox(
+            "Produto (digite para filtrar…)",
+            options=["(selecione)"] + labels,
+            index=0
+        )
+        if idx_label == "(selecione)":
+            st.stop()
+
+        # Mapeia label → índice na base filtrada
+        pos = labels.index(idx_label)
+        sel = base.iloc[pos].to_dict()
+
+    else:
+        # Modo texto + lista de resultados
+        l, r = st.columns([2,1])
+        with l:
+            termo = st.text_input("🔎 Buscar produto", placeholder="Nome, fornecedor, categoria, código de barras…")
+        # 'apenas_ativos' e 'so_estoque' já foram aplicados em 'base'
+
+        if termo:
+            t = termo.lower().strip()
+            base = base[base.apply(lambda row: t in " ".join([str(x).lower() for x in row.values]), axis=1)]
+
+        if base.empty:
+            st.info("Nada encontrado para os filtros atuais."); st.stop()
+
+        nomes_fmt = base.apply(lambda r: f'{r.get("Nome","(sem nome)")} — {r.get("Fornecedor","(s/ forn)")} — R$ {r.get("Preço","")}', axis=1).tolist()
+        pos = st.selectbox("Selecione um produto para editar", options=range(len(base)), format_func=lambda i: nomes_fmt[i])
+        sel = base.iloc[pos].to_dict()
+
+    # ---------- Formulário de edição ----------
     st.subheader("Editar")
     with st.form("editar_produto"):
         c1, c2, c3 = st.columns([1.6,1,1])
@@ -173,7 +214,7 @@ if modo == "Editar existente":
         salvar = st.form_submit_button("💾 Atualizar produto")
 
     if salvar:
-        # Validações básicas
+        # Validações
         if not nome.strip():
             st.error("Informe o **Nome**."); st.stop()
         pf = _to_float(preco)
@@ -196,21 +237,17 @@ if modo == "Editar existente":
             datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         ]
 
-        # Escrever de volta (mantendo cabeçalho)
+        # Persiste na planilha preservando header
         ws = _sheet().worksheet(ABA)
-        # lê tudo bruto para preservar linhas
         df_old = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0)
         df_old.columns = [c.strip() for c in df_old.columns]
-        # garante colunas
         df_old = _ensure_cols(df_old)
-        # substitui pela versão atualizada (merge por ID)
         ids = df_old["ID"].tolist() if "ID" in df_old.columns else []
         for _, row in df.iterrows():
             if "ID" in row and row["ID"] in ids:
                 i = ids.index(row["ID"])
                 for col in df.columns:
                     df_old.loc[i, col] = row.get(col, "")
-        # grava planilha inteira (mais simples e confiável para manter header)
         ws.clear()
         set_with_dataframe(ws, df_old.fillna(""), include_index=False, include_column_header=True, resize=True)
 
