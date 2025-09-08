@@ -1,21 +1,4 @@
-# pages/01_produtos.py — Catálogo de Produtos (com EstoqueAtual calculado)
-# -*- coding: utf-8 -*-
-import json, unicodedata
-import streamlit as st
-import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe
-from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Produtos — Ebenezér Variedades", page_icon="📦", layout="wide")
-st.title("📦 Produtos — Catálogo & Busca")
-
-# =========================
-# Utilitários
-# =========================
-def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str):
-        return key
     key = key.replace("\\n", "\n")
     key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
     return key
