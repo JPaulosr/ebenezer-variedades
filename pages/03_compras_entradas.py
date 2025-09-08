@@ -46,7 +46,7 @@ def _load_df(aba: str) -> pd.DataFrame:
     ws = _sheet().worksheet(aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
-    return df
+    return df.fillna("")  # <<< evita 'nan'
 
 def _ensure_ws(name: str, headers: list[str]):
     sh = _sheet()
@@ -80,6 +80,18 @@ def _to_float(x):
     try: return float(s)
     except: return ""
 
+def _nz(x):
+    """Normaliza vazio/NaN para string vazia."""
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan", "none") else s
+
 # ========= headers e dados =========
 PRODUTOS_ABA = "Produtos"
 COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
@@ -93,7 +105,6 @@ except Exception as e:
         st.code(str(e))
     st.stop()
 
-# map mínimo para busca
 def _pick_col(df, cands):
     for c in cands:
         if c in df.columns: return c
@@ -109,22 +120,23 @@ COL = {
 # ========= formulário =========
 st.subheader("Nova compra / entrada")
 with st.form("form_compra"):
-    # seleção assistida
     usar_lista = st.checkbox("Selecionar produto da lista", value=True)
     if usar_lista:
         if prod_df.empty:
             st.warning("Sem produtos cadastrados."); st.stop()
+
         def _fmt(r):
-            n = str(r.get(COL["nome"], "(sem nome)"))
-            f = str(r.get(COL["forn"], "") or "").strip()
-            return f"{n}" + (f" — {f}" if f else "")
+            n = _nz(r.get(COL["nome"], "")) or "(sem nome)"
+            f = _nz(r.get(COL["forn"], ""))
+            return n + (f" — {f}" if f else "")
+
         labels = prod_df.apply(_fmt, axis=1).tolist()
         idx = st.selectbox("Produto", options=range(len(prod_df)), format_func=lambda i: labels[i])
         row = prod_df.iloc[idx]
-        prod_nome = str(row.get(COL["nome"], "")).strip()
-        prod_id   = str(row.get(COL["id"], "")).strip()
-        unid_sug  = str(row.get(COL["unid"], "") or "").strip()
-        forn_sug  = str(row.get(COL["forn"], "") or "").strip()
+        prod_nome = _nz(row.get(COL["nome"], ""))
+        prod_id   = _nz(row.get(COL["id"], ""))
+        unid_sug  = _nz(row.get(COL["unid"], ""))
+        forn_sug  = _nz(row.get(COL["forn"], ""))
     else:
         prod_nome = st.text_input("Produto (nome exato)")
         prod_id   = st.text_input("ID (opcional)")
@@ -157,24 +169,24 @@ if salvar:
     _append_row(ws_compras, {
         "Data": data_c.strftime("%d/%m/%Y"),
         "Produto": prod_nome,
-        "Unidade": unid.strip(),
-        "Fornecedor": fornecedor.strip(),
+        "Unidade": _nz(unid),
+        "Fornecedor": _nz(fornecedor),
         "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
         "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
         "Total": f"{total:.2f}".replace(".", ","),
-        "IDProduto": prod_id,
-        "Obs": obs or ""
+        "IDProduto": _nz(prod_id),
+        "Obs": _nz(obs)
     })
     _append_row(ws_mov, {
         "Data": data_c.strftime("%d/%m/%Y"),
-        "IDProduto": prod_id,
+        "IDProduto": _nz(prod_id),
         "Produto": prod_nome,
         "Tipo": "entrada",
         "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-        "Obs": f"Compra — {obs or ''}".strip()
+        "Obs": f"Compra — {_nz(obs)}".strip()
     })
 
-    st.success("Entrada registrada com sucesso! ✅")
+    st.success("Entrada registrado com sucesso! ✅")
     st.toast("Compra lançada", icon="✅")
 
 st.divider()
