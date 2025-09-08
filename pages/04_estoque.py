@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pages/04_estoque.py — Movimentos & Ajustes de Estoque
-import json, unicodedata
+import json, unicodedata, re
 import streamlit as st
 import pandas as pd
 import gspread
@@ -23,10 +23,9 @@ def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None:
         st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): 
+    if isinstance(svc, str):
         svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(svc["private_key"])
+    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
     return svc
 
 @st.cache_resource
@@ -75,12 +74,23 @@ def _append_row(ws, row: dict):
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
+# ========= utilidades =========
 def _to_float_or_zero(x):
-    if x is None or str(x).strip()=="":
+    """Converte strings como '1,16', '11.60', '1.234,56' em float.
+       Remove separadores de milhar sem estragar o decimal."""
+    if x is None: return 0.0
+    s = str(x).strip()
+    if s == "": return 0.0
+    s = s.replace("R$", "").replace(" ", "")
+    s = s.replace(",", ".")               # vírgula -> ponto
+    s = re.sub(r"[^0-9.]", "", s)        # mantém só dígitos e pontos
+    if s.count(".") > 1:                 # 1.234.567.89 -> 1234567.89
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(s)
+    except:
         return 0.0
-    s = str(x).strip().replace("R$", "").replace(".", "").replace(",", ".")
-    try: return float(s)
-    except: return 0.0
 
 def _nz(x):
     if x is None:
@@ -115,7 +125,6 @@ except Exception as e:
         st.code(str(e))
     st.stop()
 
-# harmonização de colunas de Produtos
 COLP = {
     "id":   _pick_col(prod_df, ["ID","Id","id"]),
     "nome": _pick_col(prod_df, ["Nome","Produto","Descrição","Descricao"]),
@@ -123,33 +132,26 @@ COLP = {
 }
 for k,v in COLP.items():
     if v is None and k in ("id","nome"):
-        # cria se necessário para evitar KeyError
         prod_df[k.upper()] = ""
         COLP[k] = k.upper()
 
-# Compras (pode não existir ainda)
 try:
     compras_df = _load_df(ABA_COMPRAS)
 except Exception:
     compras_df = pd.DataFrame(columns=COMPRAS_HEADERS)
 
-# Movimentos (pode não existir ainda)
 try:
     mov_df = _load_df(ABA_MOV)
 except Exception:
     mov_df = pd.DataFrame(columns=MOV_HEADERS)
 
-# ========= Normalização de Compras =========
-# Garante colunas
+# ======== Normalização: Compras ========
 for c in COMPRAS_HEADERS:
     if c not in compras_df.columns:
         compras_df[c] = ""
-
-# Normaliza tipos
 compras_df["Qtd_num"]   = compras_df["Qtd"].apply(_to_float_or_zero)
 compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_float_or_zero)
 
-# Último custo por produto (prioriza IDProduto, se houver)
 def _key_prod(row):
     pid = _nz(row.get("IDProduto",""))
     nome = _nz(row.get("Produto",""))
@@ -157,22 +159,19 @@ def _key_prod(row):
 
 if not compras_df.empty:
     compras_df["__key"] = compras_df.apply(_key_prod, axis=1)
-    # Para custo atual: pega a última compra (por data/ordem do arquivo)
-    # Como o get_as_dataframe já vem na ordem, consideramos a "última" a última linha
+    # última compra por produto (considerando a última linha para cada key)
     last_cost = compras_df.dropna(subset=["__key"]).groupby("__key", as_index=True).tail(1)
     custo_atual_map = {k: v for k, v in zip(last_cost["__key"], last_cost["Custo_num"])}
 else:
     custo_atual_map = {}
 
-# ========= Normalização de Movimentos =========
+# ======== Normalização: Movimentos ========
 for c in MOV_HEADERS:
     if c not in mov_df.columns:
         mov_df[c] = ""
-
 mov_df["Qtd_num"] = mov_df["Qtd"].apply(_to_float_or_zero)
 mov_df["Tipo_s"]  = mov_df["Tipo"].astype(str).str.strip().str.lower()
 
-# Define sinais: entrada +, saída -, ajuste pode ser positivo ou negativo (usuário define sinal via Qtd)
 def _signed_qty(row):
     t = row["Tipo_s"]
     q = row["Qtd_num"]
@@ -181,37 +180,29 @@ def _signed_qty(row):
     elif t in ("saida","saída","saidas","venda","vendas","baixa"):
         return -abs(q)
     elif t in ("ajuste","ajustes"):
-        # ajuste respeita sinal informado (se usuário escrever -5, fica -5)
-        return q
+        return q  # respeita sinal informado
     else:
-        # desconhecido: neutro
         return 0.0
 
 mov_df["Qtd_signed"] = mov_df.apply(_signed_qty, axis=1)
 
-# ========= Montar estoque agregado por produto =========
-# Chave de produto: ID||Nome
+# ======== Montagem do estoque ========
 def _prod_key_from(prod_id, prod_nome):
     return f"{_nz(prod_id)}||{_nz(prod_nome)}".strip("|")
 
-# Base de produtos como referência
 base = prod_df.copy()
 base["__key"] = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
 base["Produto"] = base[COLP["nome"]]
 base["IDProduto"] = base[COLP["id"]] if COLP["id"] else ""
 
-# Agregados de movimentos
 if not mov_df.empty:
     mov_df["__key"] = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
-    grp = mov_df.groupby("__key")["Qtd_signed"].sum().rename("SaldoMov")
-    saldos = grp.reset_index()
+    saldos = mov_df.groupby("__key")["Qtd_signed"].sum().rename("SaldoMov").reset_index()
 else:
     saldos = pd.DataFrame(columns=["__key","SaldoMov"])
 
-# Junta com base de produtos
 df_estoque = base[["__key","Produto","IDProduto"]].merge(saldos, on="__key", how="left").fillna({"SaldoMov":0.0})
 
-# Entradas, Saídas e Ajustes separadas (opcional para exibição)
 def _sum_by(tipo_list):
     if mov_df.empty:
         return pd.DataFrame(columns=["__key","sum"])
@@ -230,15 +221,8 @@ for part in (entradas_sum, saidas_sum, ajustes_sum):
 
 df_estoque[["Entradas","Saidas","Ajustes"]] = df_estoque[["Entradas","Saidas","Ajustes"]].fillna(0.0)
 
-# EstoqueAtual = SaldoMov (entradas - saídas + ajustes)
 df_estoque["EstoqueAtual"] = df_estoque["SaldoMov"].fillna(0.0)
-
-# CustoAtual pelo último custo de compra
-def _custo_for_key(k):
-    return float(custo_atual_map.get(k, 0.0))
-df_estoque["CustoAtual"] = df_estoque["__key"].apply(_custo_for_key)
-
-# Valor total
+df_estoque["CustoAtual"] = df_estoque["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
 df_estoque["ValorTotal"] = df_estoque["EstoqueAtual"].astype(float) * df_estoque["CustoAtual"].astype(float)
 
 # ======== RESUMO ========
@@ -252,11 +236,17 @@ with c3:
 
 st.subheader("Tabela de Estoque")
 cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
-# garante colunas
 for c in cols_show:
     if c not in df_estoque.columns:
         df_estoque[c] = 0 if c not in ("IDProduto","Produto") else ""
 st.dataframe(df_estoque[cols_show].sort_values("Produto"), use_container_width=True, hide_index=True)
+
+with st.expander("🔎 Diagnóstico de custos (últimas compras)"):
+    if not compras_df.empty:
+        show_cols = [c for c in ["Data","Produto","IDProduto","Qtd","Custo Unitário","Total"] if c in compras_df.columns]
+        st.dataframe(compras_df[show_cols].tail(20), use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhuma compra registrada ainda.")
 
 st.divider()
 
@@ -291,18 +281,16 @@ with st.form("form_saida"):
 if salvar_s:
     if not prod_nome_s.strip():
         st.error("Selecione ou digite um produto."); st.stop()
-
     q = _to_float_or_zero(qtd_s)
     if q <= 0:
         st.error("Informe uma quantidade válida (> 0)."); st.stop()
-
     ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
     _append_row(ws_mov, {
         "Data": data_s.strftime("%d/%m/%Y"),
         "IDProduto": _nz(prod_id_s),
         "Produto": prod_nome_s,
         "Tipo": "saida",
-        "Qtd": str(int(q)) if float(q).is_integer() else str(q).replace(".", ","),
+        "Qtd": (str(int(q)) if float(q).is_integer() else str(q)).replace(".", ","),
         "Obs": _nz(obs_s)
     })
     st.success("Saída registrada com sucesso! ✅")
@@ -342,11 +330,9 @@ with st.form("form_ajuste"):
 if salvar_a:
     if not prod_nome_a.strip():
         st.error("Selecione ou digite um produto."); st.stop()
-
     qa = _to_float_or_zero(qtd_a)  # pode ser negativo
     if qa == 0:
         st.error("Informe uma quantidade diferente de zero."); st.stop()
-
     ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
     _append_row(ws_mov, {
         "Data": data_a.strftime("%d/%m/%Y"),
