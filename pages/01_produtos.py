@@ -1,4 +1,4 @@
-# pages/01_produtos.py — Catálogo de Produtos (com EstoqueAtual calculado)
+# pages/01_produtos.py — Catálogo de Produtos (com EstoqueAtual calculado e sem duplicatas)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 import streamlit as st
@@ -68,7 +68,6 @@ def _to_num(s):
     s = str(s).strip()
     if s == "" or s.lower() in ("nan", "none"):
         return 0.0
-    # trata vírgula como decimal
     s = s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".") > 1 else s.replace(",", ".")
     try:
         return float(s)
@@ -238,21 +237,29 @@ if only_low and col_estq_min and col_estq_min in df_merge.columns:
 dfv = df_merge[mask].reset_index(drop=True)
 
 # =========================
-# Exibição (corrigido para evitar KeyError)
+# Exibição — evita nomes duplicados
 # =========================
-rename_map = {}
-if "EstoqueAtual_calc" in dfv.columns:
-    rename_map["EstoqueAtual_calc"] = "EstoqueAtual"
-if "CustoAtual_calc" in dfv.columns:
-    rename_map["CustoAtual_calc"] = "CustoAtual"
-dfv = dfv.rename(columns=rename_map)
+# Cria colunas finais padronizadas (substitui/exibe as calculadas)
+dfv["EstoqueAtual"] = dfv["EstoqueAtual_calc"]
+dfv["CustoAtual"]   = dfv["CustoAtual_calc"]
 
+# Remove colunas auxiliares e deduplica nomes
+for c in ["EstoqueAtual_calc", "CustoAtual_calc", "EstoqueCalc", "CustoMedio", "_ID_join"]:
+    if c in dfv.columns:
+        dfv.drop(columns=[c], inplace=True)
+
+# Se ainda restar nome repetido (vindo da planilha), elimina duplicatas mantendo a 1ª
+dfv = dfv.loc[:, ~dfv.columns.duplicated(keep="first")]
+
+# Monta lista de colunas a exibir (sem repetir)
 cols_candidatas = [
     col_id_prod, col_nome, col_cat, col_forn, col_preco,
     col_estq_min, "EstoqueAtual", "Entradas", "Saidas", "Ajustes", "CustoAtual"
 ]
 cols_show = [c for c in cols_candidatas if c and c in dfv.columns]
+cols_show = list(dict.fromkeys(cols_show))  # garante unicidade
 
+# Exibe
 if cols_show:
     st.dataframe(dfv[cols_show], use_container_width=True, hide_index=True)
 else:
