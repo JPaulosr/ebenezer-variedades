@@ -1,110 +1,364 @@
-# pages/04_estoque.py
 # -*- coding: utf-8 -*-
+# pages/04_estoque.py — Movimentos & Ajustes de Estoque
+import json, unicodedata
 import streamlit as st
 import pandas as pd
 import gspread
-from gspread_dataframe import get_as_dataframe
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-import unicodedata, re
+from datetime import date
 
-st.set_page_config(page_title="Estoque — Movimentos & Ajustes", page_icon="📊", layout="wide")
-st.title("📊 Estoque — Movimentos & Ajustes")
+st.set_page_config(page_title="Estoque — Movimentos & Ajustes", page_icon="📦", layout="wide")
+st.title("📦 Estoque — Movimentos & Ajustes")
 
-# ======================
-# FUNÇÕES AUXILIARES
-# ======================
+# ========= credenciais (MESMO PADRÃO DO 03_) =========
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str):
         return key
-    return key.replace("\\n", "\n")
+    key = key.replace("\\n", "\n")
+    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
+    return key
 
-def _to_num(x):
+def _load_sa():
+    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+    if svc is None:
+        st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+    if isinstance(svc, str): 
+        svc = json.loads(svc)
+    svc = dict(svc)
+    svc["private_key"] = _normalize_private_key(svc["private_key"])
+    return svc
+
+@st.cache_resource
+def _client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def _sheet():
+    gc = _client()
+    url_or_id = st.secrets.get("PLANILHA_URL")
+    if not url_or_id:
+        st.error("🛑 PLANILHA_URL ausente."); st.stop()
+    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
+
+@st.cache_data
+def _load_df(aba: str) -> pd.DataFrame:
+    ws = _sheet().worksheet(aba)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
+    return df.fillna("")
+
+def _ensure_ws(name: str, headers: list[str]):
+    sh = _sheet()
     try:
-        return float(str(x).replace(",", "."))
-    except:
-        return 0
+        ws = sh.worksheet(name)
+        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+        if cur.empty or any(h not in cur.columns for h in headers):
+            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
+            df_head = pd.DataFrame(columns=cols)
+            ws.clear()
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
 
-def _norm(s: str) -> str:
-    s = str(s)
-    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    s = re.sub(r"[\W_]+", "", s, flags=re.UNICODE)  # remove acentos, espaços, símbolos
-    return s.lower()
+def _append_row(ws, row: dict):
+    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+    for col in cur.columns:
+        row.setdefault(col, "")
+    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-# ======================
-# CONEXÃO GOOGLE SHEETS
-# ======================
-SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
-ABA_ESTOQUE = "Estoque"
+def _to_float_or_zero(x):
+    if x is None or str(x).strip()=="":
+        return 0.0
+    s = str(x).strip().replace("R$", "").replace(".", "").replace(",", ".")
+    try: return float(s)
+    except: return 0.0
 
-scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-creds = Credentials.from_service_account_info(
-    st.secrets["gcp_service_account"],
-    scopes=scope
-)
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(SHEET_ID)
-worksheet = sh.worksheet(ABA_ESTOQUE)
+def _nz(x):
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan", "none") else s
 
-df_estoque = get_as_dataframe(worksheet, dtype=str).fillna("")
+def _pick_col(df, cands):
+    for c in cands:
+        if c in df.columns: return c
+    return None
 
-# ======================
-# AJUSTE DE COLUNAS
-# ======================
-esperadas = ["Entradas", "Saidas", "Ajustes", "EstoqueAtual", "CustoAtual"]
+# ========= Abas & headers =========
+ABA_PRODUTOS  = "Produtos"
+ABA_COMPRAS   = "Compras"
+ABA_MOV       = "MovimentosEstoque"
 
-# mapa normalizado -> original
-norm2orig = {_norm(c): c for c in df_estoque.columns}
+COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
+MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
 
-custo_aliases = ["custoatual", "customedio", "custounitario", "custo", "precoatual", "precomedio"]
+# ========= Carregar bases =========
+try:
+    prod_df = _load_df(ABA_PRODUTOS)
+except Exception as e:
+    st.error("Erro ao abrir a aba Produtos.")
+    with st.expander("Detalhes"):
+        st.code(str(e))
+    st.stop()
 
-for alvo in esperadas:
-    alvo_norm = _norm(alvo)
-
-    if alvo == "CustoAtual":
-        achou = None
-        for cand in custo_aliases:
-            if cand in norm2orig:
-                achou = norm2orig[cand]
-                break
-        if achou:
-            if achou != "CustoAtual":
-                df_estoque.rename(columns={achou: "CustoAtual"}, inplace=True)
-        else:
-            df_estoque["CustoAtual"] = 0
-        continue
-
-    if alvo_norm in norm2orig:
-        col_orig = norm2orig[alvo_norm]
-        if col_orig != alvo:
-            df_estoque.rename(columns={col_orig: alvo}, inplace=True)
-    else:
-        df_estoque[alvo] = 0
-
-# converter para numérico
-num_cols = ["Entradas", "Saidas", "Ajustes", "EstoqueAtual", "CustoAtual"]
-df_estoque[num_cols] = df_estoque[num_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-
-# ======================
-# LÓGICA DE ESTOQUE
-# ======================
-df_estoque["EstoqueFinal"] = (
-    df_estoque["Entradas"]
-    - df_estoque["Saidas"]
-    + df_estoque["Ajustes"]
-    + df_estoque["EstoqueAtual"]
-)
-
-df_estoque["ValorTotal"] = df_estoque["EstoqueFinal"] * df_estoque["CustoAtual"]
-
-# ======================
-# EXIBIÇÃO
-# ======================
-st.subheader("📦 Estoque Atual")
-st.dataframe(df_estoque, use_container_width=True, hide_index=True)
-
-totais = {
-    "Total Itens": df_estoque["EstoqueFinal"].sum(),
-    "Valor Total (R$)": df_estoque["ValorTotal"].sum()
+# harmonização de colunas de Produtos
+COLP = {
+    "id":   _pick_col(prod_df, ["ID","Id","id"]),
+    "nome": _pick_col(prod_df, ["Nome","Produto","Descrição","Descricao"]),
+    "unid": _pick_col(prod_df, ["Unidade","Unid"]),
 }
-st.metric("Total de Itens", f"{totais['Total Itens']:.0f}")
-st.metric("Valor Total", f"R$ {totais['Valor Total (R$)']:.2f}")
+for k,v in COLP.items():
+    if v is None and k in ("id","nome"):
+        # cria se necessário para evitar KeyError
+        prod_df[k.upper()] = ""
+        COLP[k] = k.upper()
+
+# Compras (pode não existir ainda)
+try:
+    compras_df = _load_df(ABA_COMPRAS)
+except Exception:
+    compras_df = pd.DataFrame(columns=COMPRAS_HEADERS)
+
+# Movimentos (pode não existir ainda)
+try:
+    mov_df = _load_df(ABA_MOV)
+except Exception:
+    mov_df = pd.DataFrame(columns=MOV_HEADERS)
+
+# ========= Normalização de Compras =========
+# Garante colunas
+for c in COMPRAS_HEADERS:
+    if c not in compras_df.columns:
+        compras_df[c] = ""
+
+# Normaliza tipos
+compras_df["Qtd_num"]   = compras_df["Qtd"].apply(_to_float_or_zero)
+compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_float_or_zero)
+
+# Último custo por produto (prioriza IDProduto, se houver)
+def _key_prod(row):
+    pid = _nz(row.get("IDProduto",""))
+    nome = _nz(row.get("Produto",""))
+    return (pid or "").strip() + "||" + (nome or "").strip()
+
+if not compras_df.empty:
+    compras_df["__key"] = compras_df.apply(_key_prod, axis=1)
+    # Para custo atual: pega a última compra (por data/ordem do arquivo)
+    # Como o get_as_dataframe já vem na ordem, consideramos a "última" a última linha
+    last_cost = compras_df.dropna(subset=["__key"]).groupby("__key", as_index=True).tail(1)
+    custo_atual_map = {k: v for k, v in zip(last_cost["__key"], last_cost["Custo_num"])}
+else:
+    custo_atual_map = {}
+
+# ========= Normalização de Movimentos =========
+for c in MOV_HEADERS:
+    if c not in mov_df.columns:
+        mov_df[c] = ""
+
+mov_df["Qtd_num"] = mov_df["Qtd"].apply(_to_float_or_zero)
+mov_df["Tipo_s"]  = mov_df["Tipo"].astype(str).str.strip().str.lower()
+
+# Define sinais: entrada +, saída -, ajuste pode ser positivo ou negativo (usuário define sinal via Qtd)
+def _signed_qty(row):
+    t = row["Tipo_s"]
+    q = row["Qtd_num"]
+    if t in ("entrada","entradas","compra"):
+        return q
+    elif t in ("saida","saída","saidas","venda","vendas","baixa"):
+        return -abs(q)
+    elif t in ("ajuste","ajustes"):
+        # ajuste respeita sinal informado (se usuário escrever -5, fica -5)
+        return q
+    else:
+        # desconhecido: neutro
+        return 0.0
+
+mov_df["Qtd_signed"] = mov_df.apply(_signed_qty, axis=1)
+
+# ========= Montar estoque agregado por produto =========
+# Chave de produto: ID||Nome
+def _prod_key_from(prod_id, prod_nome):
+    return f"{_nz(prod_id)}||{_nz(prod_nome)}".strip("|")
+
+# Base de produtos como referência
+base = prod_df.copy()
+base["__key"] = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
+base["Produto"] = base[COLP["nome"]]
+base["IDProduto"] = base[COLP["id"]] if COLP["id"] else ""
+
+# Agregados de movimentos
+if not mov_df.empty:
+    mov_df["__key"] = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
+    grp = mov_df.groupby("__key")["Qtd_signed"].sum().rename("SaldoMov")
+    saldos = grp.reset_index()
+else:
+    saldos = pd.DataFrame(columns=["__key","SaldoMov"])
+
+# Junta com base de produtos
+df_estoque = base[["__key","Produto","IDProduto"]].merge(saldos, on="__key", how="left").fillna({"SaldoMov":0.0})
+
+# Entradas, Saídas e Ajustes separadas (opcional para exibição)
+def _sum_by(tipo_list):
+    if mov_df.empty:
+        return pd.DataFrame(columns=["__key","sum"])
+    m = mov_df[mov_df["Tipo_s"].isin(tipo_list)].copy()
+    if m.empty:
+        return pd.DataFrame(columns=["__key","sum"])
+    m["__key"] = m.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
+    return m.groupby("__key")["Qtd_num"].sum().reset_index().rename(columns={"Qtd_num":"sum"})
+
+entradas_sum = _sum_by(["entrada","entradas","compra"]).rename(columns={"sum":"Entradas"})
+saidas_sum   = _sum_by(["saida","saída","saidas","venda","vendas","baixa"]).rename(columns={"sum":"Saidas"})
+ajustes_sum  = _sum_by(["ajuste","ajustes"]).rename(columns={"sum":"Ajustes"})
+
+for part in (entradas_sum, saidas_sum, ajustes_sum):
+    df_estoque = df_estoque.merge(part, on="__key", how="left")
+
+df_estoque[["Entradas","Saidas","Ajustes"]] = df_estoque[["Entradas","Saidas","Ajustes"]].fillna(0.0)
+
+# EstoqueAtual = SaldoMov (entradas - saídas + ajustes)
+df_estoque["EstoqueAtual"] = df_estoque["SaldoMov"].fillna(0.0)
+
+# CustoAtual pelo último custo de compra
+def _custo_for_key(k):
+    return float(custo_atual_map.get(k, 0.0))
+df_estoque["CustoAtual"] = df_estoque["__key"].apply(_custo_for_key)
+
+# Valor total
+df_estoque["ValorTotal"] = df_estoque["EstoqueAtual"].astype(float) * df_estoque["CustoAtual"].astype(float)
+
+# ======== RESUMO ========
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("🧮 Itens com estoque > 0", int((df_estoque["EstoqueAtual"] > 0).sum()))
+with c2:
+    st.metric("📦 Quantidade total em estoque", f"{df_estoque['EstoqueAtual'].sum():.0f}")
+with c3:
+    st.metric("💰 Valor total (R$)", f"R$ {df_estoque['ValorTotal'].sum():.2f}")
+
+st.subheader("Tabela de Estoque")
+cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
+# garante colunas
+for c in cols_show:
+    if c not in df_estoque.columns:
+        df_estoque[c] = 0 if c not in ("IDProduto","Produto") else ""
+st.dataframe(df_estoque[cols_show].sort_values("Produto"), use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ======== FORM: Registrar Saída ========
+st.subheader("➖ Registrar Saída / Baixa de Estoque")
+with st.form("form_saida"):
+    usar_lista_s = st.checkbox("Selecionar produto da lista", value=True, key="saida_lista")
+    if usar_lista_s:
+        if df_estoque.empty:
+            st.warning("Sem produtos para saída."); st.stop()
+
+        def _fmt_saida(i):
+            r = df_estoque.iloc[i]
+            return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
+
+        idx = st.selectbox("Produto", options=range(len(df_estoque)), format_func=_fmt_saida)
+        row = df_estoque.iloc[idx]
+        prod_nome_s = _nz(row["Produto"])
+        prod_id_s   = _nz(row["IDProduto"])
+    else:
+        prod_nome_s = st.text_input("Produto (nome exato)", key="saida_nome")
+        prod_id_s   = st.text_input("ID (opcional)", key="saida_id")
+
+    csa, csb = st.columns(2)
+    with csa:
+        data_s = st.date_input("Data da saída", value=date.today(), key="saida_data")
+    with csb:
+        qtd_s  = st.text_input("Qtd", placeholder="Ex.: 2", key="saida_qtd")
+    obs_s = st.text_input("Observações (opcional)", key="saida_obs")
+    salvar_s = st.form_submit_button("Registrar saída")
+
+if salvar_s:
+    if not prod_nome_s.strip():
+        st.error("Selecione ou digite um produto."); st.stop()
+
+    q = _to_float_or_zero(qtd_s)
+    if q <= 0:
+        st.error("Informe uma quantidade válida (> 0)."); st.stop()
+
+    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
+    _append_row(ws_mov, {
+        "Data": data_s.strftime("%d/%m/%Y"),
+        "IDProduto": _nz(prod_id_s),
+        "Produto": prod_nome_s,
+        "Tipo": "saida",
+        "Qtd": str(int(q)) if float(q).is_integer() else str(q).replace(".", ","),
+        "Obs": _nz(obs_s)
+    })
+    st.success("Saída registrada com sucesso! ✅")
+    st.toast("Saída lançada", icon="➖")
+
+st.divider()
+
+# ======== FORM: Registrar Ajuste ========
+st.subheader("🛠️ Registrar Ajuste de Estoque")
+with st.form("form_ajuste"):
+    usar_lista_a = st.checkbox("Selecionar produto da lista", value=True, key="ajuste_lista")
+    if usar_lista_a:
+        if df_estoque.empty:
+            st.warning("Sem produtos para ajuste."); st.stop()
+
+        def _fmt_aj(i):
+            r = df_estoque.iloc[i]
+            return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
+
+        idxa = st.selectbox("Produto", options=range(len(df_estoque)), format_func=_fmt_aj, key="ajuste_idx")
+        rowa = df_estoque.iloc[idxa]
+        prod_nome_a = _nz(rowa["Produto"])
+        prod_id_a   = _nz(rowa["IDProduto"])
+    else:
+        prod_nome_a = st.text_input("Produto (nome exato)", key="ajuste_nome")
+        prod_id_a   = st.text_input("ID (opcional)", key="ajuste_id")
+
+    ca1, ca2 = st.columns(2)
+    with ca1:
+        data_a = st.date_input("Data do ajuste", value=date.today(), key="ajuste_data")
+    with ca2:
+        qtd_a  = st.text_input("Qtd (use negativo para baixar, positivo para repor)", placeholder="Ex.: -1 ou 5", key="ajuste_qtd")
+
+    obs_a = st.text_input("Motivo/Observações", key="ajuste_obs")
+    salvar_a = st.form_submit_button("Registrar ajuste")
+
+if salvar_a:
+    if not prod_nome_a.strip():
+        st.error("Selecione ou digite um produto."); st.stop()
+
+    qa = _to_float_or_zero(qtd_a)  # pode ser negativo
+    if qa == 0:
+        st.error("Informe uma quantidade diferente de zero."); st.stop()
+
+    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
+    _append_row(ws_mov, {
+        "Data": data_a.strftime("%d/%m/%Y"),
+        "IDProduto": _nz(prod_id_a),
+        "Produto": prod_nome_a,
+        "Tipo": "ajuste",
+        "Qtd": (str(int(qa)) if float(qa).is_integer() else str(qa)).replace(".", ","),
+        "Obs": _nz(obs_a)
+    })
+    st.success("Ajuste registrado com sucesso! ✅")
+    st.toast("Ajuste lançado", icon="🛠️")
+
+st.divider()
+st.page_link("pages/03_compras_entradas.py", label="🧾 Registrar Compras / Entradas", icon="🧾")
+st.page_link("pages/01_produtos.py", label="📦 Ir ao Catálogo", icon="📦")
