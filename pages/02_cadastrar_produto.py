@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# pages/02_cadastrar_produto.py — Cadastrar/Editar Produtos com cálculo automático
+# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos
 import json, unicodedata, math
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 st.set_page_config(page_title="Cadastrar/Editar Produto", page_icon="➕", layout="wide")
 st.title("➕ Cadastrar / Editar Produto")
@@ -63,31 +63,50 @@ def _to_float(x):
     if x is None or str(x).strip()=="":
         return ""
     s = str(x).strip().replace("R$", "").replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return ""
+    try: return float(s)
+    except: return ""
 
 def _to_int(x):
     if x is None or str(x).strip()=="":
         return ""
-    try:
-        return int(float(str(x).strip().replace(",", ".")))
-    except:
-        return ""
+    try: return int(float(str(x).strip().replace(",", ".")))
+    except: return ""
 
 def _gen_id():
     return "P-" + datetime.now().strftime("%Y%m%d%H%M%S")
 
 def _msg_ok(msg):
     st.success(msg)
+    try: st.cache_data.clear()
+    except: pass
+
+def _ensure_ws(name: str, headers: list[str]):
+    sh = _sheet()
     try:
-        st.cache_data.clear()
-    except:
-        pass
+        ws = sh.worksheet(name)
+        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+        if cur.empty or any(h not in cur.columns for h in headers):
+            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
+            df_head = pd.DataFrame(columns=cols)
+            ws.clear()
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+
+def _append_row(ws, row: dict):
+    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+    for col in cur.columns:
+        row.setdefault(col, "")
+    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
 # =============================================================================
-# Mapeamentos flexíveis da aba Produtos
+# Mapeamentos flexíveis
 # =============================================================================
 def _pick_col(df, candidates):
     for c in candidates:
@@ -115,7 +134,6 @@ def _map_cols_produtos(df):
         "atualizado": _pick_col(df, ["AtualizadoEm","Atualizado Em","Atualizado"])
     }
 
-# Mapeamentos de outras abas (candidatos comuns)
 def _map_cols_compras(df):
     return {
         "data": _pick_col(df, ["Data","DATA"]),
@@ -123,7 +141,7 @@ def _map_cols_compras(df):
         "unid": _pick_col(df, ["Unidade","Unid"]),
         "forn": _pick_col(df, ["Fornecedor","FornecedorNome"]),
         "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "custo_unit": _pick_col(df, ["CustoUnit","Custo Unitário","Custo Unidade","PrecoUnitario","Preço Unitário"]),
+        "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Custo Unit","PrecoUnitario","Preço Unitário"]),
         "total": _pick_col(df, ["Total","ValorTotal"]),
         "id": _pick_col(df, ["IDProduto","ID"])
     }
@@ -146,13 +164,11 @@ def _map_cols_vendas(df):
     }
 
 def _map_cols_forn(df):
-    return {
-        "forn": _pick_col(df, ["Fornecedor","Nome"]),
-        "lead": _pick_col(df, ["LeadTimeDias","Lead Time","Lead"])
-    }
+    return {"forn": _pick_col(df, ["Fornecedor","Nome"]),
+            "lead": _pick_col(df, ["LeadTimeDias","Lead Time","Lead"])}
 
 # =============================================================================
-# Carregar dados base
+# Carregar dados
 # =============================================================================
 ABA = "Produtos"
 try:
@@ -164,7 +180,6 @@ except Exception as e:
     st.stop()
 
 COL = _map_cols_produtos(df)
-
 compras_df   = _safe_load("Compras")
 movest_df    = _safe_load("MovimentosEstoque")
 vendas_df    = _safe_load("Vendas")
@@ -175,32 +190,29 @@ MOV = _map_cols_mov(movest_df) if not movest_df.empty else {}
 VEN = _map_cols_vendas(vendas_df) if not vendas_df.empty else {}
 FD  = _map_cols_forn(forn_df) if not forn_df.empty else {}
 
+# Cabeçalhos padrão (se criar do zero)
+COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
+MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
+
 # =============================================================================
-# Funções de cálculo automático
+# Funções de cálculo
 # =============================================================================
 def _last_cost_and_unit(nome: str, fornecedor: str|None):
     if compras_df.empty or not CMP:
         return None, None
     base = compras_df.copy()
-    # filtro por produto (obrigatório)
     if CMP.get("nome"):
         base = base[ base[CMP["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-    # se tiver fornecedor, filtra também
     if fornecedor and CMP.get("forn"):
         base = base[ base[CMP["forn"]].astype(str).str.strip().str.lower() == fornecedor.strip().lower() ]
     if base.empty:
         return None, None
-    # ordena por data desc se existir
-    if CMP.get("data") and pd.api.types.is_datetime64_any_dtype(pd.to_datetime(base[CMP["data"]], errors="coerce")):
-        base = base.assign(__d = pd.to_datetime(base[CMP["data"]], errors="coerce")).sort_values("__d", ascending=False)
-    # pega primeira linha como último registro
-    row = base.iloc[0]
+    row = base.assign(__d=pd.to_datetime(base.get(CMP.get("data",""), None), errors="coerce")).sort_values("__d", ascending=False).iloc[0]
     custo = _to_float(row.get(CMP.get("custo_unit",""), ""))
     unid  = str(row.get(CMP.get("unid",""), "")).strip() or None
-    return custo if custo not in ("", None) else None, unid
+    return (custo if custo not in ("", None) else None), unid
 
 def _stock_balance(prod_id: str|None, nome: str):
-    # Prioridade: MovimentosEstoque; fallback: Vendas (saídas)
     saldo = 0
     has_any = False
     if not movest_df.empty and MOV:
@@ -214,7 +226,6 @@ def _stock_balance(prod_id: str|None, nome: str):
             ent = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["entrada","compra","ajuste+","entrada manual","in"]) ][MOV["qtd"]].apply(_to_float).sum()
             sai = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out"]) ][MOV["qtd"]].apply(_to_float).sum()
             saldo = (ent or 0) - (sai or 0)
-
     if not has_any and (not vendas_df.empty) and VEN:
         base = vendas_df.copy()
         if prod_id and VEN.get("id"):
@@ -222,29 +233,23 @@ def _stock_balance(prod_id: str|None, nome: str):
         elif VEN.get("nome"):
             base = base[ base[VEN["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
         if not base.empty:
-            # consideramos vendas como saídas e não temos entradas, então saldo tende a ficar negativo
-            # para não confundir, retornamos 0 nesse caso (até ter movimentos de entrada)
             return 0
     return int(round(saldo, 0))
 
 def _avg_daily_sales_30d(prod_id: str|None, nome: str):
-    if vendas_df.empty or not VEN:
+    if vendas_df.empty or not VEN or VEN.get("data") is None:
         return 0.0
     base = vendas_df.copy()
-    if VEN.get("data") is None:
-        return 0.0
     base["__d"] = pd.to_datetime(base[VEN["data"]], errors="coerce")
     maxd = base["__d"].max()
-    if pd.isna(maxd):
-        return 0.0
+    if pd.isna(maxd): return 0.0
     start = maxd - timedelta(days=30)
     base = base[ base["__d"] >= start ]
     if prod_id and VEN.get("id"):
         base = base[ base[VEN["id"]].astype(str) == str(prod_id) ]
     elif VEN.get("nome"):
         base = base[ base[VEN["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-    if base.empty:
-        return 0.0
+    if base.empty: return 0.0
     qty = base[VEN["qtd"]].apply(_to_float).sum()
     days = max((maxd - start).days, 1)
     return float(qty) / float(days)
@@ -254,19 +259,18 @@ def _lead_time_fornecedor(fornecedor: str|None):
         return None
     base = forn_df.copy()
     base = base[ base[FD["forn"]].astype(str).str.strip().str.lower() == fornecedor.strip().lower() ]
-    if base.empty:
-        return None
+    if base.empty: return None
     v = _to_int(base.iloc[0].get(FD["lead"], ""))
     return v if v != "" else None
 
 def _calc_est_min(avg_daily: float, lead_time_days: int|None):
-    lt = lead_time_days if lead_time_days not in (None, "", 0) else 7  # default 7 dias
-    safety = 1.2  # 20% de folga
+    lt = lead_time_days if lead_time_days not in (None, "", 0) else 7
+    safety = 1.2
     estmin = math.ceil(avg_daily * lt * safety)
-    return estmin if estmin > 0 else 5  # fallback 5
+    return estmin if estmin > 0 else 5
 
 # =============================================================================
-# UI — escolher ação
+# UI — ação
 # =============================================================================
 m1, m2 = st.columns([1.4, 2])
 with m1:
@@ -281,14 +285,10 @@ st.divider()
 # =============================================================================
 if modo == "Editar existente":
     cc0, cc1, cc2, cc3 = st.columns([1.6, 1.1, 1.1, 1.2])
-    with cc0:
-        usar_lista = st.checkbox("Selecionar da lista (auto-sugestão)", value=True)
-    with cc1:
-        apenas_ativos = st.checkbox("Apenas ativos", value=True)
-    with cc2:
-        so_estoque = st.checkbox("Somente com estoque (>0)", value=False)
-    with cc3:
-        recalc_auto = st.checkbox("Atualizar campos calculados", value=True)
+    with cc0: usar_lista = st.checkbox("Selecionar da lista (auto-sugestão)", value=True)
+    with cc1: apenas_ativos = st.checkbox("Apenas ativos", value=True)
+    with cc2: so_estoque = st.checkbox("Somente com estoque (>0)", value=False)
+    with cc3: recalc_auto = st.checkbox("Atualizar campos calculados", value=True)
 
     base = df.copy()
     if COL["ativo"] and apenas_ativos:
@@ -301,7 +301,7 @@ if modo == "Editar existente":
 
     if usar_lista:
         if base.empty:
-            st.info("Nada encontrado para os filtros atuais."); st.stop()
+            st.info("Nada encontrado."); st.stop()
         def _fmt_row(r):
             nome = str(r.get(COL["nome"], "(sem nome)"))
             forn = str(r.get(COL["forn"], "")).strip()
@@ -319,46 +319,36 @@ if modo == "Editar existente":
             t = termo.lower()
             base = base[base.apply(lambda row: t in " ".join([str(x).lower() for x in row.values]), axis=1)]
         if base.empty:
-            st.info("Nada encontrado para os filtros atuais."); st.stop()
+            st.info("Nada encontrado."); st.stop()
         nomes_fmt = base.apply(
             lambda r: f'{str(r.get(COL["nome"],"(sem nome)"))} — {str(r.get(COL["forn"],"")).strip() or "s/ forn"} — R$ {str(r.get(COL["preco"],"")).strip()}',
             axis=1
         ).tolist()
-        pos = st.selectbox("Selecione um produto", options=range(len(base)), format_func=lambda i: nomes_fmt[i])
+        pos = st.selectbox("Selecione", options=range(len(base)), format_func=lambda i: nomes_fmt[i])
         sel = base.iloc[pos].to_dict()
 
-    # Form
     st.subheader("Editar")
     with st.form("editar_produto"):
         c1, c2, c3 = st.columns([1.6,1,1])
-        with c1:
-            nome = st.text_input("Nome", value=str(sel.get(COL["nome"],"")).strip())
-        with c2:
-            categoria = st.text_input("Categoria", value=str(sel.get(COL["categoria"],"")).strip())
-        with c3:
-            fornecedor = st.text_input("Fornecedor", value=str(sel.get(COL["forn"],"")).strip())
-
+        with c1: nome = st.text_input("Nome", value=str(sel.get(COL["nome"],"")).strip())
+        with c2: categoria = st.text_input("Categoria", value=str(sel.get(COL["categoria"],"")).strip())
+        with c3: fornecedor = st.text_input("Fornecedor", value=str(sel.get(COL["forn"],"")).strip())
         c4, c5, c6 = st.columns([1,1,1])
-        with c4:
-            preco = st.text_input("Preço venda (R$)", value=str(sel.get(COL["preco"],"")).strip())
-        with c5:
-            # estoque aparece apenas para conferência/ajuste manual (pode deixar como está que recalcula se recalc_auto=True)
-            estoque = st.text_input("Estoque atual (un)", value=str(sel.get(COL["estoque"],"")).strip())
+        with c4: preco = st.text_input("Preço venda (R$)", value=str(sel.get(COL["preco"],"")).strip())
+        with c5: estoque = st.text_input("Estoque atual (un)", value=str(sel.get(COL["estoque"],"")).strip())
         with c6:
             ativo_flag = str(sel.get(COL["ativo"],"")).strip().lower() in ["1","true","sim","ativo","yes"]
             ativo = st.checkbox("Ativo", value=ativo_flag)
 
-        # informativo dos calculados
-        with st.expander("Campos calculados automaticamente (informativo)", expanded=False):
-            st.caption("Serão recalculados ao salvar se **Atualizar campos calculados** estiver marcado.")
-            _custo_preview, _unid_preview = _last_cost_and_unit(nome, fornecedor)
-            _lead_preview = _lead_time_fornecedor(fornecedor)
-            _avg30 = _avg_daily_sales_30d(sel.get(COL["id"], ""), nome)
-            _estmin_preview = _calc_est_min(_avg30, _lead_preview)
-            st.write(f"**CustoAtual (prev.)**: {(_custo_preview if _custo_preview is not None else '—')}")
-            st.write(f"**Unidade (prev.)**: {(_unid_preview or '—')}")
-            st.write(f"**LeadTimeDias (prev.)**: {(_lead_preview if _lead_preview is not None else '—')}")
-            st.write(f"**EstoqueMin (prev.)**: {_estmin_preview}")
+        # --- compra/entrada opcional na edição ---
+        st.markdown("#### 🧾 Lançar nova compra/entrada (opcional)")
+        c7, c8, c9, c10 = st.columns([1,1,1,1])
+        with c7: data_compra_e = st.date_input("Data da compra", value=date.today(), key="dc_e")
+        with c8: qtd_compra_e  = st.text_input("Qtd comprada", placeholder="Ex.: 10", key="qc_e")
+        with c9: custo_unit_e  = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50", key="cu_e")
+        with c10: unid_compra_e = st.text_input("Unidade", value=str(sel.get(COL["unidade"],"")), key="un_e")
+        forn_compra_e = st.text_input("Fornecedor (compra)", value=fornecedor, key="fo_e")
+        obs_compra_e  = st.text_input("Observações (opcional)", key="ob_e")
 
         salvar = st.form_submit_button("💾 Atualizar produto")
 
@@ -366,11 +356,8 @@ if modo == "Editar existente":
         if not nome.strip():
             st.error("Informe o **Nome**."); st.stop()
         pf = _to_float(preco)
-        if pf == "":
-            st.error("Preço inválido. Use números (ex: 19,90)."); st.stop()
-        est_in = _to_int(estoque)
-        if est_in == "":
-            est_in = None
+        if pf == "": st.error("Preço inválido. Use números (ex: 19,90)."); st.stop()
+        est_in = _to_int(estoque); est_in = None if est_in == "" else est_in
 
         updates = {}
         if COL["nome"]:      updates[COL["nome"]] = nome.strip()
@@ -378,49 +365,75 @@ if modo == "Editar existente":
         if COL["forn"]:      updates[COL["forn"]] = fornecedor.strip()
         if COL["preco"]:     updates[COL["preco"]] = f"{pf:.2f}".replace(".", ",")
 
-        # Recalcular automáticos
-        if recalc_auto:
-            custo, unid = _last_cost_and_unit(nome, fornecedor)
-            if custo is not None and COL["custo"]:   updates[COL["custo"]] = f"{custo:.2f}".replace(".", ",")
-            if unid and COL["unidade"]:              updates[COL["unidade"]] = unid
-            lead = _lead_time_fornecedor(fornecedor)
-            if (lead is not None) and COL["lead"]:   updates[COL["lead"]] = str(lead)
-            # estoque atual preferencialmente por movimentos; se não houver, mantém o digitado
-            saldo = _stock_balance(sel.get(COL["id"], ""), nome)
-            if COL["estoque"]:                       updates[COL["estoque"]] = str(saldo if saldo is not None else (est_in or 0))
+        # compra/entrada opcional
+        qtd_f = _to_float(qtd_compra_e)
+        cst_f = _to_float(custo_unit_e)
+        fazer_compra_e = (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0))
+        if fazer_compra_e:
+            ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
+            total = round(float(qtd_f) * float(cst_f), 2)
+            prod_id = sel.get(COL["id"], sel.get("ID", ""))
+            _append_row(ws_compras, {
+                "Data": data_compra_e.strftime("%d/%m/%Y"),
+                "Produto": nome.strip(),
+                "Unidade": (unid_compra_e or "").strip(),
+                "Fornecedor": (forn_compra_e or "").strip(),
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+                "Total": f"{total:.2f}".replace(".", ","),
+                "IDProduto": prod_id,
+                "Obs": obs_compra_e or ""
+            })
+            ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+            _append_row(ws_mov, {
+                "Data": data_compra_e.strftime("%d/%m/%Y"),
+                "IDProduto": prod_id,
+                "Produto": nome.strip(),
+                "Tipo": "entrada",
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Obs": f"Compra — {obs_compra_e or ''}".strip()
+            })
+            if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+            if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
+
+        # Recalc automáticos (estoque min, lead etc.)
+        if recalc_auto or fazer_compra_e:
+            custo_prev, unid_prev = _last_cost_and_unit(nome, fornecedor)
+            lead_prev = _lead_time_fornecedor(fornecedor)
             avg30 = _avg_daily_sales_30d(sel.get(COL["id"], ""), nome)
-            estmin = _calc_est_min(avg30, lead)
-            if COL["est_min"]:                       updates[COL["est_min"]] = str(estmin)
+            estmin = _calc_est_min(avg30, lead_prev)
+            if (custo_prev is not None) and COL["custo"]:   updates.setdefault(COL["custo"], f"{custo_prev:.2f}".replace(".", ","))
+            if unid_prev and COL["unidade"]:                updates.setdefault(COL["unidade"], unid_prev)
+            if (lead_prev is not None) and COL["lead"]:     updates.setdefault(COL["lead"], str(lead_prev))
+            saldo = _stock_balance(sel.get(COL["id"], ""), nome)
+            if COL["estoque"]:                               updates.setdefault(COL["estoque"], str(saldo if saldo is not None else (est_in or 0)))
+            if COL["est_min"]:                               updates[COL["est_min"]] = str(estmin)
         else:
             if est_in is not None and COL["estoque"]:
                 updates[COL["estoque"]] = str(est_in)
 
-        if COL["ativo"]:     updates[COL["ativo"]] = "sim" if ativo else "não"
-        if COL["atualizado"]: updates[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        if COL["ativo"]:       updates[COL["ativo"]] = "sim" if ativo else "não"
+        if COL["atualizado"]:  updates[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
         id_col = COL["id"] or "ID"
         if id_col not in df.columns:
-            st.error("Coluna de ID não encontrada na planilha."); st.stop()
+            st.error("Coluna de ID não encontrada."); st.stop()
         row_mask = (df[id_col] == sel.get(id_col, ""))
         if not row_mask.any():
-            st.error("Não foi possível localizar a linha para atualizar."); st.stop()
-
-        for k, v in updates.items():
-            if k in df.columns:
-                df.loc[row_mask, k] = v
+            st.error("Linha não localizada."); st.stop()
 
         ws = _sheet().worksheet(ABA)
         df_old = _load_df(ABA)
         ids = df_old[id_col].tolist()
         i = ids.index(sel.get(id_col, "")) if sel.get(id_col, "") in ids else None
         if i is None:
-            st.error("Falha ao localizar a linha na planilha."); st.stop()
+            st.error("Falha ao localizar a linha."); st.stop()
         for col, val in updates.items():
             if col in df_old.columns:
                 df_old.loc[i, col] = val
         ws.clear()
         set_with_dataframe(ws, df_old.fillna(""), include_index=False, include_column_header=True, resize=True)
-        _msg_ok("Produto atualizado com sucesso! Campos calculados aplicados.")
+        _msg_ok("Produto atualizado com sucesso! 👍")
 
 # =============================================================================
 # CADASTRAR NOVO
@@ -429,18 +442,21 @@ else:
     st.subheader("Cadastrar novo produto")
     with st.form("cadastrar_produto"):
         c1, c2, c3 = st.columns([1.6,1,1])
-        with c1:
-            nome = st.text_input("Nome")
-        with c2:
-            categoria = st.text_input("Categoria", placeholder="Ex.: limpeza, higiene…")
-        with c3:
-            fornecedor = st.text_input("Fornecedor")
-
+        with c1: nome = st.text_input("Nome")
+        with c2: categoria = st.text_input("Categoria", placeholder="Ex.: limpeza, higiene…")
+        with c3: fornecedor = st.text_input("Fornecedor")
         c4, c5 = st.columns([1,1])
-        with c4:
-            preco = st.text_input("Preço venda (R$)", placeholder="19,90")
-        with c5:
-            ativo = st.checkbox("Ativo", value=True)
+        with c4: preco = st.text_input("Preço venda (R$)", placeholder="19,90")
+        with c5: ativo = st.checkbox("Ativo", value=True)
+
+        st.markdown("#### 📦 Estoque inicial (opcional, recomendado)")
+        c6, c7, c8, c9 = st.columns([1,1,1,1])
+        with c6: qtd_compra = st.text_input("Qtd comprada", placeholder="Ex.: 10")
+        with c7: custo_unit = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50")
+        with c8: unid_compra = st.text_input("Unidade", placeholder="Ex.: un, cx, pct")
+        with c9: data_compra = st.date_input("Data da compra", value=date.today())
+        forn_compra = st.text_input("Fornecedor (compra)", value=fornecedor)
+        obs_compra  = st.text_input("Observações (opcional)")
 
         salvar = st.form_submit_button("➕ Cadastrar produto")
 
@@ -452,43 +468,69 @@ else:
             st.error("Preço inválido. Use números (ex: 19,90)."); st.stop()
 
         novo_id = _gen_id()
-
-        # Calculados
-        custo, unid = _last_cost_and_unit(nome, fornecedor)
+        # calculados básicos
+        custo_hist, unid_hist = _last_cost_and_unit(nome, fornecedor)
         lead = _lead_time_fornecedor(fornecedor)
-        saldo = _stock_balance(None, nome)  # sem ID ainda
+        saldo = _stock_balance(None, nome)
         avg30 = _avg_daily_sales_30d(None, nome)
         estmin = _calc_est_min(avg30, lead)
 
-        # Monta linha nova só com colunas existentes
         new_row = {}
         if COL["id"]:        new_row[COL["id"]] = novo_id
         if COL["nome"]:      new_row[COL["nome"]] = nome.strip()
         if COL["categoria"]: new_row[COL["categoria"]] = categoria.strip()
         if COL["forn"]:      new_row[COL["forn"]] = fornecedor.strip()
         if COL["preco"]:     new_row[COL["preco"]] = f"{pf:.2f}".replace(".", ",")
-        if (custo is not None) and COL["custo"]: new_row[COL["custo"]] = f"{custo:.2f}".replace(".", ",")
+        if (custo_hist is not None) and COL["custo"]: new_row[COL["custo"]] = f"{custo_hist:.2f}".replace(".", ",")
         if COL["estoque"]:   new_row[COL["estoque"]] = str(saldo if saldo is not None else 0)
         if COL["est_min"]:   new_row[COL["est_min"]] = str(estmin)
         if (lead is not None) and COL["lead"]: new_row[COL["lead"]] = str(lead)
-        if unid and COL["unidade"]: new_row[COL["unidade"]] = unid
+        if unid_hist and COL["unidade"]: new_row[COL["unidade"]] = unid_hist
         if COL["ativo"]:     new_row[COL["ativo"]] = "sim" if ativo else "não"
         if COL["atualizado"]: new_row[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
+        # se tiver estoque inicial informado, grava Compra + Movimento e ajusta custo/estoque
+        qtd_f = _to_float(qtd_compra)
+        cst_f = _to_float(custo_unit)
+        fazer_compra = (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0))
+        if fazer_compra:
+            ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
+            total = round(float(qtd_f) * float(cst_f), 2)
+            _append_row(ws_compras, {
+                "Data": data_compra.strftime("%d/%m/%Y"),
+                "Produto": nome.strip(),
+                "Unidade": (unid_compra or "").strip(),
+                "Fornecedor": (forn_compra or fornecedor or "").strip(),
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+                "Total": f"{total:.2f}".replace(".", ","),
+                "IDProduto": new_row.get(COL["id"], novo_id),
+                "Obs": obs_compra or ""
+            })
+            ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+            _append_row(ws_mov, {
+                "Data": data_compra.strftime("%d/%m/%Y"),
+                "IDProduto": new_row.get(COL["id"], novo_id),
+                "Produto": nome.strip(),
+                "Tipo": "entrada",
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Obs": f"Compra inicial — {obs_compra or ''}".strip()
+            })
+            if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+            if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
+
+        # grava na aba Produtos
         ws = _sheet().worksheet(ABA)
         df_atual = _load_df(ABA)
-
-        # Garante todas as colunas do header com vazio
         for col in df_atual.columns:
-            if col not in new_row:
-                new_row[col] = ""
-
+            new_row.setdefault(col, "")
         df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
         set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-        _msg_ok("Produto cadastrado com sucesso! Campos calculados aplicados.")
-        st.toast("Cadastro concluído ✅", icon="✅")
+        _msg_ok("Produto cadastrado com sucesso! ✅")
+        st.toast("Cadastro concluído", icon="✅")
         st.balloons()
 
 st.divider()
 st.page_link("pages/01_produtos.py", label="↩️ Ir para Catálogo de Produtos", icon="📦")
+st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
