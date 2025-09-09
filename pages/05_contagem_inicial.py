@@ -11,7 +11,6 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Contagem de estoque", page_icon="📋", layout="wide")
 st.title("📋 Contagem de estoque (definir nível)")
 
-# ---------- helpers ----------
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
@@ -38,7 +37,7 @@ def conectar_sheets():
         st.error("🛑 PLANILHA_URL ausente no Secrets."); st.stop()
     return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data
+@st.cache_data(ttl=10)
 def carregar_aba(nome: str) -> pd.DataFrame:
     ws = conectar_sheets().worksheet(nome)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
@@ -68,7 +67,7 @@ ABA_PROD, ABA_COMP, ABA_VEND, ABA_AJ = "Produtos", "Compras", "Vendas", "Ajustes
 
 try:
     dfp = carregar_aba(ABA_PROD)
-except Exception as e:
+except Exception:
     st.error("Erro ao abrir a aba Produtos."); st.stop()
 
 try:
@@ -101,7 +100,7 @@ col_v_id = _first_col(dfv, ["IDProduto","ProdutoID","ID Prod","ID_Produto","ID"]
 col_v_q  = _first_col(dfv, ["Qtd","Quantidade","Qtde","Qde"])
 
 # Ajustes
-col_a_id = _first_col(dfa, ["IDProduto","ID"])  # aceita B=ID ou IDProduto
+col_a_id = _first_col(dfa, ["IDProduto","ID"])
 col_a_q  = _first_col(dfa, ["Qtd","Quantidade","Qtde","Qde","Ajuste"])
 
 # ---------- estoque calculado ----------
@@ -176,6 +175,10 @@ if sel != "(selecione)":
             ws.clear()
             set_with_dataframe(ws, dfa2)
 
-            st.success(f"Contagem salva! Gravado ajuste de {delta:+d} para {pid}. Recarregue a página de estoque/produtos para ver o novo cálculo.")
+            # >>> auto-refresh nas outras páginas
+            st.cache_data.clear()
+            st.session_state["_force_refresh"] = True
+
+            st.success(f"Contagem salva! Ajuste de {delta:+d} para {pid}.")
 else:
     st.info("Selecione um produto para definir o estoque.")
