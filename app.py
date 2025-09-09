@@ -197,7 +197,7 @@ def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     out["DescNum"]    = out["Desconto"].apply(_to_float)
     out["TotalCupomNum"] = out["TotalCupom"].apply(_to_float)
     out["VendaID"]    = out["VendaID"].astype(str).fillna("")
-    out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORRO")
+    out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORNO")
 
     # Período
     out = out[(out["Data_d"]>=dt_ini) & (out["Data_d"]<=dt_fim)]
@@ -256,8 +256,7 @@ def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
-    # Suporta: Data | Produto | Unidade | Fornecedor | Qtd | Custo Unitário | Total
-    # e também: IDProduto | ID | CustoUnit | FreteRateado | OutrosCustos
+    # Usa: IDProduto|ID, Qtd, Custo Unitário|CustoUnit e soma FreteRateado/OutrosCustos
     if c.empty:
         return pd.DataFrame(columns=["IDProduto","QtdNum","CustoNum"])
     c = c.copy()
@@ -270,22 +269,22 @@ def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
     col_fre = _first_col(c, ["FreteRateado","Frete Rateado"])
     col_out = _first_col(c, ["OutrosCustos","Outros Custos"])
 
-    custo_base = c[col_cu1] if col_cu1 else (c[col_cu2] if col_cu2 else 0)
+    if not col_idp or not col_qtd or not (col_cu1 or col_cu2):
+        return pd.DataFrame(columns=["IDProduto","QtdNum","CustoNum"])
+
+    custo_base = c[col_cu1] if col_cu1 else c[col_cu2]
     frete_u    = c[col_fre] if col_fre else 0
     outros_u   = c[col_out] if col_out else 0
 
     out = pd.DataFrame({
-        "IDProduto": c[col_idp] if col_idp else None,
-        "QtdNum":    (c[col_qtd] if col_qtd else 0).apply(_to_float),
-        "CustoNum":  (pd.Series(custo_base).apply(_to_float)
-                      + pd.Series(frete_u).apply(_to_float)
-                      + pd.Series(outros_u).apply(_to_float)),
+        "IDProduto": c[col_idp].astype(str),
+        "QtdNum":    c[col_qtd].apply(_to_float),
+        "CustoNum":  pd.Series(custo_base).apply(_to_float) + pd.Series(frete_u).apply(_to_float) + pd.Series(outros_u).apply(_to_float),
     })
-    out["IDProduto"] = out["IDProduto"].astype(str)
     return out
 
 def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
-    # Suporta aba Ajustes: Data | ID | Qtd | Motivo | Responsável | Obs
+    # Usa sua aba: Data | ID | Qtd | ...
     if a is None or a.empty:
         return pd.DataFrame(columns=["IDProduto","QtdNum"])
     a = a.copy()
@@ -294,11 +293,7 @@ def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
     col_qtd = _first_col(a, ["Qtd","Quantidade","Qtde","Qde","Ajuste"])
     if not col_idp or not col_qtd:
         return pd.DataFrame(columns=["IDProduto","QtdNum"])
-    out = pd.DataFrame({
-        "IDProduto": a[col_idp].astype(str),
-        "QtdNum":    a[col_qtd].apply(_to_float),
-    })
-    return out
+    return pd.DataFrame({"IDProduto": a[col_idp].astype(str), "QtdNum": a[col_qtd].apply(_to_float)})
 
 # Ajustes podem não existir
 try: aj_raw = carregar_aba("Ajustes")
@@ -340,17 +335,16 @@ for col in ["EstoqueCalc","CustoMedio","Entradas","Saidas","Ajustes"]:
 prod_calc["ValorEstoqueCalc"] = prod_calc["CustoMedio"].fillna(0)*prod_calc["EstoqueCalc"].fillna(0)
 
 # =========================
-# Sincronização automática Produtos (EstoqueAtual/CustoAtual)
+# Sincronização automática Produtos (EstoqueAtual/CustoAtual) + debug
 # =========================
-def _sincronizar_produtos_automaticamente(prod_calc_df: pd.DataFrame):
+def _sincronizar_produtos_automaticamente(prod_calc_df: pd.DataFrame) -> tuple[bool, str]:
     try:
         sh = conectar_sheets()
         ws = sh.worksheet(ABA_PROD)
         df_sheet = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0)
         df_sheet.columns = [c.strip() for c in df_sheet.columns]
         if "ID" not in df_sheet.columns:
-            st.error("A aba Produtos precisa ter a coluna 'ID' para sincronizar.")
-            return
+            return False, "A aba Produtos precisa ter a coluna 'ID'."
         df_sheet["ID"] = df_sheet["ID"].astype(str)
 
         base_sync = prod_calc_df[["ID","EstoqueCalc","CustoMedio"]].copy()
@@ -367,14 +361,30 @@ def _sincronizar_produtos_automaticamente(prod_calc_df: pd.DataFrame):
         ws.clear()
         from gspread_dataframe import set_with_dataframe
         set_with_dataframe(ws, m)
-        st.caption("🔄 Estoque/Custo sincronizados automaticamente com a aba Produtos.")
         st.cache_data.clear()
+        return True, "Sincronizado."
     except Exception as e:
-        st.warning("Não foi possível sincronizar automaticamente agora.")
-        st.caption(str(e))
+        return False, str(e)
 
-if not prod_calc.empty:
-    _sincronizar_produtos_automaticamente(prod_calc)
+# Chamada automática + controles
+with st.expander("Sincronização de Produtos"):
+    do_debug = st.checkbox("Mostrar diagnóstico de estoque/custo", value=False)
+    force    = st.button("🔄 Forçar resync agora")
+
+ok_sync = False
+if not prod_calc.empty and ("ID" in prod_calc.columns):
+    if 'force' in locals() and force:
+        ok_sync, msg = _sincronizar_produtos_automaticamente(prod_calc)
+        st.caption(("✅ " if ok_sync else "⚠️ ") + msg)
+    else:
+        ok_sync, msg = _sincronizar_produtos_automaticamente(prod_calc)
+        if not ok_sync:
+            st.caption("⚠️ " + msg)
+
+if 'do_debug' in locals() and do_debug and not prod_calc.empty:
+    dbg_cols = [c for c in ["ID","Nome","Entradas","Saidas","Ajustes","EstoqueCalc","CustoMedio","CustoAtual","ValorEstoqueCalc"] if c in prod_calc.columns]
+    st.write("**Diagnóstico (primeiros 20):**")
+    st.dataframe(prod_calc[dbg_cols].head(20), use_container_width=True, hide_index=True)
 
 # =========================
 # KPIs (faturamento, cupons, itens)
