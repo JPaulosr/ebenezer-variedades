@@ -1,4 +1,4 @@
-# app.py — Dashboard Ebenezér Variedades (lucro bruto correto e compras opcionais)
+# app.py — Dashboard Ebenezér Variedades (lucro bruto correto + FIADO completo)
 # -*- coding: utf-8 -*-
 import json, unicodedata, re
 from collections.abc import Mapping
@@ -54,6 +54,16 @@ def carregar_aba(nome: str) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     return df
 
+def carregar_aba_multi(nomes: list[str]) -> pd.DataFrame:
+    for nm in nomes:
+        try:
+            df = carregar_aba(nm)
+            if not df.empty: 
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
 # =========================
 # Utils
 # =========================
@@ -98,16 +108,15 @@ def _fmt_brl(v):
 # Carrega abas
 # =========================
 ABA_PROD, ABA_VEND, ABA_COMP = "Produtos", "Vendas", "Compras"
+ABA_FIADO_CANDIDATES = ["Fiado", "Fiados", "Controle Fiado", "Fiado_Controle"]
 
-try:    prod = carregar_aba(ABA_PROD)
-except: prod = pd.DataFrame()
-try:    vend_raw = carregar_aba(ABA_VEND)
-except: vend_raw = pd.DataFrame()
-try:    comp_raw = carregar_aba(ABA_COMP)
-except: comp_raw = pd.DataFrame()
+prod     = carregar_aba(ABA_PROD)       if True else pd.DataFrame()
+vend_raw = carregar_aba(ABA_VEND)       if True else pd.DataFrame()
+comp_raw = carregar_aba(ABA_COMP)       if True else pd.DataFrame()
+fiado_rw = carregar_aba_multi(ABA_FIADO_CANDIDATES)
 
 # =========================
-# Normalização de PRODUTOS (base estática)
+# Normalização de PRODUTOS
 # =========================
 if prod.empty:
     st.warning("Aba Produtos está vazia.")
@@ -213,7 +222,7 @@ def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
 vendas, cupom_grp = _normalize_vendas_period(vend_raw)
 
 # =========================
-# Normalização COMPRAS (período) — para seção opcional
+# Normalização COMPRAS (apenas para estoque/expander opcional)
 # =========================
 def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
     if c.empty:
@@ -347,8 +356,45 @@ lucro_bruto = max(0.0, faturamento - cogs)
 margem_bruta = (lucro_bruto / faturamento * 100) if faturamento > 0 else 0.0
 ticket_medio = (faturamento / num_cupons) if num_cupons > 0 else 0.0
 
-# Caixa (simples): considera o total recebido no período (sem subtrair compras)
+# Caixa simples: total recebido no período (sem subtrair compras)
 caixa_periodo = faturamento
+
+# =========================
+# FIADO — lançado, recebido, saldo
+# =========================
+# 1) quanto FOI VENDIDO a fiado no período (pelas vendas)
+fiado_lancado_periodo = 0.0
+if not cupom_grp.empty and "Forma" in cupom_grp.columns:
+    mask_fiado = cupom_grp["Forma"].astype(str).str.lower().str.contains("fiado")
+    fiado_lancado_periodo = cupom_grp.loc[mask_fiado, "ReceitaCupom"].sum()
+
+# 2) recebido de fiado no período + 3) saldo em aberto (sheet Fiado opcional)
+fiado_recebido_periodo = 0.0
+fiado_em_aberto_saldo  = None  # None => N/D
+
+if not fiado_rw.empty:
+    # normaliza
+    f = fiado_rw.copy()
+    f.columns = [c.strip() for c in f.columns]
+    c_data  = _first_col(f, ["Data","Dt"])
+    c_valor = _first_col(f, ["Valor","Parcela","Total","Valor Parcela"])
+    c_stat  = _first_col(f, ["Status","Situação","Situacao"])
+    if c_data:  f["Data_d"] = f[c_data].apply(_parse_date_any)
+    if c_valor: f["ValorNum"] = f[c_valor].apply(_to_float)
+    if c_stat:  f["StatusTxt"] = f[c_stat].astype(str).str.lower()
+    else:       f["StatusTxt"] = ""
+
+    # recebido no período
+    pagos_mask = f["StatusTxt"].isin(["pago","recebido","quitado"])
+    if c_data:
+        per_mask = (f["Data_d"]>=dt_ini) & (f["Data_d"]<=dt_fim)
+        fiado_recebido_periodo = f.loc[pagos_mask & per_mask, "ValorNum"].sum()
+    else:
+        fiado_recebido_periodo = f.loc[pagos_mask, "ValorNum"].sum()
+
+    # saldo em aberto (sem filtro de data)
+    abertos_mask = f["StatusTxt"].isin(["aberto","pendente","em aberto","em aberto (saldo)"])
+    fiado_em_aberto_saldo = f.loc[abertos_mask, "ValorNum"].sum()
 
 # =========================
 # KPIs (cards)
@@ -359,12 +405,21 @@ k2.metric("🧾 Cupons", f"{num_cupons}", f"Ticket {_fmt_brl(ticket_medio)}")
 k3.metric("📦 Itens vendidos", f"{itens_vendidos:.0f}")
 k4.metric("📈 Lucro bruto (aprox.)", _fmt_brl(lucro_bruto), f"{margem_bruta:.1f}% margem")
 k5.metric("💼 Caixa do período", _fmt_brl(caixa_periodo))
+
+# Linha extra com FIADO
+c1,c2,c3 = st.columns(3)
+c1.metric("🧾 Fiado lançado (período)", _fmt_brl(fiado_lancado_periodo))
+c2.metric("🏦 Recebido de fiado (período)", _fmt_brl(fiado_recebido_periodo))
+c3.metric("📌 Fiado em aberto (saldo)", _fmt_brl(fiado_em_aberto_saldo if fiado_em_aberto_saldo is not None else 0.0))
+if fiado_em_aberto_saldo is None:
+    st.caption("Obs: saldo de fiado não exibido porque a aba de Fiado não foi encontrada. (Nomes aceitos: Fiado/Fiados)")
+
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
 st.divider()
 
 # =========================
-# Vendas por dia (padrão)
+# Vendas por dia
 # =========================
 st.subheader("📆 Vendas por dia")
 def _daily(df_in, date_col, val_col, label):
@@ -534,8 +589,17 @@ else:
 # =========================
 with st.expander("➕ Mostrar Vendas x Compras por dia (opcional)"):
     st.write("Use esta visão apenas para gestão de fluxo/estoque. **Não** é usada no cálculo de lucro bruto.")
+    def _daily(df_in, date_col, val_col, label):
+        if df_in is None or df_in.empty: return pd.DataFrame(columns=["Data","Valor","Tipo"])
+        d = df_in.copy()
+        d[date_col] = d[date_col].apply(_parse_date_any)
+        g = d.groupby(date_col)[val_col].sum().reset_index().rename(columns={date_col:"Data", val_col:"Valor"})
+        g["Tipo"] = label
+        return g
     g_v = _daily(cupom_grp if not vendas.empty else pd.DataFrame(), "Data_d", "ReceitaCupom", "Vendas")
-    g_c = _daily(compras, "Data_d", "TotalNum", "Compras")
+    g_c = _normalize_compras_period(comp_raw)
+    g_c = g_c.rename(columns={"TotalNum":"Valor","Data_d":"Data"})
+    g_c["Tipo"] = "Compras"
     serie = pd.concat([g_v, g_c], ignore_index=True)
     if not serie.empty:
         fig = px.bar(serie, x="Data", y="Valor", color="Tipo", barmode="group")
