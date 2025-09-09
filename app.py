@@ -356,13 +356,14 @@ else:
 # COGS correto + lucro, margem, ticket, caixa (usando KeyID)
 # =========================
 if not prod_calc.empty:
-    _cm = prod_calc.set_index("KeyID")["CustoMedio"] if "KeyID" in prod_calc.columns else pd.Series(dtype=float)
+    _cm = prod_calc.set_index("KeyID")["CustoMedio"] if "CustoMedio" in prod_calc.columns else pd.Series(dtype=float)
     _ca = prod_calc.set_index("KeyID")["CustoAtual"] if "CustoAtual" in prod_calc.columns else pd.Series(dtype=float)
     custo_ref = {}
     ids_all = set(list(_cm.index) + list(_ca.index))
     for _pid in ids_all:
         v_cm = float((_cm.get(_pid, 0) or 0))
         v_ca = float((_ca.get(_pid, 0) or 0))
+        # 🔑 PRIORIDADE: usa custo médio se existir (>0), senão cai no custo atual
         custo_ref[str(_pid)] = v_cm if v_cm > 0 else v_ca
 else:
     custo_ref = {}
