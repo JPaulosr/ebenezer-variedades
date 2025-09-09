@@ -197,7 +197,7 @@ def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     out["DescNum"]    = out["Desconto"].apply(_to_float)
     out["TotalCupomNum"] = out["TotalCupom"].apply(_to_float)
     out["VendaID"]    = out["VendaID"].astype(str).fillna("")
-    out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORNO")
+    out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORRO")
 
     # Período
     out = out[(out["Data_d"]>=dt_ini) & (out["Data_d"]<=dt_fim)]
@@ -237,10 +237,10 @@ def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
 compras = _normalize_compras_period(comp_raw)
 
 # =========================
-# >>> Estoque & Custo Médio (histórico)
+# >>> Estoque & Custo Médio (histórico) com suas colunas
 # =========================
 def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
-    if v.empty: 
+    if v.empty:
         return pd.DataFrame(columns=["IDProduto","QtdNum"])
     v = v.copy()
     v.columns = [c.strip() for c in v.columns]
@@ -256,33 +256,47 @@ def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
+    # Suporta: Data | Produto | Unidade | Fornecedor | Qtd | Custo Unitário | Total
+    # e também: IDProduto | ID | CustoUnit | FreteRateado | OutrosCustos
     if c.empty:
         return pd.DataFrame(columns=["IDProduto","QtdNum","CustoNum"])
     c = c.copy()
     c.columns = [x.strip() for x in c.columns]
+
     col_idp = _first_col(c, ["IDProduto","ProdutoID","ID"])
     col_qtd = _first_col(c, ["Qtd","Quantidade","Qtde","Qde"])
-    col_cu  = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit","Custo"])
+    col_cu1 = _first_col(c, ["Custo Unitário","CustoUnitário"])
+    col_cu2 = _first_col(c, ["CustoUnit","Custo Unit"])
+    col_fre = _first_col(c, ["FreteRateado","Frete Rateado"])
+    col_out = _first_col(c, ["OutrosCustos","Outros Custos"])
+
+    custo_base = c[col_cu1] if col_cu1 else (c[col_cu2] if col_cu2 else 0)
+    frete_u    = c[col_fre] if col_fre else 0
+    outros_u   = c[col_out] if col_out else 0
+
     out = pd.DataFrame({
         "IDProduto": c[col_idp] if col_idp else None,
-        "QtdNum": c[col_qtd].apply(_to_float) if col_qtd else 0.0,
-        "CustoNum": c[col_cu].apply(_to_float) if col_cu else 0.0,
+        "QtdNum":    (c[col_qtd] if col_qtd else 0).apply(_to_float),
+        "CustoNum":  (pd.Series(custo_base).apply(_to_float)
+                      + pd.Series(frete_u).apply(_to_float)
+                      + pd.Series(outros_u).apply(_to_float)),
     })
     out["IDProduto"] = out["IDProduto"].astype(str)
     return out
 
 def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
+    # Suporta aba Ajustes: Data | ID | Qtd | Motivo | Responsável | Obs
     if a is None or a.empty:
         return pd.DataFrame(columns=["IDProduto","QtdNum"])
     a = a.copy()
     a.columns = [x.strip() for x in a.columns]
-    col_idp = _first_col(a, ["IDProduto","ProdutoID","ID"])
+    col_idp = _first_col(a, ["ID","IDProduto","ProdutoID"])
     col_qtd = _first_col(a, ["Qtd","Quantidade","Qtde","Qde","Ajuste"])
     if not col_idp or not col_qtd:
         return pd.DataFrame(columns=["IDProduto","QtdNum"])
     out = pd.DataFrame({
         "IDProduto": a[col_idp].astype(str),
-        "QtdNum": a[col_qtd].apply(_to_float),
+        "QtdNum":    a[col_qtd].apply(_to_float),
     })
     return out
 
@@ -326,6 +340,43 @@ for col in ["EstoqueCalc","CustoMedio","Entradas","Saidas","Ajustes"]:
 prod_calc["ValorEstoqueCalc"] = prod_calc["CustoMedio"].fillna(0)*prod_calc["EstoqueCalc"].fillna(0)
 
 # =========================
+# Sincronização automática Produtos (EstoqueAtual/CustoAtual)
+# =========================
+def _sincronizar_produtos_automaticamente(prod_calc_df: pd.DataFrame):
+    try:
+        sh = conectar_sheets()
+        ws = sh.worksheet(ABA_PROD)
+        df_sheet = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0)
+        df_sheet.columns = [c.strip() for c in df_sheet.columns]
+        if "ID" not in df_sheet.columns:
+            st.error("A aba Produtos precisa ter a coluna 'ID' para sincronizar.")
+            return
+        df_sheet["ID"] = df_sheet["ID"].astype(str)
+
+        base_sync = prod_calc_df[["ID","EstoqueCalc","CustoMedio"]].copy()
+        base_sync["EstoqueAtual"] = base_sync["EstoqueCalc"].fillna(0).round(0).astype(int).astype(str)
+        base_sync["CustoAtual"]   = base_sync["CustoMedio"].fillna(0).map(lambda x: f"{float(x):.2f}".replace(".", ","))
+
+        m = df_sheet.merge(base_sync[["ID","EstoqueAtual","CustoAtual"]], how="left", on="ID", suffixes=("","_calc"))
+        if "EstoqueAtual" not in m.columns: m["EstoqueAtual"] = ""
+        if "CustoAtual"   not in m.columns: m["CustoAtual"]   = ""
+        m.loc[m["EstoqueAtual_calc"].notna(), "EstoqueAtual"] = m["EstoqueAtual_calc"]
+        m.loc[m["CustoAtual_calc"].notna(),   "CustoAtual"]   = m["CustoAtual_calc"]
+        m.drop(columns=[c for c in ["EstoqueAtual_calc","CustoAtual_calc"] if c in m.columns], inplace=True)
+
+        ws.clear()
+        from gspread_dataframe import set_with_dataframe
+        set_with_dataframe(ws, m)
+        st.caption("🔄 Estoque/Custo sincronizados automaticamente com a aba Produtos.")
+        st.cache_data.clear()
+    except Exception as e:
+        st.warning("Não foi possível sincronizar automaticamente agora.")
+        st.caption(str(e))
+
+if not prod_calc.empty:
+    _sincronizar_produtos_automaticamente(prod_calc)
+
+# =========================
 # KPIs (faturamento, cupons, itens)
 # =========================
 if not vendas.empty:
@@ -338,7 +389,6 @@ else:
 # =========================
 # COGS correto + lucro, margem, ticket, caixa
 # =========================
-# custo de referência = CustoMedio (compras) OU, se 0/NaN, CustoAtual (aba Produtos)
 if not prod_calc.empty:
     _cm = prod_calc.set_index("ID")["CustoMedio"] if "ID" in prod_calc.columns else pd.Series(dtype=float)
     _ca = prod_calc.set_index("ID")["CustoAtual"] if "CustoAtual" in prod_calc.columns and "ID" in prod_calc.columns else pd.Series(dtype=float)
@@ -406,31 +456,18 @@ if not fiado_sheet.empty:
     c_vp   = _first_col(fs, ["ValorPago","Pago","Recebido"])
     c_status = _first_col(fs, ["Status"])
 
-    # Datas e valores
-    if c_data: fs["Data_d"] = fs[c_data].apply(_parse_date_any)
-    else:      fs["Data_d"] = pd.NaT
-    if c_dp:   fs["DataPag_d"] = fs[c_dp].apply(_parse_date_any)
-    else:      fs["DataPag_d"] = pd.NaT
+    fs["Data_d"]    = fs[c_data].apply(_parse_date_any) if c_data else pd.NaT
+    fs["DataPag_d"] = fs[c_dp].apply(_parse_date_any) if c_dp else pd.NaT
+    fs["ValorNum"]     = fs[c_val].apply(_to_float) if c_val else 0.0
+    fs["ValorPagoNum"] = fs[c_vp].apply(_to_float) if c_vp else 0.0
+    fs["Status_str"]   = fs[c_status].astype(str).str.strip().str.lower() if c_status else ""
 
-    fs["ValorNum"]    = fs[c_val].apply(_to_float) if c_val else 0.0
-    fs["ValorPagoNum"]= fs[c_vp].apply(_to_float) if c_vp else 0.0
-    fs["Status_str"]  = fs[c_status].astype(str).str.strip().str.lower() if c_status else ""
-
-    # (1) Lançado no período (pela data de lançamento)
-    fiado_lancado_periodo = float(fs[(fs["Data_d"]>=dt_ini) & (fs["Data_d"]<=dt_fim)]["ValorNum"].sum())
-
-    # (2) Recebido no período (pela data de pagamento)
-    fiado_recebido_periodo = float(fs[(fs["DataPag_d"]>=dt_ini) & (fs["DataPag_d"]<=dt_fim)]["ValorPagoNum"].sum())
-
-    # (3) Saldo em aberto (histórico): Valor - ValorPago
+    fiado_lancado_periodo   = float(fs[(fs["Data_d"]>=dt_ini) & (fs["Data_d"]<=dt_fim)]["ValorNum"].sum())
+    fiado_recebido_periodo  = float(fs[(fs["DataPag_d"]>=dt_ini) & (fs["DataPag_d"]<=dt_fim)]["ValorPagoNum"].sum())
     total_lanc = float(fs["ValorNum"].sum())
     total_pago = float(fs["ValorPagoNum"].sum())
-    # Se existir coluna de Status, podemos considerar "pago/quitado" já liquidado
-    # mas como já usamos ValorPago, o saldo = lançamentos - pagamentos cobre tudo.
     fiado_saldo_aberto = max(0.0, total_lanc - total_pago)
 else:
-    # Fallback sem aba Fiado: tenta usar "Forma = Fiado" dos cupons do período para (1),
-    # e considera (2)=0 e (3)=soma histórica de fiado ≈ período (não ideal, mas informativo)
     if not cupom_grp.empty:
         fiado_lancado_periodo = float(cupom_grp[_lower(cupom_grp["Forma"]).eq("fiado")]["ReceitaCupom"].sum())
         fiado_saldo_aberto = fiado_lancado_periodo
@@ -519,32 +556,6 @@ st.divider()
 # =========================
 st.subheader("📦 Estoque — visão geral")
 
-# (Opcional) sincronizar de volta na planilha
-with st.expander("Sincronização opcional com a planilha"):
-    if st.button("🔄 Atualizar colunas EstoqueAtual/CustoAtual na aba Produtos"):
-        try:
-            sh = conectar_sheets()
-            ws = sh.worksheet(ABA_PROD)
-            df_sheet = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0)
-            df_sheet.columns = [c.strip() for c in df_sheet.columns]
-            if "ID" not in df_sheet.columns:
-                st.error("A aba Produtos precisa ter coluna 'ID' para sincronizar.")
-            else:
-                df_sheet["ID"] = df_sheet["ID"].astype(str)
-                m = df_sheet.merge(prod_calc[["ID","EstoqueCalc","CustoMedio"]], how="left", on="ID")
-                if "EstoqueAtual" not in m.columns: m["EstoqueAtual"] = ""
-                if "CustoAtual"   not in m.columns: m["CustoAtual"]   = ""
-                m["EstoqueAtual"] = m["EstoqueCalc"].fillna(0).round(0).astype(int).astype(str)
-                m["CustoAtual"]   = m["CustoMedio"].fillna(0).map(lambda x: f"{float(x):.2f}".replace(".", ","))
-                ws.clear()
-                from gspread_dataframe import set_with_dataframe
-                set_with_dataframe(ws, m)
-                st.success("Planilha sincronizada!")
-                st.cache_data.clear()
-        except Exception as e:
-            st.error("Falha ao sincronizar.")
-            st.caption(str(e))
-
 if prod_calc.empty:
     st.info("Sem produtos para exibir.")
 else:
@@ -608,6 +619,6 @@ else:
     cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoMedio","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo"] if c in dfv.columns]
     st.dataframe(dfv[cols_show].rename(columns={
         "CustoMedio":"CustoAtual",
-        "EstoqueCalc":"EstoqueAtual",  
+        "EstoqueCalc":"EstoqueAtual",
         "ValorEstoqueCalc":"ValorEstoque"
     }) if cols_show else dfv, use_container_width=True, hide_index=True)
