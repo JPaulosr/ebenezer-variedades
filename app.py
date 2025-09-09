@@ -1,8 +1,9 @@
 # app.py — Dashboard Ebenezér Variedades
 # -*- coding: utf-8 -*-
-import json, unicodedata
+import json, unicodedata, re
 from collections.abc import Mapping
 from typing import Optional
+from datetime import datetime, date, timedelta
 
 import streamlit as st
 import pandas as pd
@@ -28,46 +29,31 @@ def _load_service_account_from_secrets() -> dict:
     if svc is None:
         st.error("🛑 Segredo GCP_SERVICE_ACCOUNT ausente em Settings → Secrets.")
         st.stop()
-
-    # Se vier string (formato JSON em string), converte
     if isinstance(svc, str):
-        try:
-            svc = json.loads(svc)
+        try: svc = json.loads(svc)
         except Exception as e:
             st.error("🛑 GCP_SERVICE_ACCOUNT é uma string, mas não é JSON válido."); st.caption(str(e)); st.stop()
-
     if not isinstance(svc, Mapping):
-        st.error("🛑 GCP_SERVICE_ACCOUNT precisa ser um objeto JSON/TOML (tabela).")
-        st.stop()
-
+        st.error("🛑 GCP_SERVICE_ACCOUNT precisa ser um objeto JSON/TOML (tabela)."); st.stop()
     required = ["type", "project_id", "private_key_id", "private_key", "client_email", "token_uri"]
     missing = [k for k in required if k not in svc]
     if missing:
         st.error("🛑 Faltam campos no Service Account: " + ", ".join(missing)); st.stop()
-
-    # Bloqueia placeholders
     pk = str(svc["private_key"])
-    if "COLE AQUI" in pk or "..." in pk:
-        st.error("🛑 O campo private_key contém placeholder. Cole a CHAVE REAL completa (BEGIN/END).")
-        st.stop()
-
+    if "BEGIN PRIVATE KEY" not in pk:
+        st.error("🛑 private_key inválida. Cole a chave completa (BEGIN/END)."); st.stop()
     svc = {**svc, "private_key": _normalize_private_key(pk)}
     return svc
 
 @st.cache_resource(show_spinner=True)
 def conectar_sheets():
     svc = _load_service_account_from_secrets()
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(svc, scopes=scopes)
     gc = gspread.authorize(creds)
-
     url_or_id = st.secrets.get("PLANILHA_URL", "")
     if not url_or_id:
         st.error("🛑 PLANILHA_URL não está no Secrets."); st.stop()
-
     return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
 
 @st.cache_data(show_spinner=True)
@@ -78,20 +64,61 @@ def carregar_aba(nome_aba: str) -> pd.DataFrame:
     return df
 
 # ------------------------
-# Carregar Produtos
+# Utils de parsing numérico e datas
+# ------------------------
+def _to_float(x, default=None):
+    if x is None: return default
+    s = str(x).strip()
+    if s == "": return default
+    s = s.replace("R$", "").replace(" ", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.]", "", s)
+    if s.count(".") > 1:
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    try: return float(s)
+    except: return default
+
+def _parse_data_col(s):
+    """Aceita 'dd/mm/aaaa' ou 'aaaa-mm-dd' e retorna datetime.date (ou None)."""
+    if pd.isna(s) or s is None: return None
+    txt = str(s).strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try: return datetime.strptime(txt, fmt).date()
+        except: pass
+    # tenta automático do pandas
+    try:
+        return pd.to_datetime(txt, dayfirst=True, errors="coerce").date()
+    except:
+        return None
+
+def _fmt_brl(v):
+    try:
+        return ("R$ " + f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return "R$ 0,00"
+
+# ------------------------
+# Abas & Carregamento
 # ------------------------
 ABA_PRODUTOS = "Produtos"
+ABA_VENDAS   = "Vendas"
+ABA_COMPRAS  = "Compras"
+
 try:
-    df = carregar_aba(ABA_PRODUTOS)
+    df_prod = carregar_aba(ABA_PRODUTOS)
 except Exception as e:
     st.error("Não consegui abrir a planilha. Verifique Secrets e compartilhamento.")
     with st.expander("Detalhes técnicos"): st.code(str(e))
     st.stop()
 
+# ------------------------
+# Normalização de Produtos
+# ------------------------
+df = df_prod.copy()
 if df.empty:
     st.warning(f"A aba **{ABA_PRODUTOS}** está vazia."); st.stop()
 
-# Normalização de colunas
 df.columns = [c.strip() for c in df.columns]
 ren = {
     "ID":"ID","Nome":"Nome","Categoria":"Categoria","Unidade":"Unidade","Fornecedor":"Fornecedor",
@@ -114,7 +141,7 @@ for c in num_cols: df[c] = pd.to_numeric(df[c], errors="coerce")
 df["Ativo"] = df["Ativo"].astype(str).str.strip().str.lower()
 df["Ativo"] = df["Ativo"].map({"sim":"sim","true":"sim","1":"sim"}).fillna(df["Ativo"])
 
-# Derivadas
+# Derivadas baseadas em Produtos
 df["MargemPct"] = df["MargemPct"].where(df["MargemPct"].notna(),
     ((df["PrecoVenda"] - df["CustoAtual"]) / df["PrecoVenda"] * 100))
 df["MarkupPct"] = df["MarkupPct"].where(df["MarkupPct"].notna(),
@@ -122,8 +149,32 @@ df["MarkupPct"] = df["MarkupPct"].where(df["MarkupPct"].notna(),
 df["ValorEstoque"] = (df["CustoAtual"].fillna(0) * df["EstoqueAtual"].fillna(0))
 df["AbaixoMin"] = (df["EstoqueAtual"].fillna(0) <= df["EstoqueMin"].fillna(0))
 
-# Filtros
+# ------------------------
+# Filtros (inclui período)
+# ------------------------
 st.sidebar.header("Filtros")
+
+# Período
+preset = st.sidebar.selectbox(
+    "Período",
+    ["Hoje","Últimos 7 dias","Últimos 30 dias","Mês atual","Personalizado"],
+    index=2
+)
+
+hoje = date.today()
+if preset == "Hoje":
+    dt_ini, dt_fim = hoje, hoje
+elif preset == "Últimos 7 dias":
+    dt_ini, dt_fim = hoje - timedelta(days=6), hoje
+elif preset == "Últimos 30 dias":
+    dt_ini, dt_fim = hoje - timedelta(days=29), hoje
+elif preset == "Mês atual":
+    dt_ini, dt_fim = hoje.replace(day=1), hoje
+else:
+    c1, c2 = st.sidebar.columns(2)
+    with c1: dt_ini = st.date_input("De:", value=hoje - timedelta(days=29))
+    with c2: dt_fim = st.date_input("Até:", value=hoje)
+
 cat_sel = st.sidebar.multiselect("Categoria", sorted([x for x in df["Categoria"].dropna().astype(str).unique()]))
 forn_sel = st.sidebar.multiselect("Fornecedor", sorted([x for x in df["Fornecedor"].dropna().astype(str).unique()]))
 apenas_ativos = st.sidebar.checkbox("Somente ativos", value=True)
@@ -138,7 +189,155 @@ if busca:
     mask &= df.apply(lambda r: s in " ".join([str(x).lower() for x in r.values]), axis=1)
 dfv = df[mask].copy()
 
-# KPIs
+# ------------------------
+# Carrega Vendas & Compras e filtra por período
+# ------------------------
+def _load_vendas_periodo():
+    try:
+        v = carregar_aba(ABA_VENDAS)
+    except Exception:
+        return pd.DataFrame(columns=["Data","Produto","IDProduto","Qtd","Preço Unitário","Total","Forma Pagamento","Obs"])
+    if v.empty: return v
+    v.columns = [c.strip() for c in v.columns]
+    if "Data" in v.columns:
+        v["Data_d"] = v["Data"].apply(_parse_data_col)
+        v = v[(v["Data_d"]>=dt_ini) & (v["Data_d"]<=dt_fim)]
+    v["Qtd_num"]   = v.get("Qtd", "").apply(lambda x: _to_float(x, 0))
+    v["Preco_num"] = v.get("Preço Unitário", "").apply(lambda x: _to_float(x, 0))
+    v["Total_num"] = v.get("Total", "").apply(lambda x: _to_float(x, 0))
+    return v
+
+def _load_compras_periodo():
+    try:
+        c = carregar_aba(ABA_COMPRAS)
+    except Exception:
+        return pd.DataFrame(columns=["Data","Produto","Qtd","Custo Unitário","Total","IDProduto"])
+    if c.empty: return c
+    c.columns = [c.strip() for c in c.columns]
+    if "Data" in c.columns:
+        c["Data_d"] = c["Data"].apply(_parse_data_col)
+        c = c[(c["Data_d"]>=dt_ini) & (c["Data_d"]<=dt_fim)]
+    c["Qtd_num"]   = c.get("Qtd", "").apply(lambda x: _to_float(x, 0))
+    c["Custo_num"] = c.get("Custo Unitário", "").apply(lambda x: _to_float(x, 0))
+    c["Total_num"] = c.get("Total", "").apply(lambda x: _to_float(x, 0))
+    return c
+
+vendas_p = _load_vendas_periodo()
+compras_p = _load_compras_periodo()
+
+# ------------------------
+# KPIs do período (vendas/compras/lucro/ticket)
+# ------------------------
+# CMV/COGS aproximado: somatório (Qtd vendida × CustoAtual do produto)
+if not vendas_p.empty:
+    custo_map = dfv.set_index("ID")["CustoAtual"].to_dict() if "ID" in dfv.columns else {}
+    # se não houver ID, usa Nome
+    if not custo_map:
+        custo_map = dfv.set_index("Nome")["CustoAtual"].to_dict()
+    def _custo_aprox(row):
+        key = row.get("IDProduto") or row.get("Produto")
+        return (custo_map.get(key, 0) or 0) * row["Qtd_num"]
+    vendas_p["COGS_aprox"] = vendas_p.apply(_custo_aprox, axis=1)
+else:
+    vendas_p["COGS_aprox"] = pd.Series([], dtype=float)
+
+faturamento = vendas_p["Total_num"].sum() if "Total_num" in vendas_p else 0.0
+itens_vendidos = vendas_p["Qtd_num"].sum() if "Qtd_num" in vendas_p else 0.0
+compras_total = compras_p["Total_num"].sum() if "Total_num" in compras_p else 0.0
+cogs = vendas_p["COGS_aprox"].sum() if "COGS_aprox" in vendas_p else 0.0
+
+lucro_bruto = max(0.0, faturamento - cogs)
+margem_bruta = (lucro_bruto / faturamento * 100) if faturamento > 0 else 0.0
+ticket_medio = (faturamento / itens_vendidos) if itens_vendidos > 0 else 0.0
+caixa_periodo = faturamento - compras_total  # entrada – saída (simplificado)
+
+# Exibe KPIs
+k1,k2,k3,k4 = st.columns(4)
+k1.metric("💵 Vendas no período", _fmt_brl(faturamento))
+k2.metric("🧾 Compras no período", _fmt_brl(compras_total))
+k3.metric("📈 Lucro Bruto (aprox.)", _fmt_brl(lucro_bruto), f"{margem_bruta:.1f}% margem")
+k4.metric("🧮 Itens vendidos", f"{itens_vendidos:.0f}", f"Ticket médio {_fmt_brl(ticket_medio)}")
+
+# Giro de estoque aproximado (em unidades)
+estoque_total_un = dfv["EstoqueAtual"].fillna(0).sum()
+giro = (itens_vendidos / estoque_total_un) if estoque_total_un > 0 else 0.0
+c5,c6 = st.columns(2)
+with c5: st.metric("🔄 Giro do estoque (unid./estoque)", f"{giro:.2f}")
+with c6: st.metric("💸 Caixa do período (vendas - compras)", _fmt_brl(caixa_periodo))
+
+st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}")
+
+st.divider()
+
+# ------------------------
+# Vendas vs Compras por dia
+# ------------------------
+st.subheader("📆 Vendas vs Compras por dia (período)")
+
+def _group_daily(df_in, value_col, label):
+    if df_in.empty: 
+        return pd.DataFrame(columns=["Data","Valor","Tipo"])
+    tmp = df_in.copy()
+    col = "Data_d" if "Data_d" in tmp.columns else "Data"
+    tmp[col] = tmp[col].apply(_parse_data_col)
+    out = tmp.groupby(col)[value_col].sum().reset_index().rename(columns={value_col:"Valor", col:"Data"})
+    out["Tipo"] = label
+    return out
+
+g_v = _group_daily(vendas_p, "Total_num", "Vendas")
+g_c = _group_daily(compras_p, "Total_num", "Compras")
+serie = pd.concat([g_v, g_c], ignore_index=True)
+
+if not serie.empty:
+    fig = px.bar(serie, x="Data", y="Valor", color="Tipo", barmode="group", title="")
+    fig.update_layout(yaxis_title="R$", xaxis_title="")
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Sem dados no período selecionado.")
+
+st.divider()
+
+# ------------------------
+# Vendas por forma de pagamento (período)
+# ------------------------
+st.subheader("💳 Vendas por forma de pagamento")
+if not vendas_p.empty and "Forma Pagamento" in vendas_p.columns:
+    fp = vendas_p.groupby(vendas_p["Forma Pagamento"].astype(str))["Total_num"].sum().reset_index()
+    col1,col2 = st.columns([1.1,1])
+    with col1:
+        fig_fp = px.bar(fp, x="Forma Pagamento", y="Total_num", title="")
+        fig_fp.update_layout(yaxis_title="R$", xaxis_title="")
+        st.plotly_chart(fig_fp, use_container_width=True)
+    with col2:
+        st.dataframe(fp.rename(columns={"Total_num":"Total (R$)"}), use_container_width=True, hide_index=True)
+else:
+    st.info("Sem vendas para detalhar por forma de pagamento.")
+
+st.divider()
+
+# ------------------------
+# Top produtos por faturamento (período)
+# ------------------------
+st.subheader("🏆 Top produtos por faturamento (período)")
+if not vendas_p.empty:
+    keycol = "IDProduto" if "IDProduto" in vendas_p.columns else "Produto"
+    vtop = vendas_p.groupby([keycol, "Produto"], dropna=False)["Total_num"].sum().reset_index().sort_values("Total_num", ascending=False).head(10)
+    c1,c2 = st.columns([1.2,1])
+    with c1:
+        figt = px.bar(vtop, x="Produto", y="Total_num")
+        figt.update_layout(yaxis_title="R$", xaxis_title="")
+        st.plotly_chart(figt, use_container_width=True)
+    with c2:
+        st.dataframe(vtop.rename(columns={"Total_num":"Total (R$)"}), use_container_width=True, hide_index=True)
+else:
+    st.info("Sem vendas no período.")
+
+st.divider()
+
+# ------------------------
+# Seções antigas (estoque atual etc.)
+# ------------------------
+# KPIs estoque
 total_skus = len(dfv)
 ativos = (dfv["Ativo"] == "sim").sum()
 valor_estoque = dfv["ValorEstoque"].sum()
@@ -147,7 +346,7 @@ abaixo_min = dfv["AbaixoMin"].sum()
 k1,k2,k3,k4 = st.columns(4)
 k1.metric("SKUs exibidos", f"{total_skus}")
 k2.metric("Ativos (sim)", f"{ativos}")
-k3.metric("💰 Valor em estoque", f"R$ {valor_estoque:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+k3.metric("💰 Valor em estoque", _fmt_brl(valor_estoque))
 k4.metric("⚠️ Itens abaixo do mínimo", f"{abaixo_min}")
 
 st.divider()
@@ -157,8 +356,7 @@ st.subheader("⚠️ Alerta de ruptura / Sugestão de compra")
 df_alerta = dfv[dfv["AbaixoMin"]].copy()
 df_alerta["SugestaoCompra"] = (df_alerta["EstoqueMin"].fillna(0)*2 - df_alerta["EstoqueAtual"].fillna(0)).clip(lower=0).round()
 cols_alerta = ["ID","Nome","Categoria","Fornecedor","EstoqueAtual","EstoqueMin","SugestaoCompra","LeadTimeDias"]
-st.dataframe(df_alerta[[c for c in cols_alerta if c in df_alerta.columns]],
-             use_container_width=True, hide_index=True)
+st.dataframe(df_alerta[[c for c in cols_alerta if c in df_alerta.columns]], use_container_width=True, hide_index=True)
 
 st.divider()
 
