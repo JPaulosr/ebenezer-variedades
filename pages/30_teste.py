@@ -1,4 +1,4 @@
-# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com _rerun, clamps e Telegram
+# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date
@@ -7,9 +7,9 @@ import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-import requests  # <-- para Telegram
+import requests  # Telegram
 
-st.set_page_config(page_title="Vendas", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="Vendas", page_icon="🧾")
 st.title("🧾 Vendas (carrinho)")
 
 # =========================================================
@@ -20,7 +20,7 @@ def _rerun():
         st.rerun()  # versões novas
     except Exception:
         try:
-            st.experimental_rerun()  # fallback para versões antigas
+            st.experimental_rerun()  # fallback
         except Exception:
             pass
 
@@ -31,10 +31,27 @@ def _normalize_private_key(key: str) -> str:
     key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
     return key
 
+def _get_secret(*names, default=""):
+    # pega o primeiro secret não vazio dentre os nomes informados
+    for n in names:
+        try:
+            v = st.secrets.get(n, "")
+            if isinstance(v, (dict, list)):  # nunca retornamos estruturas aqui
+                continue
+            v = (v or "").strip()
+            if v:
+                return v
+        except Exception:
+            continue
+    return default
+
 def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
+    if svc is None:
+        st.error("🛑 GCP_SERVICE_ACCOUNT ausente.")
+        st.stop()
+    if isinstance(svc, str):
+        svc = json.loads(svc)
     svc = {**svc, "private_key": _normalize_private_key(svc["private_key"])}
     return svc
 
@@ -44,8 +61,10 @@ def conectar_sheets():
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
     gc = gspread.authorize(creds)
     url_or_id = st.secrets.get("PLANILHA_URL", "")
-    if not url_or_id: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
+    if not url_or_id:
+        st.error("🛑 PLANILHA_URL ausente.")
+        st.stop()
+    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
 @st.cache_data(ttl=10)
 def carregar_aba(nome: str) -> pd.DataFrame:
@@ -75,33 +94,36 @@ def _to_num(x):
 def _fmt_brl_num(v):
     return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
+def _fmt_brl2(v: float) -> str:
+    try: v = float(v)
+    except Exception: v = 0.0
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
+
 # ================= Abas/colunas =================
 ABA_PROD = "Produtos"
 ABA_VEND = "Vendas"
 
 # ==================== TELEGRAM (lojinha) ====================
 def _tg_token() -> str | None:
-    try:
-        v = st.secrets.get("TELEGRAM_TOKEN", "").strip()
-        return v or None
-    except Exception:
-        return None
+    return _get_secret("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN") or None
 
 def _tg_chat() -> str | None:
-    try:
-        v = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "").strip()
-        return v or None
-    except Exception:
-        return None
+    return _get_secret("TELEGRAM_CHAT_ID_LOJINHA", "TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID_JP") or None
+
+def _tg_enabled() -> bool:
+    # set TELEGRAM_ENABLED="0" para desativar envios (ex.: desenvolvimento)
+    return (_get_secret("TELEGRAM_ENABLED", default="1") != "0")
 
 def _tg_ready() -> bool:
-    return bool((_tg_token() or "").strip() and (_tg_chat() or "").strip())
+    return bool(_tg_enabled() and (_tg_token() or "").strip() and (_tg_chat() or "").strip())
 
 def tg_send_loja(text: str) -> tuple[bool, str]:
     """Envia texto para o canal da lojinha. Retorna (ok, erro_str)."""
+    if not _tg_enabled():
+        return (False, "Envio desativado por TELEGRAM_ENABLED=0.")
     token, chat_id = _tg_token(), _tg_chat()
     if not token or not chat_id:
-        return (False, "🛑 TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID_LOJINHA ausente nos secrets.")
+        return (False, "🛑 TELEGRAM_TOKEN/TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID(_LOJINHA/_JP) ausente nos secrets.")
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -113,11 +135,6 @@ def tg_send_loja(text: str) -> tuple[bool, str]:
         return (False, f"Telegram erro: HTTP {r.status_code} • {js}")
     except Exception as e:
         return (False, f"Exceção Telegram: {e}")
-
-def _fmt_brl2(v: float) -> str:
-    try: v = float(v)
-    except Exception: v = 0.0
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
 def make_card_caption_venda(venda_id: str, data_str: str, forma: str,
                             itens: list[dict], desconto: float, total_bruto: float, total_liq: float) -> str:
@@ -199,14 +216,22 @@ def make_resumo_do_dia_vendas(df_vend: pd.DataFrame, data_str: str) -> str:
     ]
     return "\n".join(linhas)
 
+# Aviso não-bloqueante se Telegram não configurado
+if not _tg_ready():
+    st.info("ℹ️ Telegram não configurado (defina TELEGRAM_TOKEN/TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID_LOJINHA/TELEGRAM_CHAT_ID). O app continua funcionando normalmente.")
+
 with st.expander("🔧 Debug Telegram (lojinha) — remova depois"):
     def _mask(s, keep=6):
         if not s: return "—"
         s = str(s); return s[:keep] + "…" if len(s) > keep else s
     tok, cid = _tg_token(), _tg_chat()
     st.write("TOKEN presente?", bool(tok), _mask(tok or ""))
-    st.write("CHAT_ID_LOJINHA presente?", bool(cid), _mask(cid or ""))
-    st.write("Chaves carregadas:", list(st.secrets.keys()))
+    st.write("CHAT_ID (lojinha/jp) presente?", bool(cid), _mask(cid or ""))
+    st.write("TELEGRAM_ENABLED:", _get_secret("TELEGRAM_ENABLED", default="1"))
+    try:
+        st.write("Chaves carregadas:", list(st.secrets.keys()))
+    except Exception:
+        st.write("Não foi possível listar secrets.keys().")
     if st.button("📨 Testar Telegram (lojinha)"):
         ok, err = tg_send_loja("✅ Teste lojinha (Streamlit).")
         st.success("Mensagem enviada!") if ok else st.error(err or "Falhou")
@@ -392,42 +417,45 @@ else:
 
             # ========= Envio Telegram (card + resumo do dia) =========
             try:
-                # Card da venda
-                card_txt = make_card_caption_venda(
-                    venda_id=venda_id,
-                    data_str=data_str,
-                    forma=st.session_state["forma"],
-                    itens=[{"id": it["id"], "nome": it.get("nome") or "", "qtd": int(it["qtd"]), "preco": float(it["preco"])} for it in cart_backup],
-                    desconto=desconto,
-                    total_bruto=total_bruto,
-                    total_liq=total_cupom
-                )
-                ok1, err1 = tg_send_loja(card_txt)
+                if _tg_ready():
+                    # Card da venda
+                    card_txt = make_card_caption_venda(
+                        venda_id=venda_id,
+                        data_str=data_str,
+                        forma=st.session_state["forma"],
+                        itens=[{"id": it["id"], "nome": it.get("nome") or "", "qtd": int(it["qtd"]), "preco": float(it["preco"])} for it in cart_backup],
+                        desconto=desconto,
+                        total_bruto=total_bruto,
+                        total_liq=total_cupom
+                    )
+                    ok1, err1 = tg_send_loja(card_txt)
 
-                # Resumo do dia (recarrega Vendas da planilha)
-                try:
-                    vend_all = carregar_aba(ABA_VEND)
-                except Exception:
-                    vend_all = pd.DataFrame()
-                resumo_txt = make_resumo_do_dia_vendas(vend_all, data_str)
-                ok2, err2 = tg_send_loja(resumo_txt)
+                    # Resumo do dia (recarrega Vendas da planilha)
+                    try:
+                        vend_all = carregar_aba(ABA_VEND)
+                    except Exception:
+                        vend_all = pd.DataFrame()
+                    resumo_txt = make_resumo_do_dia_vendas(vend_all, data_str)
+                    ok2, err2 = tg_send_loja(resumo_txt)
 
-                if ok1 and ok2:
-                    st.success(f"Venda registrada ({venda_id})! 📲 Card + resumo enviados.")
-                elif ok1 or ok2:
-                    st.warning(f"Venda registrada ({venda_id}). Só um dos envios do Telegram funcionou.")
-                    if not ok1 and err1: st.caption(f"Card: {err1}")
-                    if not ok2 and err2: st.caption(f"Resumo: {err2}")
+                    if ok1 and ok2:
+                        st.success(f"Venda registrada ({venda_id})! 📲 Card + resumo enviados.")
+                    elif ok1 or ok2:
+                        st.warning(f"Venda registrada ({venda_id}). Só um dos envios do Telegram funcionou.")
+                        if not ok1 and err1: st.caption(f"Card: {err1}")
+                        if not ok2 and err2: st.caption(f"Resumo: {err2}")
+                    else:
+                        st.warning(f"Venda registrada ({venda_id}), mas o Telegram falhou.")
+                        if err1: st.caption(f"Card: {err1}")
+                        if err2: st.caption(f"Resumo: {err2}")
                 else:
-                    st.warning(f"Venda registrada ({venda_id}), mas o Telegram falhou.")
-                    if err1: st.caption(f"Card: {err1}")
-                    if err2: st.caption(f"Resumo: {err2}")
+                    st.info(f"Venda registrada ({venda_id}). Telegram não configurado ou desativado (TELEGRAM_ENABLED=0).")
             except Exception as e:
                 st.warning(f"Venda registrada ({venda_id}), mas não consegui enviar ao Telegram: {e}")
 
             # por último, limpa carrinho e avisa
             st.session_state["cart"] = []
-            st.success(f"Venda registrada ({venda_id})!")
+            st.success(f"Venda registrado(a) ({venda_id})!")
 
     if colB.button("🧹 Limpar carrinho", use_container_width=True):
         st.session_state["cart"] = []
@@ -452,9 +480,8 @@ else:
     col_preco = _first_col(vend, ["PrecoUnit","PreçoUnitário","Preço","Preco"])
     col_venda = _first_col(vend, ["VendaID","Pedido","Cupom"])
     col_forma = _first_col(vend, ["FormaPagto","FormaPagamento","Pagamento","Forma"])
-    has_desc  = "Desconto"   in vend.columns
-    has_total = "TotalCupom" in vend.columns
-    has_stat  = "CupomStatus" in vend.columns
+    has_desc  = "Desconto"    in vend.columns
+    has_total = "TotalCupom"  in vend.columns
 
     vend["_Bruto"] = vend.apply(
         lambda r: _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns else (
@@ -502,13 +529,11 @@ else:
                 q_raw = int(_to_num(r[col_qtd])) if col_qtd else 1
                 q = abs(q_raw) or 1  # evita 0 e negativo
                 p = float(_to_num(r[col_preco])) if col_preco else 0.0
-                if p < 0:
-                    p = 0.0
-                if q == 0:
-                    continue
+                if p < 0: p = 0.0
+                if q == 0: continue
                 cart.append({
                     "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "nome": "",  # opcional
+                    "nome": "",
                     "unid": "un",
                     "qtd": q,
                     "preco": p
