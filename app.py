@@ -313,7 +313,7 @@ entradas = c_all.groupby("IDProduto")["QtdNum"].sum() if not c_all.empty else pd
 saidas   = v_all.groupby("IDProduto")["QtdNum"].sum() if not v_all.empty else pd.Series(dtype=float)
 ajustes  = a_all.groupby("IDProduto")["QtdNum"].sum() if not a_all.empty else pd.Series(dtype=float)
 
-calc = pd.DataFrame({"Entradas": entradas, "Saidas": saídas, "Ajustes": ajustes}).fillna(0.0)
+calc = pd.DataFrame({"Entradas": entradas, "Saidas": saidas, "Ajustes": ajustes}).fillna(0.0)
 calc["EstoqueCalc"] = calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
 
 # custo médio (ponderado pelas compras)
