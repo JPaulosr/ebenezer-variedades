@@ -1,4 +1,4 @@
-# app.py — Dashboard Ebenezér Variedades (robusto p/ Vendas Rápidas)
+# app.py — Dashboard Ebenezér Variedades (estoque/custo calculados ao vivo)
 # -*- coding: utf-8 -*-
 import json, unicodedata, re
 from collections.abc import Mapping
@@ -55,7 +55,7 @@ def carregar_aba(nome: str) -> pd.DataFrame:
     return df
 
 # =========================
-# Utils de parsing
+# Utils
 # =========================
 def _to_float(x, default=0.0):
     if x is None: return default
@@ -95,19 +95,19 @@ def _fmt_brl(v):
     except: return "R$ 0,00"
 
 # =========================
-# Carregamento de abas
+# Carrega abas
 # =========================
 ABA_PROD, ABA_VEND, ABA_COMP = "Produtos", "Vendas", "Compras"
 
 try:    prod = carregar_aba(ABA_PROD)
 except: prod = pd.DataFrame()
-try:    vend = carregar_aba(ABA_VEND)
-except: vend = pd.DataFrame()
-try:    comp = carregar_aba(ABA_COMP)
-except: comp = pd.DataFrame()
+try:    vend_raw = carregar_aba(ABA_VEND)
+except: vend_raw = pd.DataFrame()
+try:    comp_raw = carregar_aba(ABA_COMP)
+except: comp_raw = pd.DataFrame()
 
 # =========================
-# Normalização de PRODUTOS
+# Normalização de PRODUTOS (base estática)
 # =========================
 if prod.empty:
     st.warning("Aba Produtos está vazia.")
@@ -120,14 +120,11 @@ else:
     }
     for k,v in ren.items():
         if k in prod.columns and v!=k: prod.rename(columns={k:v}, inplace=True)
-    # garante colunas
     for c in ["ID","Nome","Categoria","Fornecedor","EstoqueAtual","EstoqueMin","CustoAtual","PrecoVenda","Ativo"]:
         if c not in prod.columns: prod[c] = None
-    # numéricos
     for c in ["EstoqueAtual","EstoqueMin","CustoAtual","PrecoVenda"]:
         prod[c] = pd.to_numeric(prod[c], errors="coerce")
     prod["ValorEstoque"] = prod["CustoAtual"].fillna(0)*prod["EstoqueAtual"].fillna(0)
-    prod["AbaixoMin"] = (prod["EstoqueAtual"].fillna(0) <= prod["EstoqueMin"].fillna(0))
 
 # =========================
 # Filtros (período + cat/forn/ativos)
@@ -150,22 +147,19 @@ else:
 
 inclui_estornos = st.sidebar.checkbox("Incluir estornos (CN-/ESTORNO)", value=False)
 
-if prod.empty:
-    cats = []; forns = []
-else:
-    cats = sorted(pd.Series(prod["Categoria"].dropna().astype(str).unique()).tolist())
-    forns = sorted(pd.Series(prod["Fornecedor"].dropna().astype(str).unique()).tolist())
+cats = sorted(pd.Series(prod["Categoria"].dropna().astype(str).unique()).tolist()) if not prod.empty else []
+forns = sorted(pd.Series(prod["Fornecedor"].dropna().astype(str).unique()).tolist()) if not prod.empty else []
 cat_sel  = st.sidebar.multiselect("Categoria", cats)
 forn_sel = st.sidebar.multiselect("Fornecedor", forns)
 apenas_ativos = st.sidebar.checkbox("Somente ativos", value=True)
 busca = st.sidebar.text_input("Buscar por nome/ID")
 
 # =========================
-# Normalização de VENDAS
+# Normalização VENDAS (período)
 # =========================
-def _normalize_vendas(v: pd.DataFrame) -> pd.DataFrame:
-    if v.empty: 
-        return pd.DataFrame(columns=["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","Forma","Obs","Desconto","TotalCupom","CupomStatus"])
+def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if v.empty:
+        return pd.DataFrame(), pd.DataFrame()
     v = v.copy()
     v.columns = [c.strip() for c in v.columns]
     col_data  = _first_col(v, ["Data"])
@@ -182,7 +176,7 @@ def _normalize_vendas(v: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame({
         "Data":      v[col_data]  if col_data else None,
-        "VendaID":   v[col_vid]   if col_vid  else None,
+        "VendaID":   v[col_vid]   if col_vid  else "",
         "IDProduto": v[col_idp]   if col_idp  else None,
         "Qtd":       v[col_qtd]   if col_qtd  else 0,
         "PrecoUnit": v[col_pu]    if col_pu   else 0,
@@ -193,76 +187,155 @@ def _normalize_vendas(v: pd.DataFrame) -> pd.DataFrame:
         "TotalCupom":v[col_totcup]if col_totcup else None,
         "CupomStatus":v[col_stat] if col_stat else None
     })
-    # datas e números
     out["Data_d"]     = out["Data"].apply(_parse_date_any)
     out["QtdNum"]     = out["Qtd"].apply(_to_float)
     out["PrecoNum"]   = out["PrecoUnit"].apply(_to_float)
     out["TotalNum"]   = out["TotalLinha"].apply(_to_float)
     out["DescNum"]    = out["Desconto"].apply(_to_float)
     out["TotalCupomNum"] = out["TotalCupom"].apply(_to_float)
-    out["VendaID"] = out["VendaID"].astype(str).fillna("")
+    out["VendaID"]    = out["VendaID"].astype(str).fillna("")
     out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORNO")
-    return out
 
-vendas = _normalize_vendas(vend)
-# filtra período
-if not vendas.empty:
-    vendas = vendas[(vendas["Data_d"]>=dt_ini) & (vendas["Data_d"]<=dt_fim)]
+    # Período
+    out = out[(out["Data_d"]>=dt_ini) & (out["Data_d"]<=dt_fim)]
     if not inclui_estornos:
-        vendas = vendas[~vendas["is_estorno"]]
+        out = out[~out["is_estorno"]]
 
-# =========================
-# Normalização de COMPRAS
-# =========================
-def _normalize_compras(c: pd.DataFrame) -> pd.DataFrame:
-    if c.empty:
-        return pd.DataFrame(columns=["Data","IDProduto","Qtd","CustoUnit","TotalLinha"])
-    c = c.copy()
-    c.columns = [x.strip() for x in c.columns]
-    col_data = _first_col(c, ["Data"])
-    col_idp  = _first_col(c, ["IDProduto","ProdutoID","ID"])
-    col_qtd  = _first_col(c, ["Qtd","Quantidade","Qtde","Qde"])
-    col_cu   = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit","Custo"])
-    col_tot  = _first_col(c, ["Total","TotalLinha"])
-    out = pd.DataFrame({
-        "Data": c[col_data] if col_data else None,
-        "IDProduto": c[col_idp] if col_idp else None,
-        "Qtd": c[col_qtd] if col_qtd else 0,
-        "CustoUnit": c[col_cu] if col_cu else 0,
-        "TotalLinha": c[col_tot] if col_tot else 0
-    })
-    out["Data_d"]   = out["Data"].apply(_parse_date_any)
-    out["QtdNum"]   = out["Qtd"].apply(_to_float)
-    out["CustoNum"] = out["CustoUnit"].apply(_to_float)
-    out["TotalNum"] = out["TotalLinha"].apply(_to_float)
-    return out
-
-compras = _normalize_compras(comp)
-if not compras.empty:
-    compras = compras[(compras["Data_d"]>=dt_ini) & (compras["Data_d"]<=dt_fim)]
-
-# =========================
-# KPIs (faturamento, cupons, itens, lucro, margem, ticket)
-# =========================
-# Faturamento: se existir TotalCupom, usa o agregado por VendaID (respeita desconto)
-if not vendas.empty:
-    cupom_grp = vendas.groupby("VendaID", dropna=True).agg({
+    # Receita por cupom (respeita desconto)
+    cupom_grp = out.groupby("VendaID", dropna=True).agg({
         "Data_d":"first","Forma":"first","TotalNum":"sum","DescNum":"max","TotalCupomNum":"max"
     }).reset_index()
     cupom_grp["ReceitaCupom"] = cupom_grp.apply(
         lambda r: r["TotalCupomNum"] if r["TotalCupomNum"]>0 else max(0.0, r["TotalNum"] - r["DescNum"]), axis=1
     )
+    return out, cupom_grp
+
+vendas, cupom_grp = _normalize_vendas_period(vend_raw)
+
+# =========================
+# Normalização COMPRAS (período)
+# =========================
+def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
+    if c.empty:
+        return pd.DataFrame(columns=["Data_d","TotalNum"])
+    c = c.copy()
+    c.columns = [x.strip() for x in c.columns]
+    col_data = _first_col(c, ["Data"])
+    col_tot  = _first_col(c, ["Total","TotalLinha"])
+    out = pd.DataFrame({
+        "Data": c[col_data] if col_data else None,
+        "TotalLinha": c[col_tot] if col_tot else 0
+    })
+    out["Data_d"]   = out["Data"].apply(_parse_date_any)
+    out["TotalNum"] = out["TotalLinha"].apply(_to_float)
+    out = out[(out["Data_d"]>=dt_ini) & (out["Data_d"]<=dt_fim)]
+    return out
+
+compras = _normalize_compras_period(comp_raw)
+
+# =========================
+# >>> Estoque & Custo Médio calculados da HISTÓRIA inteira <<<
+# (para independência da aba Produtos)
+# =========================
+def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
+    if v.empty: 
+        return pd.DataFrame(columns=["IDProduto","QtdNum"])
+    v = v.copy()
+    v.columns = [c.strip() for c in v.columns]
+    col_idp = _first_col(v, ["IDProduto","ProdutoID","ID"])
+    col_qtd = _first_col(v, ["Qtd","Quantidade","Qtde","Qde"])
+    col_vid = _first_col(v, ["VendaID","Pedido","Cupom"])
+    out = pd.DataFrame({
+        "IDProduto": v[col_idp] if col_idp else None,
+        "QtdNum": v[col_qtd].apply(_to_float) if col_qtd else 0.0,
+        "VendaID": v[col_vid] if col_vid else ""
+    })
+    out["IDProduto"] = out["IDProduto"].astype(str)
+    return out
+
+def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
+    if c.empty:
+        return pd.DataFrame(columns=["IDProduto","QtdNum","CustoNum"])
+    c = c.copy()
+    c.columns = [x.strip() for x in c.columns]
+    col_idp = _first_col(c, ["IDProduto","ProdutoID","ID"])
+    col_qtd = _first_col(c, ["Qtd","Quantidade","Qtde","Qde"])
+    col_cu  = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit","Custo"])
+    out = pd.DataFrame({
+        "IDProduto": c[col_idp] if col_idp else None,
+        "QtdNum": c[col_qtd].apply(_to_float) if col_qtd else 0.0,
+        "CustoNum": c[col_cu].apply(_to_float) if col_cu else 0.0,
+    })
+    out["IDProduto"] = out["IDProduto"].astype(str)
+    return out
+
+def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
+    if a is None or a.empty:
+        return pd.DataFrame(columns=["IDProduto","QtdNum"])
+    a = a.copy()
+    a.columns = [x.strip() for x in a.columns]
+    col_idp = _first_col(a, ["IDProduto","ProdutoID","ID"])
+    col_qtd = _first_col(a, ["Qtd","Quantidade","Qtde","Qde","Ajuste"])
+    if not col_idp or not col_qtd:
+        return pd.DataFrame(columns=["IDProduto","QtdNum"])
+    out = pd.DataFrame({
+        "IDProduto": a[col_idp].astype(str),
+        "QtdNum": a[col_qtd].apply(_to_float),
+    })
+    return out
+
+# Ajustes podem não existir
+try: aj_raw = carregar_aba("Ajustes")
+except Exception: aj_raw = pd.DataFrame()
+
+v_all = _normalize_vendas_all(vend_raw)
+c_all = _normalize_compras_all(comp_raw)
+a_all = _normalize_ajustes_all(aj_raw)
+
+entradas = c_all.groupby("IDProduto")["QtdNum"].sum() if not c_all.empty else pd.Series(dtype=float)
+saidas   = v_all.groupby("IDProduto")["QtdNum"].sum() if not v_all.empty else pd.Series(dtype=float)
+ajustes  = a_all.groupby("IDProduto")["QtdNum"].sum() if not a_all.empty else pd.Series(dtype=float)
+
+calc = pd.DataFrame({"Entradas": entradas, "Saidas": saidas, "Ajustes": ajustes}).fillna(0.0)
+calc["EstoqueCalc"] = calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
+
+# custo médio (ponderado pelas compras)
+if not c_all.empty:
+    cm = c_all.assign(Parcial=c_all["QtdNum"]*c_all["CustoNum"]).groupby("IDProduto")[["Parcial","QtdNum"]].sum()
+    cm["CustoMedio"] = cm["Parcial"] / cm["QtdNum"].replace(0, pd.NA)
+    custo_medio = cm["CustoMedio"].fillna(0.0)
+else:
+    custo_medio = pd.Series(dtype=float)
+
+calc["CustoMedio"] = custo_medio
+calc = calc.reset_index().rename(columns={"index":"IDProduto"})
+
+# Merge com PRODUTOS por ID
+prod_calc = prod.copy() if not prod.empty else pd.DataFrame()
+if not prod_calc.empty and "ID" in prod_calc.columns:
+    prod_calc["ID"] = prod_calc["ID"].astype(str)
+    prod_calc = prod_calc.merge(calc, how="left", left_on="ID", right_on="IDProduto")
+    prod_calc.drop(columns=["IDProduto"], inplace=True)
+
+for col in ["EstoqueCalc","CustoMedio","Entradas","Saidas","Ajustes"]:
+    if col not in prod_calc.columns:
+        prod_calc[col] = 0.0
+
+prod_calc["ValorEstoqueCalc"] = prod_calc["CustoMedio"].fillna(0)*prod_calc["EstoqueCalc"].fillna(0)
+
+# =========================
+# KPIs (faturamento, cupons, itens, lucro, margem, ticket, caixa)
+# =========================
+if not vendas.empty:
     faturamento = cupom_grp["ReceitaCupom"].sum()
     num_cupons  = cupom_grp["VendaID"].nunique()
-    # Itens vendidos (por linha)
     itens_vendidos = vendas["QtdNum"].sum()
 else:
     faturamento = 0.0; num_cupons = 0; itens_vendidos = 0.0
 
-# COGS aproximado = sum(Qtd * CustoAtual[produto])
-if not vendas.empty and not prod.empty and "ID" in prod.columns:
-    custo_map = prod.set_index("ID")["CustoAtual"].to_dict()
-    # tenta também ProdutoID/ID nos dados
+# COGS aproximado = sum(Qtd * CustoMedio[produto])
+if not vendas.empty and not prod_calc.empty and "ID" in prod_calc.columns:
+    custo_map = prod_calc.set_index("ID")["CustoMedio"].to_dict()
     idcol = "IDProduto" if "IDProduto" in vendas.columns else None
     if idcol:
         vendas["_CustoLinha"] = vendas["QtdNum"] * vendas[idcol].map(lambda x: _to_float(custo_map.get(str(x), 0)))
@@ -287,7 +360,6 @@ k2.metric("🧾 Cupons", f"{num_cupons}", f"Ticket {_fmt_brl(ticket_medio)}")
 k3.metric("📦 Itens vendidos", f"{itens_vendidos:.0f}")
 k4.metric("📈 Lucro bruto (aprox.)", _fmt_brl(lucro_bruto), f"{margem_bruta:.1f}% margem")
 k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
-
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
 st.divider()
@@ -340,28 +412,21 @@ st.divider()
 # =========================
 st.subheader("🏆 Top produtos por faturamento")
 if not vendas.empty:
-    # tenta juntar nome do produto se existir na planilha de vendas
-    col_nome_v = _first_col(vend, ["Produto","Nome"])
-    base = vendas.copy()
-    if col_nome_v and col_nome_v in vend.columns:
-        base = base.merge(vend[[ "VendaID", col_nome_v ]], how="left", left_on="VendaID", right_on="VendaID")
-        base.rename(columns={col_nome_v:"NomeProduto"}, inplace=True)
-    key = "IDProduto" if "IDProduto" in base.columns else None
+    key = "IDProduto" if "IDProduto" in vendas.columns else None
     if key:
-        g = base.groupby(key)["TotalNum"].sum().reset_index().sort_values("TotalNum", ascending=False).head(10)
-        # junta nome a partir de PRODUTOS
+        g = vendas.groupby(key)["TotalNum"].sum().reset_index().sort_values("TotalNum", ascending=False).head(10)
         if not prod.empty and "ID" in prod.columns and "Nome" in prod.columns:
             g = g.merge(prod[["ID","Nome"]], how="left", left_on=key, right_on="ID")
-            g["Label"] = g["Nome"].fillna(g[key].astype(str))
+            g["Produto"] = g["Nome"].fillna(g[key].astype(str))
         else:
-            g["Label"] = g[key].astype(str)
+            g["Produto"] = g[key].astype(str)
         c1,c2 = st.columns([1.2,1])
         with c1:
-            figt = px.bar(g, x="Label", y="TotalNum")
+            figt = px.bar(g, x="Produto", y="TotalNum")
             figt.update_layout(yaxis_title="R$", xaxis_title="")
             st.plotly_chart(figt, use_container_width=True)
         with c2:
-            st.dataframe(g[["Label","TotalNum"]].rename(columns={"Label":"Produto","TotalNum":"Total (R$)"}),
+            st.dataframe(g[["Produto","TotalNum"]].rename(columns={"TotalNum":"Total (R$)"}),
                          use_container_width=True, hide_index=True)
     else:
         st.info("Não encontrei coluna de ID nas vendas para rankear produtos.")
@@ -371,41 +436,68 @@ else:
 st.divider()
 
 # =========================
-# Estoque (instantâneo)
+# ESTOQUE — visão geral (usando cálculos ao vivo)
 # =========================
 st.subheader("📦 Estoque — visão geral")
-if prod.empty:
+
+# (Opcional) sincronizar de volta na planilha
+with st.expander("Sincronização opcional com a planilha"):
+    if st.button("🔄 Atualizar colunas EstoqueAtual/CustoAtual na aba Produtos"):
+        try:
+            sh = conectar_sheets()
+            ws = sh.worksheet(ABA_PROD)
+            df_sheet = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0)
+            df_sheet.columns = [c.strip() for c in df_sheet.columns]
+            if "ID" not in df_sheet.columns:
+                st.error("A aba Produtos precisa ter coluna 'ID' para sincronizar.")
+            else:
+                df_sheet["ID"] = df_sheet["ID"].astype(str)
+                m = df_sheet.merge(prod_calc[["ID","EstoqueCalc","CustoMedio"]], how="left", on="ID")
+                if "EstoqueAtual" not in m.columns: m["EstoqueAtual"] = ""
+                if "CustoAtual"   not in m.columns: m["CustoAtual"]   = ""
+                m["EstoqueAtual"] = m["EstoqueCalc"].fillna(0).round(0).astype(int).astype(str)
+                m["CustoAtual"]   = m["CustoMedio"].fillna(0).map(lambda x: f"{float(x):.2f}".replace(".", ","))
+                ws.clear()
+                from gspread_dataframe import set_with_dataframe
+                set_with_dataframe(ws, m)
+                st.success("Planilha sincronizada!")
+                st.cache_data.clear()
+        except Exception as e:
+            st.error("Falha ao sincronizar.")
+            st.caption(str(e))
+
+if prod_calc.empty:
     st.info("Sem produtos para exibir.")
 else:
-    # filtros produtos
-    m = pd.Series(True, index=prod.index)
-    if cat_sel:  m &= prod["Categoria"].astype(str).isin(cat_sel)
-    if forn_sel: m &= prod["Fornecedor"].astype(str).isin(forn_sel)
-    if apenas_ativos and "Ativo" in prod.columns:
-        prod["Ativo"] = prod["Ativo"].astype(str).str.lower()
-        m &= (prod["Ativo"]=="sim")
+    m = pd.Series(True, index=prod_calc.index)
+    if cat_sel:  m &= prod_calc["Categoria"].astype(str).isin(cat_sel)
+    if forn_sel: m &= prod_calc["Fornecedor"].astype(str).isin(forn_sel)
+    if apenas_ativos and "Ativo" in prod_calc.columns:
+        prod_calc["Ativo"] = prod_calc["Ativo"].astype(str).str.lower()
+        m &= (prod_calc["Ativo"]=="sim")
     if busca:
         s = busca.lower()
-        m &= prod.apply(lambda r: s in " ".join([str(x).lower() for x in r.values]), axis=1)
+        m &= prod_calc.apply(lambda r: s in " ".join([str(x).lower() for x in r.values]), axis=1)
 
-    dfv = prod[m].copy()
-    # KPIs de estoque
-    total_skus = len(dfv)
-    valor_estoque = dfv["ValorEstoque"].sum()
-    abaixo_min = int(dfv["AbaixoMin"].sum())
+    dfv = prod_calc[m].copy()
+
+    total_produtos = len(dfv)
+    valor_estoque  = dfv["ValorEstoqueCalc"].sum()
+    abaixo_min     = int((dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0)).sum())
+
     k1,k2,k3 = st.columns(3)
-    k1.metric("SKUs exibidos", f"{total_skus}")
+    k1.metric("Produtos exibidos", f"{total_produtos}")
     k2.metric("💰 Valor em estoque", _fmt_brl(valor_estoque))
     k3.metric("⚠️ Abaixo do mínimo", f"{abaixo_min}")
 
-    # Abaixo do mínimo
     st.markdown("**⚠️ Itens abaixo do mínimo / sugestão de compra**")
     if "EstoqueMin" in dfv.columns:
-        alert = dfv[dfv["AbaixoMin"]].copy()
+        alert = dfv[dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0)].copy()
         if not alert.empty:
-            alert["SugestaoCompra"] = (alert["EstoqueMin"].fillna(0)*2 - alert["EstoqueAtual"].fillna(0)).clip(lower=0).round()
-            cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueAtual","EstoqueMin","SugestaoCompra","LeadTimeDias"] if c in alert.columns]
-            st.dataframe(alert[cols_alerta], use_container_width=True, hide_index=True)
+            alert["SugestaoCompra"] = (alert["EstoqueMin"].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
+            cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc","EstoqueMin","SugestaoCompra","LeadTimeDias"] if c in alert.columns]
+            st.dataframe(alert[cols_alerta].rename(columns={"EstoqueCalc":"EstoqueAtual"}),
+                         use_container_width=True, hide_index=True)
         else:
             st.info("Nenhum item abaixo do mínimo.")
     else:
@@ -413,20 +505,30 @@ else:
 
     st.divider()
 
-    # Top valor em estoque
     st.markdown("**🏆 Top 10 — Valor em estoque**")
-    if not dfv.empty:
-        top = dfv.sort_values("ValorEstoque", ascending=False).head(10)
+    top = dfv.sort_values("ValorEstoqueCalc", ascending=False).head(10)
+    if top["ValorEstoqueCalc"].fillna(0).sum() <= 0:
+        st.info("Sem valor em estoque (custo/estoque ainda não cadastrados).")
+    else:
         c1,c2 = st.columns([1.2,1])
         with c1:
-            fig = px.bar(top, x="Nome", y="ValorEstoque", hover_data=["EstoqueAtual","CustoAtual","Categoria"])
+            fig = px.bar(top, x="Nome", y="ValorEstoqueCalc",
+                         hover_data=["EstoqueCalc","CustoMedio","Categoria"])
             fig.update_layout(xaxis_title="", yaxis_title="R$ em estoque")
             st.plotly_chart(fig, use_container_width=True)
         with c2:
-            cols = [c for c in ["ID","Nome","Categoria","EstoqueAtual","CustoAtual","ValorEstoque"] if c in top.columns]
-            st.dataframe(top[cols], use_container_width=True, hide_index=True, height=420)
+            cols = [c for c in ["ID","Nome","Categoria","EstoqueCalc","CustoMedio","ValorEstoqueCalc"] if c in top.columns]
+            st.dataframe(top[cols].rename(columns={
+                "EstoqueCalc":"EstoqueAtual",
+                "CustoMedio":"CustoAtual",
+                "ValorEstoqueCalc":"ValorEstoque"
+            }), use_container_width=True, hide_index=True, height=420)
 
     st.divider()
     st.markdown("**📋 Lista de produtos (filtrada)**")
-    cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoAtual","PrecoVenda","EstoqueAtual","EstoqueMin","ValorEstoque","Ativo"] if c in dfv.columns]
-    st.dataframe(dfv[cols_show] if cols_show else dfv, use_container_width=True, hide_index=True)
+    cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoMedio","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo"] if c in dfv.columns]
+    st.dataframe(dfv[cols_show].rename(columns={
+        "CustoMedio":"CustoAtual",
+        "EstoqueCalc":"EstoqueAtual",
+        "ValorEstoqueCalc":"ValorEstoque"
+    }) if cols_show else dfv, use_container_width=True, hide_index=True)
