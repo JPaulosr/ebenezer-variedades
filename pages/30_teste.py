@@ -305,24 +305,24 @@ else:
 
         # ---------- Duplicar ----------
         def _carrega_carrinho(venda_id):
-            linhas = vend[vend[col_venda]==venda_id].copy()
-            cart = []
-            for _, r in linhas.iterrows():
-                cart.append({
-                    "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "nome": "",  # opcional
-                    "unid": "un",
-                    "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
-                    "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
-                })
-            st.session_state["prefill_cart"] = {
-                "cart": cart,
-                "forma": row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro",
-                "obs": "",
-                "data": date.today(),
-                "desc": float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
-            }
-            _rerun()
+    linhas = vend[vend[col_venda]==venda_id].copy()
+    cart = []
+    for _, r in linhas.iterrows():
+        cart.append({
+            "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
+            "nome": "",
+            "unid": "un",
+            "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
+            "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
+        })
+    st.session_state["prefill_cart"] = {
+        "cart": cart,
+        "forma": row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro",
+        "obs": "",
+        "data": date.today(),
+        "desc": float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
+    }
+    st.rerun()  # <-- troque por isso
 
         # ---------- Estornar ----------
         def _cancelar_cupom(venda_id):
