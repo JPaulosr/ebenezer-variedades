@@ -1,4 +1,4 @@
-# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar)
+# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com _rerun e clamps de Qtd/Preço
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date
@@ -8,8 +8,20 @@ import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Vendas rápidas", page_icon="🧾", layout="wide")
-st.title("🧾 Vendas rápidas (carrinho)")
+st.set_page_config(page_title="Vendas", page_icon="🧾", layout="wide")
+st.title("🧾 Vendas (carrinho)")
+
+# =========================================================
+# Helper para rerun compatível (Streamlit >=1.27 e versões antigas)
+# =========================================================
+def _rerun():
+    try:
+        st.rerun()  # versões novas
+    except Exception:
+        try:
+            st.experimental_rerun()  # fallback para versões antigas
+        except Exception:
+            pass
 
 # ================= Helpers =================
 def _normalize_private_key(key: str) -> str:
@@ -59,9 +71,14 @@ def _to_num(x):
     try: return float(s)
     except: return 0.0
 
-# ================= Catálogo =================
-ABA_PROD, ABA_VEND = "Produtos", "Vendas"
+def _fmt_brl_num(v):
+    return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
+# ================= Abas/colunas =================
+ABA_PROD = "Produtos"
+ABA_VEND = "Vendas"
+
+# ================= Catálogo =================
 try:
     dfp = carregar_aba(ABA_PROD)
 except Exception as e:
@@ -69,9 +86,9 @@ except Exception as e:
     with st.expander("Detalhes técnicos"): st.code(str(e))
     st.stop()
 
-col_id   = _first_col(dfp, ["ID","Codigo","Código","SKU"])
-col_nome = _first_col(dfp, ["Nome","Produto","Descrição"])
-col_preco= _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"])
+col_id   = _first_col(dfp, ["ID","Codigo","Código","SKU","IDProduto"])
+col_nome = _first_col(dfp, ["Nome","Produto","Descrição","Descricao"])
+col_preco= _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco","PrecoUnit"])
 col_unid = _first_col(dfp, ["Unidade","Und"])
 if not col_id or not col_nome:
     st.error("A aba Produtos precisa ter colunas de ID e Nome."); st.stop()
@@ -79,6 +96,13 @@ if not col_id or not col_nome:
 dfp["_label"] = dfp.apply(lambda r: f"{str(r[col_id])} — {str(r[col_nome])}", axis=1)
 cat_map = dfp.set_index("_label")[[col_id, col_nome, col_preco, col_unid]].to_dict("index")
 labels = ["(selecione)"] + sorted(cat_map.keys())
+
+# ================= Estado inicial =================
+if "cart" not in st.session_state: st.session_state["cart"] = []
+if "forma" not in st.session_state: st.session_state["forma"] = "Dinheiro"
+if "obs" not in st.session_state:   st.session_state["obs"] = ""
+if "data_venda" not in st.session_state: st.session_state["data_venda"] = date.today()
+if "desc" not in st.session_state:  st.session_state["desc"] = 0.0
 
 # ================= Prefill (duplicar cupom) =================
 if "prefill_cart" in st.session_state:
@@ -90,14 +114,9 @@ if "prefill_cart" in st.session_state:
     st.session_state.pop("prefill_cart")
 
 # ================= Carrinho =================
-if "cart" not in st.session_state: st.session_state["cart"] = []
-if "forma" not in st.session_state: st.session_state["forma"] = "Dinheiro"
-if "obs" not in st.session_state:   st.session_state["obs"] = ""
-if "data_venda" not in st.session_state: st.session_state["data_venda"] = date.today()
-if "desc" not in st.session_state:  st.session_state["desc"] = 0.0
-
 st.subheader("Nova venda / cupom")
 
+# Data
 cdate, = st.columns(1)
 with cdate:
     st.session_state["data_venda"] = st.date_input("Data da venda", value=st.session_state["data_venda"])
@@ -140,14 +159,29 @@ else:
         c1, c2, c3, c4, c5, c6 = st.columns([1.8, 3, 1, 1.4, 1.6, 0.8])
         c1.write(it["id"])
         c2.write(it["nome"])
+
+        # ---- Qtd (clamp >= 1) ----
         with c3:
-            st.session_state["cart"][idx]["qtd"] = st.number_input("Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"]))
+            q_val = int(_to_num(it.get("qtd", 1)))
+            if q_val < 1:
+                q_val = 1
+            st.session_state["cart"][idx]["qtd"] = st.number_input(
+                "Qtd", key=f"q_{idx}", min_value=1, step=1, value=q_val
+            )
+
+        # ---- Preço (clamp >= 0) ----
         with c4:
-            st.session_state["cart"][idx]["preco"] = st.number_input("Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=float(it["preco"]), format="%.2f")
-        c5.write(f"Subtotal: R$ {(st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']):,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+            p_val = float(_to_num(it.get("preco", 0.0)))
+            if p_val < 0:
+                p_val = 0.0
+            st.session_state["cart"][idx]["preco"] = st.number_input(
+                "Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=p_val, format="%.2f"
+            )
+
+        c5.write(_fmt_brl_num(st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']))
         if c6.button("🗑️", key=f"rm_{idx}"):
             st.session_state["cart"].pop(idx)
-            st.experimental_rerun()
+            _rerun()
 
     st.markdown("---")
     total_itens = sum(i["qtd"] for i in st.session_state["cart"])
@@ -155,14 +189,16 @@ else:
 
     cL, cR = st.columns([2, 1.2])
     with cL:
-        st.session_state["forma"] = st.selectbox("Forma de pagamento", ["Dinheiro","Pix","Cartão Débito","Cartão Crédito","Outros"], index=["Dinheiro","Pix","Cartão Débito","Cartão Crédito","Outros"].index(st.session_state["forma"]) if st.session_state["forma"] in ["Dinheiro","Pix","Cartão Débito","Cartão Crédito","Outros"] else 0)
+        formas = ["Dinheiro","Pix","Cartão Débito","Cartão Crédito","Outros"]
+        idx_forma = formas.index(st.session_state["forma"]) if st.session_state["forma"] in formas else 0
+        st.session_state["forma"] = st.selectbox("Forma de pagamento", formas, index=idx_forma)
         st.session_state["obs"]   = st.text_input("Observações (opcional)", value=st.session_state["obs"])
     with cR:
         st.session_state["desc"]  = st.number_input("Desconto (R$)", min_value=0.0, value=float(st.session_state["desc"]), step=0.5, format="%.2f")
         total_liq = max(0.0, total_bruto - float(st.session_state["desc"]))
         st.metric("Total itens", total_itens)
-        st.metric("Total bruto", f"R$ {total_bruto:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-        st.metric("Total líquido", f"R$ {total_liq:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+        st.metric("Total bruto", _fmt_brl_num(total_bruto))
+        st.metric("Total líquido", _fmt_brl_num(total_liq))
 
     colA, colB = st.columns([1, 1])
     if colA.button("🧾 Registrar venda", type="primary", use_container_width=True):
@@ -244,9 +280,14 @@ else:
     has_total = "TotalCupom" in vend.columns
     has_stat  = "CupomStatus" in vend.columns
 
-    vend["_Bruto"] = vend.apply(lambda r: _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns else (_to_num(r.get(col_qtd))*_to_num(r.get(col_preco)) if col_qtd and col_preco else 0.0), axis=1)
+    vend["_Bruto"] = vend.apply(
+        lambda r: _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns else (
+            _to_num(r.get(col_qtd))*_to_num(r.get(col_preco)) if col_qtd and col_preco else 0.0
+        ),
+        axis=1
+    )
     vend["_Desc"]  = vend["Desconto"].map(_to_num) if has_desc else 0.0
-    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])  # se não tiver desconto salvo
+    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])
 
     # agrega por VendaID
     grp = vend.groupby(col_venda, dropna=False).agg({
@@ -257,6 +298,7 @@ else:
         "_TotalC": "max",
         "Obs": "first"
     }).reset_index().rename(columns={col_venda:"VendaID", col_data:"Data", col_forma:"Forma"})
+
     # Ordena por data/venda (recente primeiro)
     try:
         grp["_ord"] = pd.to_datetime(grp["Data"], format="%d/%m/%Y", errors="coerce")
@@ -271,20 +313,30 @@ else:
         b2.write(row["Data"])
         b3.write(row["Forma"] if pd.notna(row["Forma"]) else "—")
         bruto = row["_Bruto"]; desc = row["_Desc"]; total = row["_TotalC"] if row["_TotalC"]>0 else (bruto - desc)
-        b4.write(f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+        b4.write(_fmt_brl_num(total))
         cancelado = str(row.get("Obs","")).upper().startswith("ESTORNO DE") or str(row["VendaID"]).startswith("CN-")
 
         c1, c2, c3 = st.columns([0.9, 0.9, 4])
+
+        # ---------- Duplicar ----------
         def _carrega_carrinho(venda_id):
             linhas = vend[vend[col_venda]==venda_id].copy()
             cart = []
             for _, r in linhas.iterrows():
+                q_raw = int(_to_num(r[col_qtd])) if col_qtd else 1
+                q = abs(q_raw) or 1  # evita 0 e negativo
+                p = float(_to_num(r[col_preco])) if col_preco else 0.0
+                if p < 0:
+                    p = 0.0
+                # se por algum motivo veio 0, pula
+                if q == 0:
+                    continue
                 cart.append({
                     "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "nome": "",  # opcional, não precisa no carrinho
+                    "nome": "",  # opcional
                     "unid": "un",
-                    "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
-                    "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
+                    "qtd": q,
+                    "preco": p
                 })
             st.session_state["prefill_cart"] = {
                 "cart": cart,
@@ -293,8 +345,9 @@ else:
                 "data": date.today(),
                 "desc": float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
             }
-            st.experimental_rerun()
+            _rerun()
 
+        # ---------- Estornar ----------
         def _cancelar_cupom(venda_id):
             if str(venda_id).startswith("CN-"):
                 st.warning("Esse cupom já é um estorno."); return
