@@ -1,4 +1,4 @@
-# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar)
+# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com Telegram (recibo + resumo do dia)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date
@@ -55,7 +55,7 @@ def carregar_aba(nome: str) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     return df
 
-def _first_col(df: pd.DataFrame, candidates) -> str:
+def _first_col(df: pd.DataFrame, candidates) -> str | None:
     if df is None or df.empty: return None
     for c in candidates:
         if c in df.columns: return c
@@ -69,7 +69,6 @@ def _to_num(x):
     if isinstance(x, (int, float)): return float(x)
     s = str(x).strip()
     if s == "" or s.lower() in ("nan", "none"): return 0.0
-    # caso pt-BR com milhares e vírgula decimal
     s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>1 else s.replace(",", ".")
     try: return float(s)
     except: return 0.0
@@ -79,26 +78,37 @@ def _fmt_brl_num(v):
 
 # ================= Telegram =================
 def _tg_send_loja(texto, kb=None, parse_mode="Markdown"):
-    """Envia mensagem para o canal da lojinha usando o TOKEN/CHAT_ID do secrets."""
+    """
+    Envia mensagem para o canal da lojinha e retorna (ok, resp_text).
+    Mostra erro detalhado em caso de falha (ex.: chat_id errado, bot sem permissão, markdown inválido).
+    """
     token = st.secrets.get("TELEGRAM_TOKEN", "")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "")
     if not token or not chat_id:
-        return  # silencioso se faltar config
+        st.error("🛑 TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID_LOJINHA ausente nos secrets.")
+        return False, "missing_secrets"
+
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": chat_id,  # -100... (privado) ou @canal (público)
         "text": texto,
-        "parse_mode": parse_mode,
+        "parse_mode": parse_mode,  # use None se der erro de markdown
         "disable_web_page_preview": True,
     }
     if kb:
         payload["reply_markup"] = json.dumps({"inline_keyboard": kb})
-    try:
-        requests.post(url, data=payload, timeout=8)
-    except Exception as e:
-        st.info(f"[Telegram] {e}")
 
-def _fmt_recibo_venda(venda_id, data_str, forma, itens, desconto, total_liq):
+    try:
+        r = requests.post(url, data=payload, timeout=12)
+        if not r.ok:
+            st.error(f"❌ Telegram falhou: {r.status_code} — {r.text}")
+            return False, r.text
+        return True, r.text
+    except Exception as e:
+        st.error(f"❌ Erro ao chamar Telegram: {e}")
+        return False, str(e)
+
+def _fmt_recibo_venda(venda_id: str, data_str: str, forma: str, itens: list[dict], desconto: float, total_liq: float) -> str:
     # itens: [{"nome": "...", "qtd": 2, "preco": 15.0}]
     linhas = []
     for it in itens:
@@ -119,7 +129,7 @@ def _fmt_recibo_venda(venda_id, data_str, forma, itens, desconto, total_liq):
         f"*Total líquido:* R$ {float(total_liq):.2f}"
     ).replace(".", ",")
 
-def _resumo_do_dia_texto(data_str: str, vend_df: pd.DataFrame) -> str:
+def _resumo_do_dia_texto(data_str: str, vend_df: pd.DataFrame) -> str | None:
     """Checklist/resumo do dia (parcial) com base na aba Vendas."""
     if vend_df is None or vend_df.empty:
         return f"*Checklist do dia* ({data_str})\n— Sem cupons OK por enquanto."
@@ -147,7 +157,7 @@ def _resumo_do_dia_texto(data_str: str, vend_df: pd.DataFrame) -> str:
     df["_Desc"]   = df["Desconto"].map(_to_num) if has_desc else 0.0
     df["_TotalC"] = df["TotalCupom"].map(_to_num) if has_total else df["_Bruto"]
 
-    # apenas do dia
+    # somente o dia selecionado
     df = df[df[col_data] == data_str].copy()
 
     # exclui estornos
@@ -307,16 +317,13 @@ else:
         st.metric("Total bruto", _fmt_brl_num(total_bruto))
         st.metric("Total líquido", _fmt_brl_num(total_liq))
 
-    # botão manual para enviar resumo do dia (com a data selecionada)
-    if st.button("📊 Enviar resumo do dia agora", use_container_width=True):
-        try:
-            vend_full_btn = carregar_aba(ABA_VEND)
-            data_str_btn = st.session_state["data_venda"].strftime("%d/%m/%Y")
-            msg_resumo_btn = _resumo_do_dia_texto(data_str_btn, vend_full_btn)
-            _tg_send_loja(msg_resumo_btn)
-            st.success("Resumo do dia enviado para o Telegram.")
-        except Exception as e:
-            st.warning(f"Não foi possível enviar o resumo agora. Detalhes: {e}")
+    # Botão opcional de teste de envio ao Telegram
+    if st.button("📨 Testar Telegram (lojinha)", use_container_width=True):
+        ok_test, resp_test = _tg_send_loja("Teste de envio ✅")
+        if ok_test:
+            st.success("Teste enviado. Verifique o canal.")
+        else:
+            st.warning("Não foi possível enviar o teste. Veja o erro acima.")
 
     colA, colB = st.columns([1, 1])
     if colA.button("🧾 Registrar venda", type="primary", use_container_width=True):
@@ -392,15 +399,15 @@ else:
             if app_url:  row.append({"text": "📲 App", "url": app_url})
             if row: kb.append(row)
 
-            _tg_send_loja(msg_recibo, kb)
+            ok1, resp1 = _tg_send_loja(msg_recibo, kb)
 
             # ======= TELEGRAM: RESUMO DO DIA (PARCIAL) =======
             try:
                 vend_full = carregar_aba(ABA_VEND)  # recarrega para refletir a venda gravada
                 msg_resumo = _resumo_do_dia_texto(data_str, vend_full)
-                _tg_send_loja(msg_resumo)
-            except Exception:
-                pass
+                ok2, resp2 = _tg_send_loja(msg_resumo)
+            except Exception as e:
+                st.warning(f"[Resumo do dia] falhou ao montar/enviar: {e}")
 
             # limpa carrinho e força refresh nas outras páginas
             st.session_state["cart"] = []
@@ -479,13 +486,13 @@ else:
             cart = []
             for _, r in linhas.iterrows():
                 q_raw = int(_to_num(r[col_qtd])) if col_qtd else 1
-                q = abs(q_raw) or 1
+                q = abs(q_raw) or 1  # evita 0 e negativo
                 p = float(_to_num(r[col_preco])) if col_preco else 0.0
                 if p < 0: p = 0.0
                 if q == 0: continue
                 cart.append({
                     "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "nome": "",
+                    "nome": "",  # opcional
                     "unid": "un",
                     "qtd": q,
                     "preco": p
