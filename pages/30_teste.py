@@ -1,4 +1,4 @@
-# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar) — COM FIADO AUTOMÁTICO
+# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar) — COM FIADO AUTOMÁTICO + CLIENTES CADASTRADOS
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date, timedelta
@@ -89,11 +89,29 @@ def _append_rows(ws, rows: list[dict]):
     if to_append:
         ws.append_rows(to_append, value_input_option="USER_ENTERED")
 
-# ================= Catálogo =================
+# ================= Abas principais =================
 ABA_PROD, ABA_VEND = "Produtos", "Vendas"
 ABA_FIADO = "Fiado"
-COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
+ABA_CLIENTES = "Clientes"
 
+COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
+COLS_CLIENTES = ["Cliente","Telefone","Obs"]
+
+# ---- Clientes (cadastro) ----
+def _garantir_aba_clientes(sh):
+    return _garantir_aba(sh, ABA_CLIENTES, COLS_CLIENTES)
+
+def _carregar_clientes() -> list[str]:
+    try:
+        dfc = carregar_aba(ABA_CLIENTES)
+        col_cli = "Cliente" if "Cliente" in dfc.columns else (dfc.columns[0] if not dfc.empty else None)
+        if not col_cli: return []
+        lst = [str(x).strip() for x in dfc[col_cli].dropna().tolist() if str(x).strip()]
+        return sorted(list(dict.fromkeys(lst)))
+    except Exception:
+        return []
+
+# ================= Catálogo =================
 try:
     dfp = carregar_aba(ABA_PROD)
 except Exception as e:
@@ -121,7 +139,7 @@ if "prefill_cart" in st.session_state:
     st.session_state["desc"]  = float(st.session_state["prefill_cart"].get("desc", 0.0))
     st.session_state.pop("prefill_cart")
 
-# ================= Carrinho =================
+# ================= Estado inicial =================
 if "cart" not in st.session_state: st.session_state["cart"] = []
 if "forma" not in st.session_state: st.session_state["forma"] = "Dinheiro"
 if "obs" not in st.session_state:   st.session_state["obs"] = ""
@@ -130,9 +148,10 @@ if "desc" not in st.session_state:  st.session_state["desc"] = 0.0
 if "cliente" not in st.session_state: st.session_state["cliente"] = ""
 if "venc_fiado" not in st.session_state: st.session_state["venc_fiado"] = date.today() + timedelta(days=30)
 
+# ================= Carrinho =================
 st.subheader("Nova venda / cupom")
 
-# Data e (cliente aparece mais abaixo quando Fiado)
+# Data
 cdate, = st.columns(1)
 with cdate:
     st.session_state["data_venda"] = st.date_input("Data da venda", value=st.session_state["data_venda"])
@@ -195,9 +214,18 @@ else:
         idx_forma = formas.index(st.session_state["forma"]) if st.session_state["forma"] in formas else 0
         st.session_state["forma"] = st.selectbox("Forma de pagamento", formas, index=idx_forma)
 
-        # Se Fiado: pedir Cliente (obrigatório) e Vencimento (padrão +30 dias)
         if st.session_state["forma"] == "Fiado":
-            st.session_state["cliente"] = st.text_input("Cliente (obrigatório para Fiado)", value=st.session_state["cliente"])
+            # Clientes cadastrados
+            clientes_existentes = _carregar_clientes()
+            usar_lista = st.checkbox("Selecionar cliente cadastrado", value=True)
+
+            if usar_lista and clientes_existentes:
+                sel_cli = st.selectbox("Cliente (lista)", ["(selecione)"] + clientes_existentes, index=0)
+                novo_cli = st.text_input("Ou cadastrar novo cliente", value="")
+                st.session_state["cliente"] = (novo_cli.strip() or (sel_cli if sel_cli != "(selecione)" else "")).strip()
+            else:
+                st.session_state["cliente"] = st.text_input("Cliente (obrigatório para Fiado)", value=st.session_state["cliente"])
+
             st.session_state["venc_fiado"] = st.date_input("Vencimento do fiado", value=st.session_state["venc_fiado"])
         else:
             st.session_state["cliente"] = st.text_input("Cliente (opcional)", value=st.session_state["cliente"])
@@ -241,15 +269,33 @@ else:
             desconto = float(st.session_state["desc"])
             total_cupom = max(0.0, total_bruto - desconto)
 
-            # ---- Se for FIADO, gera o fiado agora e usa o ID nas linhas
+            # ---- Se for FIADO, garante cadastro do cliente e cria o fiado
             fiado_id = ""
             if st.session_state["forma"] == "Fiado":
+                cli_nome = st.session_state.get("cliente","").strip()
+
+                # cadastra cliente se não existir
+                ws_cli = _garantir_aba(sh, ABA_CLIENTES, COLS_CLIENTES)
+                try:
+                    dfc = carregar_aba(ABA_CLIENTES)
+                except Exception:
+                    dfc = pd.DataFrame(columns=COLS_CLIENTES)
+                ja_tem = False
+                if not dfc.empty:
+                    if "Cliente" in dfc.columns:
+                        ja_tem = any(str(x).strip().lower() == cli_nome.lower() for x in dfc["Cliente"].dropna())
+                    else:
+                        ja_tem = any(str(x).strip().lower() == cli_nome.lower() for x in dfc[dfc.columns[0]].dropna())
+                if cli_nome and not ja_tem:
+                    _append_rows(ws_cli, [{"Cliente": cli_nome, "Telefone": "", "Obs": ""}])
+
+                # cria fiado
                 ws_fiado = _garantir_aba(sh, ABA_FIADO, COLS_FIADO)
                 fiado_id = _gerar_id("F")
                 linha_fiado = {
                     "ID": fiado_id,
                     "Data": data_str,
-                    "Cliente": st.session_state.get("cliente","").strip(),
+                    "Cliente": cli_nome,
                     "Valor": float(total_cupom),
                     "Vencimento": st.session_state["venc_fiado"].strftime("%d/%m/%Y") if isinstance(st.session_state["venc_fiado"], date) else "",
                     "Status": "Em aberto",
@@ -323,7 +369,7 @@ else:
 
     vend["_Bruto"] = vend.apply(lambda r: _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns else (_to_num(r.get(col_qtd))*_to_num(r.get(col_preco)) if col_qtd and col_preco else 0.0), axis=1)
     vend["_Desc"]  = vend["Desconto"].map(_to_num) if has_desc else 0.0
-    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])  # se não tiver desconto salvo
+    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])
 
     # agrega por VendaID
     grp = vend.groupby(col_venda, dropna=False).agg({
@@ -348,7 +394,7 @@ else:
         b2.write(row["Data"])
         b3.write(row["Forma"] if pd.notna(row["Forma"]) else "—")
         bruto = row["_Bruto"]; desc = row["_Desc"]; total = row["_TotalC"] if row["_TotalC"]>0 else (bruto - desc)
-        b4.write(f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+        b4.write(f"{_fmt_brl_num(total)}")
         cancelado = str(row.get("Obs","")).upper().startswith("ESTORNO DE") or str(row["VendaID"]).startswith("CN-")
 
         c1, c2, c3 = st.columns([0.9, 0.9, 4])
