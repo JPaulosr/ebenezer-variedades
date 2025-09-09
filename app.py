@@ -256,7 +256,10 @@ def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
-    # Usa: IDProduto|ID, Qtd, Custo Unitário|CustoUnit e soma FreteRateado/OutrosCustos
+    """
+    Entradas SEMPRE pela Qtd; custo é opcional.
+    Soma FreteRateado/OutrosCustos quando existirem.
+    """
     if c.empty:
         return pd.DataFrame(columns=["IDProduto","QtdNum","CustoNum"])
     c = c.copy()
@@ -269,19 +272,23 @@ def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
     col_fre = _first_col(c, ["FreteRateado","Frete Rateado"])
     col_out = _first_col(c, ["OutrosCustos","Outros Custos"])
 
-    if not col_idp or not col_qtd or not (col_cu1 or col_cu2):
+    if not col_idp or not col_qtd:
         return pd.DataFrame(columns=["IDProduto","QtdNum","CustoNum"])
 
-    custo_base = c[col_cu1] if col_cu1 else c[col_cu2]
-    frete_u    = c[col_fre] if col_fre else 0
-    outros_u   = c[col_out] if col_out else 0
+    custo_base = (c[col_cu1] if col_cu1 else (c[col_cu2] if col_cu2 else 0))
+    frete_u    = (c[col_fre] if col_fre else 0)
+    outros_u   = (c[col_out] if col_out else 0)
 
-    out = pd.DataFrame({
+    df = pd.DataFrame({
         "IDProduto": c[col_idp].astype(str),
         "QtdNum":    c[col_qtd].apply(_to_float),
-        "CustoNum":  pd.Series(custo_base).apply(_to_float) + pd.Series(frete_u).apply(_to_float) + pd.Series(outros_u).apply(_to_float),
+        "CustoNum":  pd.Series(custo_base).apply(_to_float)
+                     + pd.Series(frete_u).apply(_to_float)
+                     + pd.Series(outros_u).apply(_to_float),
     })
-    return out
+    df["QtdNum"]   = df["QtdNum"].fillna(0.0)
+    df["CustoNum"] = df["CustoNum"].fillna(0.0)
+    return df
 
 def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
     # Usa sua aba: Data | ID | Qtd | ...
@@ -328,10 +335,11 @@ if not prod_calc.empty and "ID" in prod_calc.columns:
     prod_calc = prod_calc.merge(calc, how="left", left_on="ID", right_on="IDProduto")
     prod_calc.drop(columns=["IDProduto"], inplace=True)
 
-for col in ["EstoqueCalc","CustoMedio","Entradas","Saidas","Ajustes"]:
+# Garante zeros em vez de NaN/None e calcula valor
+for col in ["Entradas","Saidas","Ajustes","EstoqueCalc","CustoMedio"]:
     if col not in prod_calc.columns:
         prod_calc[col] = 0.0
-
+    prod_calc[col] = pd.to_numeric(prod_calc[col], errors="coerce").fillna(0.0)
 prod_calc["ValorEstoqueCalc"] = prod_calc["CustoMedio"].fillna(0)*prod_calc["EstoqueCalc"].fillna(0)
 
 # =========================
