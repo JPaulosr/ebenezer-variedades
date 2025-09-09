@@ -1,7 +1,9 @@
-# pages/05_fechamento_caixa.py — Fechamento de caixa
+# pages/02_fechamento_caixa.py — Fechamento de caixa (líquido por cupom + COGS)
 # -*- coding: utf-8 -*-
-import json, unicodedata
-from datetime import datetime
+import json, unicodedata, re
+from collections.abc import Mapping
+from datetime import datetime, date, timedelta
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -9,29 +11,31 @@ import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Fechamento de caixa", page_icon="💵", layout="wide")
-st.title("💵 Fechamento de caixa")
+st.set_page_config(page_title="Fechamento de caixa", page_icon="🧾", layout="wide")
+st.title("🧾 Fechamento de caixa")
 
-# ------- Helpers -------
+# ========= Helpers =========
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
+    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
     return key
 
-def _load_sa():
+def _load_sa() -> dict:
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
     if isinstance(svc, str): svc = json.loads(svc)
-    svc = {**svc, "private_key": _normalize_private_key(svc["private_key"])}
-    return svc
+    if not isinstance(svc, Mapping): st.error("🛑 GCP_SERVICE_ACCOUNT inválido."); st.stop()
+    pk = str(svc.get("private_key",""))
+    if "BEGIN PRIVATE KEY" not in pk: st.error("🛑 private_key inválida."); st.stop()
+    return {**svc, "private_key": _normalize_private_key(pk)}
 
 @st.cache_resource
 def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL", "")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    creds  = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
+    gc     = gspread.authorize(creds)
+    url_or_id = st.secrets.get("PLANILHA_URL","")
     if not url_or_id: st.error("🛑 PLANILHA_URL ausente."); st.stop()
     return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
 
@@ -42,138 +46,463 @@ def carregar_aba(nome: str) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     return df
 
+def _to_float(x, default=0.0):
+    if x is None: return default
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"): return default
+    s = s.replace("R$","").replace(" ","").replace("\u00A0","")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.\-]","", s)
+    if s.count(".")>1:
+        parts = s.split("."); s = "".join(parts[:-1]) + "." + parts[-1]
+    try: return float(s)
+    except: return default
+
+def _parse_date_any(s):
+    if s is None or (isinstance(s, float) and pd.isna(s)): return None
+    txt = str(s).strip()
+    for fmt in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%y"):
+        try: return datetime.strptime(txt, fmt).date()
+        except: pass
+    try: return pd.to_datetime(txt, dayfirst=True, errors="coerce").date()
+    except: return None
+
 def _first_col(df: pd.DataFrame, candidates) -> str | None:
     if df is None or df.empty: return None
+    cols = list(df.columns)
     for c in candidates:
-        if c in df.columns: return c
-    low = {c.lower(): c for c in df.columns}
+        if c in cols: return c
+    low = {c.lower(): c for c in cols}
     for c in candidates:
         if c.lower() in low: return low[c.lower()]
     return None
 
-def _to_num(x):
-    if x is None: return 0.0
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"): return 0.0
-    s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>1 else s.replace(",", ".")
-    try: return float(s)
-    except: return 0.0
+def _fmt_brl(v):
+    try: return ("R$ "+f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
+    except: return "R$ 0,00"
 
-# ------- Carrega Vendas, Produtos -------
-try:
-    vend = carregar_aba("Vendas")
-except Exception:
-    vend = pd.DataFrame()
+# ========= Carregar bases =========
+ABA_PROD, ABA_VEND, ABA_COMP = "Produtos", "Vendas", "Compras"
+try: prod = carregar_aba(ABA_PROD)
+except: prod = pd.DataFrame()
+try: vend_raw = carregar_aba(ABA_VEND)
+except: vend_raw = pd.DataFrame()
+try: comp_raw = carregar_aba(ABA_COMP)
+except: comp_raw = pd.DataFrame()
 
-try:
-    prod = carregar_aba("Produtos")
-except Exception:
-    prod = pd.DataFrame()
-
-if vend.empty:
-    st.info("Sem vendas para exibir.")
-    st.stop()
-
-col_data  = _first_col(vend, ["Data"])
-col_id    = _first_col(vend, ["IDProduto","ProdutoID","ID"])
-col_qtd   = _first_col(vend, ["Qtd","Quantidade","Qtde","Qde"])
-col_preco = _first_col(vend, ["PrecoUnit","PreçoUnitário","Preço","Preco"])
-col_forma = _first_col(vend, ["FormaPagto","FormaPagamento","Pagamento","Forma"])
-col_venda = _first_col(vend, ["VendaID","Pedido","Cupom"])
-
-# parse datas (dd/mm/yyyy)
-def _parse_date(s):
-    try: return datetime.strptime(str(s).strip(), "%d/%m/%Y").date()
-    except: return None
-vend["_d"] = vend[col_data].map(_parse_date)
-
-# Filtro de período
-hoje = datetime.now().date()
+# ========= Filtros de período =========
 c1, c2 = st.columns(2)
-with c1: dt_ini = st.date_input("De", value=hoje)
-with c2: dt_fim = st.date_input("Até", value=hoje)
-mask = vend["_d"].between(dt_ini, dt_fim)
-vendp = vend[mask].copy()
+with c1:
+    de = st.date_input("De", value=date.today())
+with c2:
+    ate = st.date_input("Até", value=date.today())
+inclui_estornos = st.checkbox("Incluir estornos (CN-/ESTORNO)", value=False)
 
-if vendp.empty:
-    st.warning("Sem vendas no período selecionado."); st.stop()
+# ========= Normalizar VENDAS (período) =========
+def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if v.empty: return pd.DataFrame(), pd.DataFrame()
+    v = v.copy(); v.columns = [c.strip() for c in v.columns]
+    col_data  = _first_col(v, ["Data"])
+    col_vid   = _first_col(v, ["VendaID","Pedido","Cupom"])
+    col_idp   = _first_col(v, ["IDProduto","ProdutoID","ID"])
+    col_qtd   = _first_col(v, ["Qtd","Quantidade","Qtde","Qde"])
+    col_pu    = _first_col(v, ["PrecoUnit","Preço Unitário","PreçoUnitário","Preço","Preco"])
+    col_tot   = _first_col(v, ["TotalLinha","Total"])
+    col_forma = _first_col(v, ["FormaPagto","Forma Pagamento","FormaPagamento","Pagamento","Forma"])
+    col_obs   = _first_col(v, ["Obs","Observação"])
+    col_desc  = _first_col(v, ["Desconto"])
+    col_totcup= _first_col(v, ["TotalCupom"])
+    col_stat  = _first_col(v, ["CupomStatus","Status"])
 
-# números
-vendp["QtdNum"]   = vendp[col_qtd].map(_to_num)
-vendp["PrecoNum"] = vendp[col_preco].map(_to_num) if col_preco else 0.0
-vendp["TotalLinhaNum"] = vendp["QtdNum"] * (vendp["PrecoNum"] if col_preco else 0.0)
+    out = pd.DataFrame({
+        "Data": v[col_data] if col_data else None,
+        "VendaID": v[col_vid] if col_vid else "",
+        "IDProduto": v[col_idp] if col_idp else None,
+        "Qtd": v[col_qtd] if col_qtd else 0,
+        "PrecoUnit": v[col_pu] if col_pu else 0,
+        "TotalLinha": v[col_tot] if col_tot else 0,
+        "Forma": v[col_forma] if col_forma else "",
+        "Obs": v[col_obs] if col_obs else "",
+        "Desconto": v[col_desc] if col_desc else 0,
+        "TotalCupom": v[col_totcup] if col_totcup else None,
+        "CupomStatus": v[col_stat] if col_stat else None
+    })
+    out["Data_d"] = out["Data"].apply(_parse_date_any)
+    out = out[(out["Data_d"]>=de) & (out["Data_d"]<=ate)]
 
-# fallback de valor se não houver PrecoUnit
-if col_preco is None and not prod.empty:
-    # tentar preço da aba Produtos
-    col_pid = _first_col(prod, ["ID","Codigo","Código","SKU"])
-    col_pnome = _first_col(prod, ["Nome","Produto"])
-    col_pvenda = _first_col(prod, ["PrecoVenda","PreçoVenda","Preço","Preco"])
-    if col_pid and col_pvenda:
-        m = prod[[col_pid, col_pvenda]].copy()
-        m.columns = ["IDProduto","PrecoPadrao"]
-        vendp = vendp.merge(m, how="left", left_on=col_id, right_on="IDProduto")
-        vendp["TotalLinhaNum"] = vendp["QtdNum"] * vendp["PrecoPadrao"].map(_to_num)
+    out["QtdNum"]   = out["Qtd"].apply(_to_float)
+    out["PrecoNum"] = out["PrecoUnit"].apply(_to_float)
+    out["TotalNum"] = out["TotalLinha"].apply(_to_float)
+    out["DescNum"]  = out["Desconto"].apply(_to_float)
+    out["CupomNum"] = out["TotalCupom"].apply(_to_float)
+    out["VendaID"]  = out["VendaID"].astype(str).fillna("")
+    out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORNO")
+    if not inclui_estornos:
+        out = out[~out["is_estorno"]]
 
-# custo estimado (para lucro bruto) via Produtos.CustoAtual
-lucro_bruto = None
-if not prod.empty:
-    col_pid = _first_col(prod, ["ID","Codigo","Código","SKU"])
-    col_custo = _first_col(prod, ["CustoAtual","Custo Médio","CustoMedio"])
-    if col_pid and col_custo:
-        m2 = prod[[col_pid, col_custo]].copy()
-        m2.columns = ["IDProduto","CustoAtual"]
-        vendp = vendp.merge(m2, how="left", left_on=col_id, right_on="IDProduto")
-        vendp["CustoLinhaNum"] = vendp["QtdNum"] * vendp["CustoAtual"].map(_to_num)
-        lucro_bruto = (vendp["TotalLinhaNum"].fillna(0) - vendp["CustoLinhaNum"].fillna(0)).sum()
+    # Receita líquida por cupom
+    cupom = out.groupby("VendaID", dropna=True).agg({
+        "Data_d":"first", "Forma":"first",
+        "TotalNum":"sum", "DescNum":"max", "CupomNum":"max"
+    }).reset_index()
+    cupom["ReceitaCupom"] = cupom.apply(
+        lambda r: r["CupomNum"] if r["CupomNum"]>0 else max(0.0, r["TotalNum"] - r["DescNum"]), axis=1
+    )
+    return out, cupom
 
-# KPIs
-total_itens = int(vendp["QtdNum"].sum())
-faturamento = float(vendp["TotalLinhaNum"].sum())
-num_cupons = vendp[col_venda].nunique() if col_venda else len(vendp.groupby([col_data, col_forma]))
+vendas, cupom = _normalize_vendas_period(vend_raw)
+
+# ========= COGS (custo médio ponderado do histórico) =========
+def _custo_medio_map(comp_df: pd.DataFrame, prod_df: pd.DataFrame) -> dict:
+    if comp_df.empty and (prod_df.empty or "CustoAtual" not in prod_df.columns):
+        return {}
+    if not comp_df.empty:
+        c = comp_df.copy(); c.columns = [x.strip() for x in c.columns]
+        col_idp = _first_col(c, ["IDProduto","ProdutoID","ID"])
+        col_qtd = _first_col(c, ["Qtd","Quantidade","Qtde","Qde"])
+        col_cu  = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit","Custo"])
+        if col_idp and col_qtd and col_cu:
+            c["QtdNum"]   = c[col_qtd].apply(_to_float)
+            c["CustoNum"] = c[col_cu].apply(_to_float)
+            c["Parcial"]  = c["QtdNum"]*c["CustoNum"]
+            g = c.groupby(c[col_idp].astype(str))[["Parcial","QtdNum"]].sum()
+            g["CustoMedio"] = g["Parcial"] / g["QtdNum"].replace(0, pd.NA)
+            mp = g["CustoMedio"].fillna(0.0).to_dict()
+        else:
+            mp = {}
+    else:
+        mp = {}
+    # fallback: Produtos.CustoAtual
+    if not prod_df.empty and "ID" in prod_df.columns and "CustoAtual" in prod_df.columns:
+        for _id, custo in prod_df.set_index("ID")["CustoAtual"].items():
+            if _id not in mp or mp[_id] == 0:
+                mp[str(_id)] = float(custo) if pd.notna(custo) else 0.0
+    return mp
+
+custo_map = _custo_medio_map(comp_raw, prod)
+
+# ========= KPIs =========
+if vendas.empty:
+    cupons = 0; itens = 0; receita = 0.0; bruto = 0.0; desc_tot = 0.0
+else:
+    cupons = cupom["VendaID"].nunique()
+    itens  = vendas["QtdNum"].sum()
+    receita = cupom["ReceitaCupom"].sum()            # líquido
+    bruto   = cupom["TotalNum"].sum()
+    desc_tot= max(0.0, bruto - receita)
+
+# COGS do período: soma(qtd vendida * custo médio)
+if vendas.empty or not custo_map:
+    cogs = 0.0
+else:
+    idcol = "IDProduto" if "IDProduto" in vendas.columns else None
+    if idcol:
+        vendas["_CustoLinha"] = vendas.apply(lambda r: r["QtdNum"] * float(custo_map.get(str(r[idcol]), 0.0)), axis=1)
+        cogs = vendas["_CustoLinha"].sum()
+    else:
+        cogs = 0.0
+
+lucro = max(0.0, receita - cogs)
+margem = (lucro/receita*100) if receita>0 else 0.0
 
 k1,k2,k3,k4 = st.columns(4)
-k1.metric("Cupons (vendas)", num_cupons)
-k2.metric("Itens vendidos", total_itens)
-k3.metric("Faturamento bruto", f"R$ {faturamento:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-if lucro_bruto is not None:
-    k4.metric("Lucro bruto (estimado)", f"R$ {lucro_bruto:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-else:
-    k4.metric("Lucro bruto (estimado)", "—")
+k1.metric("Cupons (vendas)", f"{cupons}")
+k2.metric("Itens vendidos", f"{itens:.0f}")
+k3.metric("Faturamento líquido", _fmt_brl(receita), f"Bruto {_fmt_brl(bruto)}")
+k4.metric("Lucro bruto (estimado)", _fmt_brl(lucro), f"{margem:.1f}% margem")
+st.caption(f"Período: {de.strftime('%d/%m/%Y')} a {ate.strftime('%d/%m/%Y')} • Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'} • Descontos aplicados: {_fmt_brl(desc_tot)}")
 
 st.divider()
 
-# Por forma de pagamento
-if col_forma:
-    st.subheader("Por forma de pagamento")
-    grp = vendp.groupby(col_forma, dropna=False)["TotalLinhaNum"].sum().reset_index().sort_values("TotalLinhaNum", ascending=False)
-    if not grp.empty:
-        fig = px.bar(grp, x=col_forma, y="TotalLinhaNum")
-        fig.update_layout(xaxis_title="", yaxis_title="R$")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(grp.rename(columns={"TotalLinhaNum":"Valor (R$)"}), use_container_width=True, hide_index=True)
+# ========= Por forma de pagamento (líquido) =========
+st.subheader("Por forma de pagamento")
+if not cupom.empty:
+    fpg = cupom.groupby("Forma", dropna=False)["ReceitaCupom"].sum().reset_index().sort_values("ReceitaCupom", ascending=False)
+    fig = px.bar(fpg, x="Forma", y="ReceitaCupom")
+    fig.update_layout(yaxis_title="R$", xaxis_title="")
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(fpg.rename(columns={"Forma":"Forma de pagamento","ReceitaCupom":"Total (R$)"}), use_container_width=True, hide_index=True)
+else:
+    st.info("Sem vendas no período.")
+
+st.divider()
+
+# ========= Resumo por produto =========
+st.subheader("Resumo por produto (período)")
+if vendas.empty:
+    st.info("Sem vendas para detalhar.")
+else:
+    key = "IDProduto" if "IDProduto" in vendas.columns else None
+    if key:
+        g = vendas.groupby(key)["QtdNum","TotalNum"].sum().reset_index()
+        g["COGS"]  = g.apply(lambda r: r["QtdNum"] * float(custo_map.get(str(r[key]), 0.0)), axis=1)
+        g["Lucro"] = g["TotalNum"] - g["COGS"]
+        # junta nome
+        if not prod.empty and "ID" in prod.columns and "Nome" in prod.columns:
+            g = g.merge(prod[["ID","Nome"]], how="left", left_on=key, right_on="ID")
+            g["Produto"] = g["Nome"].fillna(g[key].astype(str))
+        else:
+            g["Produto"] = g[key].astype(str)
+        g = g[["Produto","QtdNum","TotalNum","COGS","Lucro"]].rename(columns={
+            "QtdNum":"Qtd", "TotalNum":"Receita (R$)"
+        }).sort_values("Receita (R$)", ascending=False)
+        st.dataframe(g, use_container_width=True, hide_index=True)
+        # Exportar CSV
+        csv = g.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Exportar (CSV)", data=csv, file_name=f"fechamento_{de:%Y%m%d}_{ate:%Y%m%d}.csv", mime="text/csv")
     else:
-        st.info("Sem dados de pagamento.")
+        st.info("Não encontrei coluna de ID do produto nas vendas.")
+# pages/02_fechamento_caixa.py — Fechamento de caixa (líquido por cupom + COGS)
+# -*- coding: utf-8 -*-
+import json, unicodedata, re
+from collections.abc import Mapping
+from datetime import datetime, date, timedelta
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import gspread
+from gspread_dataframe import get_as_dataframe
+from google.oauth2.service_account import Credentials
+
+st.set_page_config(page_title="Fechamento de caixa", page_icon="🧾", layout="wide")
+st.title("🧾 Fechamento de caixa")
+
+# ========= Helpers =========
+def _normalize_private_key(key: str) -> str:
+    if not isinstance(key, str): return key
+    key = key.replace("\\n", "\n")
+    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
+    return key
+
+def _load_sa() -> dict:
+    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+    if isinstance(svc, str): svc = json.loads(svc)
+    if not isinstance(svc, Mapping): st.error("🛑 GCP_SERVICE_ACCOUNT inválido."); st.stop()
+    pk = str(svc.get("private_key",""))
+    if "BEGIN PRIVATE KEY" not in pk: st.error("🛑 private_key inválida."); st.stop()
+    return {**svc, "private_key": _normalize_private_key(pk)}
+
+@st.cache_resource
+def conectar_sheets():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    creds  = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
+    gc     = gspread.authorize(creds)
+    url_or_id = st.secrets.get("PLANILHA_URL","")
+    if not url_or_id: st.error("🛑 PLANILHA_URL ausente."); st.stop()
+    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
+
+@st.cache_data(ttl=20)
+def carregar_aba(nome: str) -> pd.DataFrame:
+    ws = conectar_sheets().worksheet(nome)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+def _to_float(x, default=0.0):
+    if x is None: return default
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"): return default
+    s = s.replace("R$","").replace(" ","").replace("\u00A0","")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.\-]","", s)
+    if s.count(".")>1:
+        parts = s.split("."); s = "".join(parts[:-1]) + "." + parts[-1]
+    try: return float(s)
+    except: return default
+
+def _parse_date_any(s):
+    if s is None or (isinstance(s, float) and pd.isna(s)): return None
+    txt = str(s).strip()
+    for fmt in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%y"):
+        try: return datetime.strptime(txt, fmt).date()
+        except: pass
+    try: return pd.to_datetime(txt, dayfirst=True, errors="coerce").date()
+    except: return None
+
+def _first_col(df: pd.DataFrame, candidates) -> str | None:
+    if df is None or df.empty: return None
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols: return c
+    low = {c.lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in low: return low[c.lower()]
+    return None
+
+def _fmt_brl(v):
+    try: return ("R$ "+f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
+    except: return "R$ 0,00"
+
+# ========= Carregar bases =========
+ABA_PROD, ABA_VEND, ABA_COMP = "Produtos", "Vendas", "Compras"
+try: prod = carregar_aba(ABA_PROD)
+except: prod = pd.DataFrame()
+try: vend_raw = carregar_aba(ABA_VEND)
+except: vend_raw = pd.DataFrame()
+try: comp_raw = carregar_aba(ABA_COMP)
+except: comp_raw = pd.DataFrame()
+
+# ========= Filtros de período =========
+c1, c2 = st.columns(2)
+with c1:
+    de = st.date_input("De", value=date.today())
+with c2:
+    ate = st.date_input("Até", value=date.today())
+inclui_estornos = st.checkbox("Incluir estornos (CN-/ESTORNO)", value=False)
+
+# ========= Normalizar VENDAS (período) =========
+def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if v.empty: return pd.DataFrame(), pd.DataFrame()
+    v = v.copy(); v.columns = [c.strip() for c in v.columns]
+    col_data  = _first_col(v, ["Data"])
+    col_vid   = _first_col(v, ["VendaID","Pedido","Cupom"])
+    col_idp   = _first_col(v, ["IDProduto","ProdutoID","ID"])
+    col_qtd   = _first_col(v, ["Qtd","Quantidade","Qtde","Qde"])
+    col_pu    = _first_col(v, ["PrecoUnit","Preço Unitário","PreçoUnitário","Preço","Preco"])
+    col_tot   = _first_col(v, ["TotalLinha","Total"])
+    col_forma = _first_col(v, ["FormaPagto","Forma Pagamento","FormaPagamento","Pagamento","Forma"])
+    col_obs   = _first_col(v, ["Obs","Observação"])
+    col_desc  = _first_col(v, ["Desconto"])
+    col_totcup= _first_col(v, ["TotalCupom"])
+    col_stat  = _first_col(v, ["CupomStatus","Status"])
+
+    out = pd.DataFrame({
+        "Data": v[col_data] if col_data else None,
+        "VendaID": v[col_vid] if col_vid else "",
+        "IDProduto": v[col_idp] if col_idp else None,
+        "Qtd": v[col_qtd] if col_qtd else 0,
+        "PrecoUnit": v[col_pu] if col_pu else 0,
+        "TotalLinha": v[col_tot] if col_tot else 0,
+        "Forma": v[col_forma] if col_forma else "",
+        "Obs": v[col_obs] if col_obs else "",
+        "Desconto": v[col_desc] if col_desc else 0,
+        "TotalCupom": v[col_totcup] if col_totcup else None,
+        "CupomStatus": v[col_stat] if col_stat else None
+    })
+    out["Data_d"] = out["Data"].apply(_parse_date_any)
+    out = out[(out["Data_d"]>=de) & (out["Data_d"]<=ate)]
+
+    out["QtdNum"]   = out["Qtd"].apply(_to_float)
+    out["PrecoNum"] = out["PrecoUnit"].apply(_to_float)
+    out["TotalNum"] = out["TotalLinha"].apply(_to_float)
+    out["DescNum"]  = out["Desconto"].apply(_to_float)
+    out["CupomNum"] = out["TotalCupom"].apply(_to_float)
+    out["VendaID"]  = out["VendaID"].astype(str).fillna("")
+    out["is_estorno"] = out["VendaID"].str.startswith("CN-") | (out["CupomStatus"].astype(str).str.upper()=="ESTORNO")
+    if not inclui_estornos:
+        out = out[~out["is_estorno"]]
+
+    # Receita líquida por cupom
+    cupom = out.groupby("VendaID", dropna=True).agg({
+        "Data_d":"first", "Forma":"first",
+        "TotalNum":"sum", "DescNum":"max", "CupomNum":"max"
+    }).reset_index()
+    cupom["ReceitaCupom"] = cupom.apply(
+        lambda r: r["CupomNum"] if r["CupomNum"]>0 else max(0.0, r["TotalNum"] - r["DescNum"]), axis=1
+    )
+    return out, cupom
+
+vendas, cupom = _normalize_vendas_period(vend_raw)
+
+# ========= COGS (custo médio ponderado do histórico) =========
+def _custo_medio_map(comp_df: pd.DataFrame, prod_df: pd.DataFrame) -> dict:
+    if comp_df.empty and (prod_df.empty or "CustoAtual" not in prod_df.columns):
+        return {}
+    if not comp_df.empty:
+        c = comp_df.copy(); c.columns = [x.strip() for x in c.columns]
+        col_idp = _first_col(c, ["IDProduto","ProdutoID","ID"])
+        col_qtd = _first_col(c, ["Qtd","Quantidade","Qtde","Qde"])
+        col_cu  = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit","Custo"])
+        if col_idp and col_qtd and col_cu:
+            c["QtdNum"]   = c[col_qtd].apply(_to_float)
+            c["CustoNum"] = c[col_cu].apply(_to_float)
+            c["Parcial"]  = c["QtdNum"]*c["CustoNum"]
+            g = c.groupby(c[col_idp].astype(str))[["Parcial","QtdNum"]].sum()
+            g["CustoMedio"] = g["Parcial"] / g["QtdNum"].replace(0, pd.NA)
+            mp = g["CustoMedio"].fillna(0.0).to_dict()
+        else:
+            mp = {}
+    else:
+        mp = {}
+    # fallback: Produtos.CustoAtual
+    if not prod_df.empty and "ID" in prod_df.columns and "CustoAtual" in prod_df.columns:
+        for _id, custo in prod_df.set_index("ID")["CustoAtual"].items():
+            if _id not in mp or mp[_id] == 0:
+                mp[str(_id)] = float(custo) if pd.notna(custo) else 0.0
+    return mp
+
+custo_map = _custo_medio_map(comp_raw, prod)
+
+# ========= KPIs =========
+if vendas.empty:
+    cupons = 0; itens = 0; receita = 0.0; bruto = 0.0; desc_tot = 0.0
+else:
+    cupons = cupom["VendaID"].nunique()
+    itens  = vendas["QtdNum"].sum()
+    receita = cupom["ReceitaCupom"].sum()            # líquido
+    bruto   = cupom["TotalNum"].sum()
+    desc_tot= max(0.0, bruto - receita)
+
+# COGS do período: soma(qtd vendida * custo médio)
+if vendas.empty or not custo_map:
+    cogs = 0.0
+else:
+    idcol = "IDProduto" if "IDProduto" in vendas.columns else None
+    if idcol:
+        vendas["_CustoLinha"] = vendas.apply(lambda r: r["QtdNum"] * float(custo_map.get(str(r[idcol]), 0.0)), axis=1)
+        cogs = vendas["_CustoLinha"].sum()
+    else:
+        cogs = 0.0
+
+lucro = max(0.0, receita - cogs)
+margem = (lucro/receita*100) if receita>0 else 0.0
+
+k1,k2,k3,k4 = st.columns(4)
+k1.metric("Cupons (vendas)", f"{cupons}")
+k2.metric("Itens vendidos", f"{itens:.0f}")
+k3.metric("Faturamento líquido", _fmt_brl(receita), f"Bruto {_fmt_brl(bruto)}")
+k4.metric("Lucro bruto (estimado)", _fmt_brl(lucro), f"{margem:.1f}% margem")
+st.caption(f"Período: {de.strftime('%d/%m/%Y')} a {ate.strftime('%d/%m/%Y')} • Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'} • Descontos aplicados: {_fmt_brl(desc_tot)}")
 
 st.divider()
 
-# Itens mais vendidos
-st.subheader("Itens mais vendidos")
-if not prod.empty:
-    col_pid = _first_col(prod, ["ID","Codigo","Código","SKU"])
-    col_pnome = _first_col(prod, ["Nome","Produto"])
-    mp = prod[[col_pid, col_pnome]].copy()
-    mp.columns = ["IDProduto","Nome"]
-    top = vendp.groupby(col_id, dropna=False)["QtdNum"].sum().reset_index().rename(columns={"QtdNum":"Qtd"})
-    top = top.merge(mp, how="left", left_on=col_id, right_on="IDProduto")
-    top["Nome"] = top["Nome"].fillna(top[col_id])
-    top = top.sort_values("Qtd", ascending=False).head(15)
-    st.dataframe(top[["Nome","Qtd"]], use_container_width=True, hide_index=True)
+# ========= Por forma de pagamento (líquido) =========
+st.subheader("Por forma de pagamento")
+if not cupom.empty:
+    fpg = cupom.groupby("Forma", dropna=False)["ReceitaCupom"].sum().reset_index().sort_values("ReceitaCupom", ascending=False)
+    fig = px.bar(fpg, x="Forma", y="ReceitaCupom")
+    fig.update_layout(yaxis_title="R$", xaxis_title="")
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(fpg.rename(columns={"Forma":"Forma de pagamento","ReceitaCupom":"Total (R$)"}), use_container_width=True, hide_index=True)
 else:
-    top = vendp.groupby(col_id, dropna=False)["QtdNum"].sum().reset_index().rename(columns={"QtdNum":"Qtd"})
-    st.dataframe(top, use_container_width=True, hide_index=True)
+    st.info("Sem vendas no período.")
 
-# Exportar CSV
-csv = vendp.to_csv(index=False).encode("utf-8-sig")
-st.download_button("⬇️ Exportar CSV (detalhado)", data=csv, file_name="fechamento.csv", mime="text/csv")
+st.divider()
+
+# ========= Resumo por produto =========
+st.subheader("Resumo por produto (período)")
+if vendas.empty:
+    st.info("Sem vendas para detalhar.")
+else:
+    key = "IDProduto" if "IDProduto" in vendas.columns else None
+    if key:
+        g = vendas.groupby(key)["QtdNum","TotalNum"].sum().reset_index()
+        g["COGS"]  = g.apply(lambda r: r["QtdNum"] * float(custo_map.get(str(r[key]), 0.0)), axis=1)
+        g["Lucro"] = g["TotalNum"] - g["COGS"]
+        # junta nome
+        if not prod.empty and "ID" in prod.columns and "Nome" in prod.columns:
+            g = g.merge(prod[["ID","Nome"]], how="left", left_on=key, right_on="ID")
+            g["Produto"] = g["Nome"].fillna(g[key].astype(str))
+        else:
+            g["Produto"] = g[key].astype(str)
+        g = g[["Produto","QtdNum","TotalNum","COGS","Lucro"]].rename(columns={
+            "QtdNum":"Qtd", "TotalNum":"Receita (R$)"
+        }).sort_values("Receita (R$)", ascending=False)
+        st.dataframe(g, use_container_width=True, hide_index=True)
+        # Exportar CSV
+        csv = g.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Exportar (CSV)", data=csv, file_name=f"fechamento_{de:%Y%m%d}_{ate:%Y%m%d}.csv", mime="text/csv")
+    else:
+        st.info("Não encontrei coluna de ID do produto nas vendas.")
