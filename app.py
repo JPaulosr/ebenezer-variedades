@@ -15,6 +15,14 @@ st.set_page_config(page_title="Ebenezér Variedades — Dashboard", page_icon="�
 st.title("🧮 Dashboard — Ebenezér Variedades")
 
 # =========================
+# Auto-refresh leve
+# =========================
+# Se alguma página filha (ex.: Contagem/Compras) sinalizar _force_refresh, limpamos cache e rerodamos
+if st.session_state.pop("_force_refresh", False):
+    st.cache_data.clear()
+    st.rerun()
+
+# =========================
 # Auth & Conexão
 # =========================
 def _normalize_private_key(key: str) -> str:
@@ -46,7 +54,7 @@ def conectar_sheets():
         st.error("🛑 PLANILHA_URL não está no Secrets."); st.stop()
     return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)  # atualiza sozinho a cada ~20s
 def carregar_aba(nome: str) -> pd.DataFrame:
     ws = conectar_sheets().worksheet(nome)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
@@ -388,7 +396,7 @@ k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
 # =========================
-# FIADO
+# FIADO (corrigido)
 # =========================
 def _carregar_fiado_sheet():
     nomes = ["Fiado", "Fiados", "PagamentosFiado", "RecebimentoFiado", "RecebimentosFiado"]
@@ -421,15 +429,17 @@ if not fiado_sheet.empty:
     fs["ValorNum"]    = fs[c_val].apply(_to_float) if c_val else 0.0
     fs["ValorPagoNum"]= fs[c_vp].apply(_to_float) if c_vp else 0.0
 
-    fiado_lancado_periodo = float(fs[(fs["Data_d"]>=dt_ini) & (fs["Data_d"]<=dt_fim)]["ValorNum"].sum())
+    fiado_lancado_periodo  = float(fs[(fs["Data_d"]>=dt_ini) & (fs["Data_d"]<=dt_fim)]["ValorNum"].sum())
     fiado_recebido_periodo = float(fs[(fs["DataPag_d"]>=dt_ini) & (fs["DataPag_d"]<=dt_fim)]["ValorPagoNum"].sum())
 
     total_lanc = float(fs["ValorNum"].sum())
     total_pago = float(fs["ValorPagoNum"].sum())
     fiado_saldo_aberto = max(0.0, total_lanc - total_pago)
 else:
+    # fallback: usa forma de pagamento "fiado" nos cupons do período
     if not cupom_grp.empty:
-        fiado_lancado_periodo = float(cupom_grp[_lower(cupom_grp["Forma"]).eq("fiado")]["ReceitaCupom"].sum())
+        forma_lower = cupom_grp["Forma"].astype(str).str.lower()
+        fiado_lancado_periodo = float(cupom_grp[forma_lower.eq("fiado")]["ReceitaCupom"].sum())
         fiado_saldo_aberto = fiado_lancado_periodo
         fiado_recebido_periodo = 0.0
 
@@ -509,8 +519,8 @@ if prod_calc.empty:
     st.info("Sem produtos para exibir.")
 else:
     m = pd.Series(True, index=prod_calc.index)
-    if cat_sel:  m &= prod_calc["Categoria"].astype(str).isin(cat_sel)
-    if forn_sel: m &= prod_calc["Fornecedor"].astype(str).isin(forn_sel)
+    if cat_sel and "Categoria" in prod_calc.columns:  m &= prod_calc["Categoria"].astype(str).isin(cat_sel)
+    if forn_sel and "Fornecedor" in prod_calc.columns: m &= prod_calc["Fornecedor"].astype(str).isin(forn_sel)
     if apenas_ativos and "Ativo" in prod_calc.columns:
         prod_calc["Ativo"] = prod_calc["Ativo"].astype(str).str.lower()
         m &= (prod_calc["Ativo"]=="sim")
@@ -519,12 +529,19 @@ else:
         m &= prod_calc.apply(lambda r: s in " ".join([str(x).lower() for x in r.values]), axis=1)
 
     dfv = prod_calc[m].copy()
-    if ocultar_zerados and "EstoqueCalc" in dfv.columns:
-        dfv = dfv[dfv["EstoqueCalc"].fillna(0) != 0]
 
+    # Oculta itens com estoque zerado sem "bugar" quando NaN
+    if "EstoqueCalc" in dfv.columns and ocultar_zerados:
+        dfv = dfv[dfv["EstoqueCalc"].fillna(0).astype(float) != 0.0]
+
+    # KPIs do bloco de estoque
+    estq_min_col = "EstoqueMin" if "EstoqueMin" in dfv.columns else None
     total_produtos = len(dfv)
-    valor_estoque  = dfv["ValorEstoqueCalc"].sum()
-    abaixo_min     = int((dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0)).sum())
+    valor_estoque  = float(dfv["ValorEstoqueCalc"].fillna(0).sum()) if "ValorEstoqueCalc" in dfv.columns else 0.0
+    if estq_min_col:
+        abaixo_min = int((dfv["EstoqueCalc"].fillna(0) <= dfv[estq_min_col].fillna(0)).sum())
+    else:
+        abaixo_min = 0
 
     k1,k2,k3 = st.columns(3)
     k1.metric("Produtos exibidos", f"{total_produtos}")
@@ -532,26 +549,24 @@ else:
     k3.metric("⚠️ Abaixo do mínimo", f"{abaixo_min}")
 
     st.markdown("**⚠️ Itens abaixo do mínimo / sugestão de compra**")
-    if "EstoqueMin" in dfv.columns:
-        alert = dfv[(dfv["EstoqueMin"].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0))].copy()
+    if estq_min_col:
+        alert = dfv[(dfv[estq_min_col].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv[estq_min_col].fillna(0))].copy()
         if not alert.empty:
-            alert["SugestaoCompra"] = (alert["EstoqueMin"].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
-            cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc","EstoqueMin","SugestaoCompra","LeadTimeDias"] if c in alert.columns]
-            st.dataframe(alert[cols_alerta].rename(columns={"EstoqueCalc":"EstoqueAtual"}),
+            alert["SugestaoCompra"] = (alert[estq_min_col].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
+            cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc",estq_min_col,"SugestaoCompra","LeadTimeDias"] if c in alert.columns]
+            st.dataframe(alert[cols_alerta].rename(columns={"EstoqueCalc":"EstoqueAtual", estq_min_col:"EstoqueMin"}),
                          use_container_width=True, hide_index=True)
         else:
             st.info("Nenhum item abaixo do mínimo.")
     st.divider()
 
     st.markdown("**🏆 Top 10 — Valor em estoque**")
-    top = dfv.sort_values("ValorEstoqueCalc", ascending=False).head(10)
-    if top["ValorEstoqueCalc"].fillna(0).sum() <= 0:
-        st.info("Sem valor em estoque (custo/estoque ainda não cadastrados).")
-    else:
+    if "ValorEstoqueCalc" in dfv.columns and dfv["ValorEstoqueCalc"].fillna(0).sum() > 0:
+        top = dfv.sort_values("ValorEstoqueCalc", ascending=False).head(10)
         c1,c2 = st.columns([1.2,1])
         with c1:
             fig = px.bar(top, x="Nome", y="ValorEstoqueCalc",
-                         hover_data=["EstoqueCalc","CustoMedio","Categoria"])
+                         hover_data=[c for c in ["EstoqueCalc","CustoMedio","Categoria"] if c in top.columns])
             fig.update_layout(xaxis_title="", yaxis_title="R$ em estoque")
             st.plotly_chart(fig, use_container_width=True)
         with c2:
@@ -561,7 +576,10 @@ else:
                 "CustoMedio":"CustoAtual",
                 "ValorEstoqueCalc":"ValorEstoque"
             }), use_container_width=True, hide_index=True, height=420)
+    else:
+        st.info("Sem valor em estoque (custo/estoque ainda não cadastrados).")
     st.divider()
+
     st.markdown("**📋 Lista de produtos (filtrada)**")
     cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoMedio","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo"] if c in dfv.columns]
     st.dataframe(dfv[cols_show].rename(columns={
