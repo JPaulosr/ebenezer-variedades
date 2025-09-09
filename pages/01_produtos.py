@@ -1,4 +1,4 @@
-# pages/01_produtos.py — Catálogo de Produtos (com EstoqueAtual calculado e sem duplicatas)
+# pages/01_produtos.py — Catálogo de Produtos (auto-refresh)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 import streamlit as st
@@ -10,13 +10,10 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Produtos — Ebenezér Variedades", page_icon="📦", layout="wide")
 st.title("📦 Produtos — Catálogo & Busca")
 
-# Botão para atualizar dados (limpa cache e recarrega)
-if st.button("🔄 Atualizar dados"):
+# Auto-refresh quando outra página sinaliza que salvou algo (ex.: contagem)
+if st.session_state.pop("_force_refresh", False):
     st.cache_data.clear()
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
+    st.rerun()
 
 # =========================
 # Utilitários
@@ -50,7 +47,7 @@ def conectar_sheets():
         st.error("🛑 PLANILHA_URL ausente."); st.stop()
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data
+@st.cache_data(ttl=10)  # <= expira sozinho a cada 10s
 def carregar_aba(nome_aba: str) -> pd.DataFrame:
     sh = conectar_sheets()
     ws = sh.worksheet(nome_aba)
@@ -137,7 +134,7 @@ col_comp_custo  = _first_col(df_comp, ["Custo Unitário", "CustoUnitário", "Cus
 col_vend_idprod = _first_col(df_vend, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto", "ID"])
 col_vend_qtd    = _first_col(df_vend, ["Qtd", "Quantidade", "Qtde", "Qde"])
 
-# Ajustes (agora aceita também 'ID')
+# Ajustes (aceita também 'ID')
 col_aj_idprod = _first_col(df_aj, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto", "ID"])
 col_aj_qtd    = _first_col(df_aj, ["Qtd", "Quantidade", "Qtde", "Qde", "Ajuste"])
 
@@ -247,34 +244,26 @@ dfv = df_merge[mask].reset_index(drop=True)
 # =========================
 # Exibição — evita nomes duplicados
 # =========================
-# Cria colunas finais padronizadas (substitui/exibe as calculadas)
 dfv["EstoqueAtual"] = dfv["EstoqueAtual_calc"]
 dfv["CustoAtual"]   = dfv["CustoAtual_calc"]
-
-# Remove colunas auxiliares e deduplica nomes
 for c in ["EstoqueAtual_calc", "CustoAtual_calc", "EstoqueCalc", "CustoMedio", "_ID_join"]:
-    if c in dfv.columns:
-        dfv.drop(columns=[c], inplace=True)
-
-# Se ainda restar nome repetido (vindo da planilha), elimina duplicatas mantendo a 1ª
+    if c in dfv.columns: dfv.drop(columns=[c], inplace=True)
 dfv = dfv.loc[:, ~dfv.columns.duplicated(keep="first")]
 
-# Monta lista de colunas a exibir (sem repetir)
 cols_candidatas = [
     col_id_prod, col_nome, col_cat, col_forn, col_preco,
     col_estq_min, "EstoqueAtual", "Entradas", "Saidas", "Ajustes", "CustoAtual"
 ]
 cols_show = [c for c in cols_candidatas if c and c in dfv.columns]
-cols_show = list(dict.fromkeys(cols_show))  # garante unicidade
+cols_show = list(dict.fromkeys(cols_show))
 
-# Exibe
 if cols_show:
     st.dataframe(dfv[cols_show], use_container_width=True, hide_index=True)
 else:
     st.dataframe(dfv, use_container_width=True, hide_index=True)
 
 st.caption("""
-• **EstoqueAtual** = Compras − Vendas ± Ajustes (calculado em tempo real).  
-• **CustoAtual** = custo médio ponderado das compras.  
-• Use a aba **Compras** e **Vendas** para registrar movimentos; **Ajustes** é opcional (quebra, perda, acerto).
+• **EstoqueAtual** = Compras − Vendas ± Ajustes (calculado em tempo real).
+• **CustoAtual** = custo médio ponderado das compras.
+• Use as páginas **Compras** e **Contagem** para lançar entradas/ajustes.
 """)
