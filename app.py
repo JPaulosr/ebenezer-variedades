@@ -384,6 +384,8 @@ k4.metric("📈 Lucro bruto (aprox.)", _fmt_brl(lucro_bruto), f"{margem_bruta:.1
 k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
+
+
 # =========================
 # Vendas vs Compras por dia
 # =========================
