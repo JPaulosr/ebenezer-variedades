@@ -385,41 +385,6 @@ k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
 # =========================
-# 🧪 Diagnóstico COGS/Estoque
-# =========================
-with st.expander("🧪 Diagnóstico COGS/Estoque", expanded=False):
-    if not vendas.empty:
-        vv_dbg = vendas.copy()
-        vv_dbg["KeyID"] = vv_dbg["KeyID"].astype(str)
-        vv_dbg = vv_dbg[vv_dbg["KeyID"] != ""]
-        vv_dbg["CustoRef"] = vv_dbg["KeyID"].map(lambda k: float(custo_ref.get(str(k), 0.0) or 0.0))
-        sem_custo = vv_dbg[vv_dbg["CustoRef"] <= 0]
-        if not sem_custo.empty:
-            st.warning("Há itens de venda sem custo encontrado (COGS=0). Verifique ID e custo.")
-            cols = [c for c in ["KeyID","IDProduto","Qtd","PrecoUnit","TotalLinha","Obs"] if c in sem_custo.columns]
-            st.dataframe(sem_custo[cols].head(50), use_container_width=True, hide_index=True)
-    if not prod_calc.empty:
-        prod_sem_custo = prod_calc[(prod_calc["CustoMedio"].fillna(0)<=0) & (prod_calc["CustoAtual"].fillna(0)<=0)]
-        if not prod_sem_custo.empty:
-            st.info("Produtos sem custo (nem CustoMedio das Compras, nem CustoAtual em Produtos).")
-            st.dataframe(prod_sem_custo[[c for c in ["ID","Nome","Categoria","CustoMedio","CustoAtual"] if c in prod_sem_custo.columns]].head(50),
-                         use_container_width=True, hide_index=True)
-    if not vendas.empty and not prod_calc.empty:
-        join_ex = vendas[vendas["KeyID"]!=""].merge(
-            prod_calc[["KeyID","Nome","CustoMedio","CustoAtual"]],
-            on="KeyID", how="left"
-        )
-        join_ex["_CustoUsado"] = join_ex.apply(
-            lambda r: r["CustoMedio"] if (pd.notna(r["CustoMedio"]) and r["CustoMedio"]>0) else (r["CustoAtual"] or 0),
-            axis=1
-        )
-        st.caption("Amostra Vendas→Produtos (custo aplicado)")
-        st.dataframe(join_ex[["KeyID","Nome","QtdNum","PrecoNum","TotalNum","CustoMedio","CustoAtual","_CustoUsado"]].head(30),
-                     use_container_width=True, hide_index=True)
-
-st.divider()
-
-# =========================
 # Vendas vs Compras por dia
 # =========================
 st.subheader("📆 Vendas vs Compras por dia")
