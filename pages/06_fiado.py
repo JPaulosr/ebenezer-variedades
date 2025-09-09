@@ -1,6 +1,6 @@
-# pages/06_fiado.py — Fiado simples para Ebenezér Variedades
+# pages/06_fiado.py — Fiado simples para Ebenezér Variedades (com checkbox p/ clientes cadastrados e dedupe)
 # -*- coding: utf-8 -*-
-import json, unicodedata, re
+import json, unicodedata, re, difflib
 from datetime import datetime, date, timedelta
 
 import streamlit as st
@@ -45,8 +45,18 @@ def conectar_sheets():
         st.error("🛑 PLANILHA_URL ausente no Secrets."); st.stop()
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
+# =========================
+# Utils
+# =========================
 def _norm_key(s: str) -> str:
     return unicodedata.normalize("NFKC", str(s or "")).strip().casefold()
+
+def _strip_accents_lower(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s or "").strip())
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    # normaliza espaços internos (ex.: "  Maria  da  Silva " -> "maria da silva")
+    s = " ".join(s.split())
+    return s.casefold()
 
 def _fmt_brl(v) -> str:
     try:
@@ -157,12 +167,26 @@ with tab_novo:
     st.subheader("➕ Lançar fiado")
 
     df_cli = load_df(ABA_CLIENTES)
+    # Lista e mapa normalizados para evitar duplicatas por acento/caixa/espaço
+    df_cli["_norm"] = df_cli["Cliente"].apply(_strip_accents_lower)
     lista_clientes = sorted([c for c in df_cli["Cliente"].astype(str).str.strip().unique().tolist() if c])
+    norm_to_canon = {n: c for n, c in zip(df_cli["_norm"], df_cli["Cliente"]) if str(c).strip()}
+
+    # Checkbox que controla se mostra a lista de clientes cadastrados
+    show_lista = st.checkbox(
+        "Escolher a partir dos clientes cadastrados",
+        value=True,
+        help="Desmarque para digitar um novo nome manualmente."
+    )
 
     c1,c2 = st.columns([1,1])
     with c1:
-        cliente_sel = st.selectbox("Cliente", options=[""] + lista_clientes, index=0)
-        cliente_novo = st.text_input("Ou cadastrar novo cliente (nome)", value="")
+        if show_lista:
+            cliente_sel = st.selectbox("Cliente (cadastrado)", options=[""] + lista_clientes, index=0)
+            cliente_novo = st.text_input("Ou digite um novo nome (se não encontrar)", value="")
+        else:
+            cliente_sel = ""
+            cliente_novo = st.text_input("Nome do cliente (novo)", value="")
         tel_novo = st.text_input("Telefone (opcional)", value="")
     with c2:
         data_fiado = st.date_input("Data do fiado", value=date.today())
@@ -171,21 +195,39 @@ with tab_novo:
         obs = st.text_input("Observações (opcional)", value="")
 
     if st.button("Salvar fiado", use_container_width=True):
-        # valida nome
-        cliente_final = (cliente_sel or "").strip() or (cliente_novo or "").strip()
+        # 1) Determina o nome final, com dedupe por normalização
+        digitado = (cliente_novo or "").strip()
+        escolhido = (cliente_sel or "").strip()
+        cliente_final = (escolhido or digitado)
+
         if not cliente_final:
-            st.error("Informe o cliente (selecione ou cadastre).")
+            st.error("Informe o cliente (selecione ou digite um novo).")
             st.stop()
+
+        # normalização/anti-duplicata
+        k = _strip_accents_lower(cliente_final)
+        if k in norm_to_canon:
+            # existe um cadastro equivalente (ex.: "MARIA" vs "Maria")
+            cliente_final = norm_to_canon[k]
+            st.info(f"Usando o cliente já cadastrado: **{cliente_final}** (evitando duplicidade).")
+        else:
+            # ainda não existe exatamente igual (normalizado); mantém o digitado
+            pass
 
         sh = conectar_sheets()
         ws_cli  = garantir_aba(sh, ABA_CLIENTES, COLS_CLIENTES)
         ws_fiado= garantir_aba(sh, ABA_FIADO, COLS_FIADO)
 
-        # cria cliente se for novo
-        if cliente_final not in lista_clientes and cliente_final:
+        # 2) Se for realmente novo (não existe equivalente normalizado), cadastra na aba Clientes
+        if _strip_accents_lower(cliente_final) not in norm_to_canon:
             append_rows(ws_cli, [{"Cliente": cliente_final, "Telefone": tel_novo, "Obs": ""}])
+            # atualiza cache e mapas locais
+            st.cache_data.clear()
+            df_cli = load_df(ABA_CLIENTES)
+            df_cli["_norm"] = df_cli["Cliente"].apply(_strip_accents_lower)
+            norm_to_canon = {n: c for n, c in zip(df_cli["_norm"], df_cli["Cliente"]) if str(c).strip()}
 
-        # salva fiado
+        # 3) Salva o fiado
         fid = gerar_id("F")
         linha = {
             "ID": fid,
@@ -215,9 +257,14 @@ with tab_quitar:
         st.info("Nenhum fiado em aberto.")
     else:
         clientes_abertos = sorted(abertos["Cliente"].astype(str).str.strip().unique().tolist())
+        # Para quem é leigo: pode mostrar ou não a lista de clientes (mesma lógica do Novo fiado)
+        show_lista_pag = st.checkbox("Mostrar lista de clientes com fiado em aberto", value=True)
         c1,c2 = st.columns([1,1])
         with c1:
-            cli = st.selectbox("Cliente", options=[""]+clientes_abertos, index=0)
+            if show_lista_pag:
+                cli = st.selectbox("Cliente", options=[""]+clientes_abertos, index=0)
+            else:
+                cli = st.text_input("Cliente (digite)", value="")
         with c2:
             data_pag = st.date_input("Data do pagamento", value=date.today())
 
@@ -227,6 +274,7 @@ with tab_quitar:
             st.info("Nenhum lançamento em aberto para esse cliente.")
         else:
             # Multi-seleção por ID
+            subset["ValorNum"] = subset["ValorNum"].astype(float)
             subset["Label"] = subset.apply(
                 lambda r: f"{r['ID']} • {r['Data']} • {_fmt_brl(r['ValorNum'])} • Venc: {r.get('Vencimento','') or '-'} • {r.get('Obs','') or ''}",
                 axis=1
