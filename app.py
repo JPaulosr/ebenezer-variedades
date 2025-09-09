@@ -1,6 +1,6 @@
 # app.py — Dashboard Ebenezér Variedades (estoque/custo calculados ao vivo)
 # -*- coding: utf-8 -*-
-import json, unicodedata, re
+import json, unicodedata, re, time
 from collections.abc import Mapping
 from datetime import datetime, date, timedelta
 
@@ -13,6 +13,13 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Ebenezér Variedades — Dashboard", page_icon="🧮", layout="wide")
 st.title("🧮 Dashboard — Ebenezér Variedades")
+
+# ------- Auto-refresh (opcional; só funciona se o pacote estiver disponível) -------
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=60_000, key="auto_refresh_60s")
+except Exception:
+    pass  # sem dependência, segue normal
 
 # =========================
 # Auth & Conexão
@@ -110,7 +117,7 @@ try:    comp_raw = carregar_aba(ABA_COMP)
 except: comp_raw = pd.DataFrame()
 
 # =========================
-# Normalização de PRODUTOS (base estática)
+# Normalização de PRODUTOS
 # =========================
 if prod.empty:
     st.warning("Aba Produtos está vazia.")
@@ -130,7 +137,7 @@ else:
     prod["ValorEstoque"] = prod["CustoAtual"].fillna(0)*prod["EstoqueAtual"].fillna(0)
 
 # =========================
-# Filtros (período + cat/forn/ativos)
+# Filtros
 # =========================
 st.sidebar.header("Filtros")
 preset = st.sidebar.selectbox("Período", ["Hoje","Últimos 7 dias","Últimos 30 dias","Mês atual","Personalizado"], index=2)
@@ -154,7 +161,8 @@ cats = sorted(pd.Series(prod["Categoria"].dropna().astype(str).unique()).tolist(
 forns = sorted(pd.Series(prod["Fornecedor"].dropna().astype(str).unique()).tolist()) if not prod.empty else []
 cat_sel  = st.sidebar.multiselect("Categoria", cats)
 forn_sel = st.sidebar.multiselect("Fornecedor", forns)
-apenas_ativos = st.sidebar.checkbox("Somente ativos", value=True)
+apenas_ativos   = st.sidebar.checkbox("Somente ativos", value=True)
+ocultar_zerados = st.sidebar.checkbox("Ocultar itens com estoque zerado", value=True)
 busca = st.sidebar.text_input("Buscar por nome/ID")
 
 # =========================
@@ -338,30 +346,38 @@ else:
 # =========================
 # COGS correto + lucro, margem, ticket, caixa
 # =========================
-# custo de referência = CustoMedio (compras) OU, se 0/NaN, CustoAtual (aba Produtos)
 if not prod_calc.empty:
     _cm = prod_calc.set_index("ID")["CustoMedio"] if "ID" in prod_calc.columns else pd.Series(dtype=float)
     _ca = prod_calc.set_index("ID")["CustoAtual"] if "CustoAtual" in prod_calc.columns and "ID" in prod_calc.columns else pd.Series(dtype=float)
+
     custo_ref = {}
     ids_all = set(list(_cm.index) + list(_ca.index))
     for _pid in ids_all:
-        v_cm = float(_cm.get(_pid, 0) or 0)
-        v_ca = float(_ca.get(_pid, 0) or 0)
+        v_cm = float((_cm.get(_pid, 0) or 0))
+        v_ca = float((_ca.get(_pid, 0) or 0))
         custo_ref[str(_pid)] = v_cm if v_cm > 0 else v_ca
 else:
     custo_ref = {}
 
-if not vendas.empty and "IDProduto" in vendas.columns:
+if not vendas.empty:
+    vv = vendas.copy()
+    if "IDProduto" in vv.columns:
+        vv["IDProduto"] = vv["IDProduto"].astype(str)
+    else:
+        vv["IDProduto"] = ""
+    vv = vv[vv["IDProduto"].str.len() > 0]
+
     def _custo_lookup(pid):
-        return float(custo_ref.get(str(pid), 0) or 0)
-    vendas["_CustoLinha"] = vendas["QtdNum"] * vendas["IDProduto"].map(_custo_lookup)
-    cogs = float(vendas["_CustoLinha"].sum())
+        return float(custo_ref.get(str(pid), 0.0) or 0.0)
+
+    vv["_CustoLinha"] = vv["QtdNum"] * vv["IDProduto"].map(_custo_lookup)
+    cogs = float(vv["_CustoLinha"].sum())
 else:
     cogs = 0.0
 
-lucro_bruto = max(0.0, faturamento - cogs)
-margem_bruta = (lucro_bruto / faturamento * 100) if faturamento > 0 else 0.0
-ticket_medio = (faturamento / num_cupons) if num_cupons > 0 else 0.0
+lucro_bruto   = max(0.0, faturamento - cogs)
+margem_bruta  = (lucro_bruto / faturamento * 100) if faturamento > 0 else 0.0
+ticket_medio  = (faturamento / num_cupons) if num_cupons > 0 else 0.0
 compras_total = compras["TotalNum"].sum() if not compras.empty else 0.0
 caixa_periodo = faturamento - compras_total
 
@@ -377,7 +393,7 @@ k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
 # =========================
-# Cards de FIADO (compatível com sua aba Fiado)
+# Cards de FIADO
 # =========================
 def _carregar_fiado_sheet():
     nomes = ["Fiado", "Fiados", "PagamentosFiado", "RecebimentoFiado", "RecebimentosFiado"]
@@ -406,7 +422,6 @@ if not fiado_sheet.empty:
     c_vp   = _first_col(fs, ["ValorPago","Pago","Recebido"])
     c_status = _first_col(fs, ["Status"])
 
-    # Datas e valores
     if c_data: fs["Data_d"] = fs[c_data].apply(_parse_date_any)
     else:      fs["Data_d"] = pd.NaT
     if c_dp:   fs["DataPag_d"] = fs[c_dp].apply(_parse_date_any)
@@ -416,21 +431,13 @@ if not fiado_sheet.empty:
     fs["ValorPagoNum"]= fs[c_vp].apply(_to_float) if c_vp else 0.0
     fs["Status_str"]  = fs[c_status].astype(str).str.strip().str.lower() if c_status else ""
 
-    # (1) Lançado no período (pela data de lançamento)
     fiado_lancado_periodo = float(fs[(fs["Data_d"]>=dt_ini) & (fs["Data_d"]<=dt_fim)]["ValorNum"].sum())
-
-    # (2) Recebido no período (pela data de pagamento)
     fiado_recebido_periodo = float(fs[(fs["DataPag_d"]>=dt_ini) & (fs["DataPag_d"]<=dt_fim)]["ValorPagoNum"].sum())
 
-    # (3) Saldo em aberto (histórico): Valor - ValorPago
     total_lanc = float(fs["ValorNum"].sum())
     total_pago = float(fs["ValorPagoNum"].sum())
-    # Se existir coluna de Status, podemos considerar "pago/quitado" já liquidado
-    # mas como já usamos ValorPago, o saldo = lançamentos - pagamentos cobre tudo.
     fiado_saldo_aberto = max(0.0, total_lanc - total_pago)
 else:
-    # Fallback sem aba Fiado: tenta usar "Forma = Fiado" dos cupons do período para (1),
-    # e considera (2)=0 e (3)=soma histórica de fiado ≈ período (não ideal, mas informativo)
     if not cupom_grp.empty:
         fiado_lancado_periodo = float(cupom_grp[_lower(cupom_grp["Forma"]).eq("fiado")]["ReceitaCupom"].sum())
         fiado_saldo_aberto = fiado_lancado_periodo
@@ -560,6 +567,9 @@ else:
 
     dfv = prod_calc[m].copy()
 
+    if ocultar_zerados and "EstoqueCalc" in dfv.columns:
+        dfv = dfv[dfv["EstoqueCalc"].fillna(0) != 0]
+
     total_produtos = len(dfv)
     valor_estoque  = dfv["ValorEstoqueCalc"].sum()
     abaixo_min     = int((dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0)).sum())
@@ -571,7 +581,7 @@ else:
 
     st.markdown("**⚠️ Itens abaixo do mínimo / sugestão de compra**")
     if "EstoqueMin" in dfv.columns:
-        alert = dfv[dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0)].copy()
+        alert = dfv[(dfv["EstoqueMin"].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv["EstoqueMin"].fillna(0))].copy()
         if not alert.empty:
             alert["SugestaoCompra"] = (alert["EstoqueMin"].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
             cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc","EstoqueMin","SugestaoCompra","LeadTimeDias"] if c in alert.columns]
@@ -608,6 +618,6 @@ else:
     cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoMedio","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo"] if c in dfv.columns]
     st.dataframe(dfv[cols_show].rename(columns={
         "CustoMedio":"CustoAtual",
-        "EstoqueCalc":"EstoqueAtual",  
+        "EstoqueCalc":"EstoqueAtual",
         "ValorEstoqueCalc":"ValorEstoque"
     }) if cols_show else dfv, use_container_width=True, hide_index=True)
