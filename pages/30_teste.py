@@ -1,4 +1,4 @@
-# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com _rerun compatível
+# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com _rerun e clamps de Qtd/Preço
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date
@@ -159,10 +159,25 @@ else:
         c1, c2, c3, c4, c5, c6 = st.columns([1.8, 3, 1, 1.4, 1.6, 0.8])
         c1.write(it["id"])
         c2.write(it["nome"])
+
+        # ---- Qtd (clamp >= 1) ----
         with c3:
-            st.session_state["cart"][idx]["qtd"] = st.number_input("Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"]))
+            q_val = int(_to_num(it.get("qtd", 1)))
+            if q_val < 1:
+                q_val = 1
+            st.session_state["cart"][idx]["qtd"] = st.number_input(
+                "Qtd", key=f"q_{idx}", min_value=1, step=1, value=q_val
+            )
+
+        # ---- Preço (clamp >= 0) ----
         with c4:
-            st.session_state["cart"][idx]["preco"] = st.number_input("Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=float(it["preco"]), format="%.2f")
+            p_val = float(_to_num(it.get("preco", 0.0)))
+            if p_val < 0:
+                p_val = 0.0
+            st.session_state["cart"][idx]["preco"] = st.number_input(
+                "Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=p_val, format="%.2f"
+            )
+
         c5.write(_fmt_brl_num(st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']))
         if c6.button("🗑️", key=f"rm_{idx}"):
             st.session_state["cart"].pop(idx)
@@ -272,7 +287,7 @@ else:
         axis=1
     )
     vend["_Desc"]  = vend["Desconto"].map(_to_num) if has_desc else 0.0
-    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])  # se não tiver desconto salvo
+    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])
 
     # agrega por VendaID
     grp = vend.groupby(col_venda, dropna=False).agg({
@@ -305,24 +320,32 @@ else:
 
         # ---------- Duplicar ----------
         def _carrega_carrinho(venda_id):
-    linhas = vend[vend[col_venda]==venda_id].copy()
-    cart = []
-    for _, r in linhas.iterrows():
-        cart.append({
-            "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-            "nome": "",
-            "unid": "un",
-            "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
-            "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
-        })
-    st.session_state["prefill_cart"] = {
-        "cart": cart,
-        "forma": row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro",
-        "obs": "",
-        "data": date.today(),
-        "desc": float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
-    }
-    st.rerun()  # <-- troque por isso
+            linhas = vend[vend[col_venda]==venda_id].copy()
+            cart = []
+            for _, r in linhas.iterrows():
+                q_raw = int(_to_num(r[col_qtd])) if col_qtd else 1
+                q = abs(q_raw) or 1  # evita 0 e negativo
+                p = float(_to_num(r[col_preco])) if col_preco else 0.0
+                if p < 0:
+                    p = 0.0
+                # se por algum motivo veio 0, pula
+                if q == 0:
+                    continue
+                cart.append({
+                    "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
+                    "nome": "",  # opcional
+                    "unid": "un",
+                    "qtd": q,
+                    "preco": p
+                })
+            st.session_state["prefill_cart"] = {
+                "cart": cart,
+                "forma": row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro",
+                "obs": "",
+                "data": date.today(),
+                "desc": float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
+            }
+            _rerun()
 
         # ---------- Estornar ----------
         def _cancelar_cupom(venda_id):
