@@ -94,6 +94,9 @@ def _fmt_brl(v):
         return ("R$ " + f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
     except: return "R$ 0,00"
 
+def _lower(s):
+    return str(s or "").strip().lower()
+
 # =========================
 # Carrega abas
 # =========================
@@ -234,8 +237,7 @@ def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
 compras = _normalize_compras_period(comp_raw)
 
 # =========================
-# >>> Estoque & Custo Médio calculados da HISTÓRIA inteira <<<
-# (para independência da aba Produtos)
+# >>> Estoque & Custo Médio (histórico)
 # =========================
 def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
     if v.empty: 
@@ -324,7 +326,7 @@ for col in ["EstoqueCalc","CustoMedio","Entradas","Saidas","Ajustes"]:
 prod_calc["ValorEstoqueCalc"] = prod_calc["CustoMedio"].fillna(0)*prod_calc["EstoqueCalc"].fillna(0)
 
 # =========================
-# KPIs (faturamento, cupons, itens, lucro, margem, ticket, caixa)
+# KPIs (faturamento, cupons, itens)
 # =========================
 if not vendas.empty:
     faturamento = cupom_grp["ReceitaCupom"].sum()
@@ -333,15 +335,27 @@ if not vendas.empty:
 else:
     faturamento = 0.0; num_cupons = 0; itens_vendidos = 0.0
 
-# COGS aproximado = sum(Qtd * CustoMedio[produto])
-if not vendas.empty and not prod_calc.empty and "ID" in prod_calc.columns:
-    custo_map = prod_calc.set_index("ID")["CustoMedio"].to_dict()
-    idcol = "IDProduto" if "IDProduto" in vendas.columns else None
-    if idcol:
-        vendas["_CustoLinha"] = vendas["QtdNum"] * vendas[idcol].map(lambda x: _to_float(custo_map.get(str(x), 0)))
-        cogs = vendas["_CustoLinha"].sum()
-    else:
-        cogs = 0.0
+# =========================
+# COGS correto + lucro, margem, ticket, caixa
+# =========================
+# custo de referência = CustoMedio (compras) OU, se 0/NaN, CustoAtual (aba Produtos)
+if not prod_calc.empty:
+    _cm = prod_calc.set_index("ID")["CustoMedio"] if "ID" in prod_calc.columns else pd.Series(dtype=float)
+    _ca = prod_calc.set_index("ID")["CustoAtual"] if "CustoAtual" in prod_calc.columns and "ID" in prod_calc.columns else pd.Series(dtype=float)
+    custo_ref = {}
+    ids_all = set(list(_cm.index) + list(_ca.index))
+    for _pid in ids_all:
+        v_cm = float(_cm.get(_pid, 0) or 0)
+        v_ca = float(_ca.get(_pid, 0) or 0)
+        custo_ref[str(_pid)] = v_cm if v_cm > 0 else v_ca
+else:
+    custo_ref = {}
+
+if not vendas.empty and "IDProduto" in vendas.columns:
+    def _custo_lookup(pid):
+        return float(custo_ref.get(str(pid), 0) or 0)
+    vendas["_CustoLinha"] = vendas["QtdNum"] * vendas["IDProduto"].map(_custo_lookup)
+    cogs = float(vendas["_CustoLinha"].sum())
 else:
     cogs = 0.0
 
@@ -352,7 +366,7 @@ compras_total = compras["TotalNum"].sum() if not compras.empty else 0.0
 caixa_periodo = faturamento - compras_total
 
 # =========================
-# KPIs (cards)
+# KPIs (cards principais)
 # =========================
 k1,k2,k3,k4,k5 = st.columns(5)
 k1.metric("💵 Faturamento (período)", _fmt_brl(faturamento))
@@ -361,6 +375,71 @@ k3.metric("📦 Itens vendidos", f"{itens_vendidos:.0f}")
 k4.metric("📈 Lucro bruto (aprox.)", _fmt_brl(lucro_bruto), f"{margem_bruta:.1f}% margem")
 k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
+
+# =========================
+# Cards de FIADO (compatível com sua aba Fiado)
+# =========================
+def _carregar_fiado_sheet():
+    nomes = ["Fiado", "Fiados", "PagamentosFiado", "RecebimentoFiado", "RecebimentosFiado"]
+    for n in nomes:
+        try:
+            df = carregar_aba(n)
+            if not df.empty:
+                return df, n
+        except Exception:
+            pass
+    return pd.DataFrame(), None
+
+fiado_sheet, _fiado_nome = _carregar_fiado_sheet()
+
+fiado_lancado_periodo = 0.0
+fiado_recebido_periodo = 0.0
+fiado_saldo_aberto = 0.0
+
+if not fiado_sheet.empty:
+    fs = fiado_sheet.copy()
+    fs.columns = [c.strip() for c in fs.columns]
+
+    c_data = _first_col(fs, ["Data","Dt"])
+    c_val  = _first_col(fs, ["Valor"])
+    c_dp   = _first_col(fs, ["DataPagamento","DtPagamento","PagamentoData"])
+    c_vp   = _first_col(fs, ["ValorPago","Pago","Recebido"])
+    c_status = _first_col(fs, ["Status"])
+
+    # Datas e valores
+    if c_data: fs["Data_d"] = fs[c_data].apply(_parse_date_any)
+    else:      fs["Data_d"] = pd.NaT
+    if c_dp:   fs["DataPag_d"] = fs[c_dp].apply(_parse_date_any)
+    else:      fs["DataPag_d"] = pd.NaT
+
+    fs["ValorNum"]    = fs[c_val].apply(_to_float) if c_val else 0.0
+    fs["ValorPagoNum"]= fs[c_vp].apply(_to_float) if c_vp else 0.0
+    fs["Status_str"]  = fs[c_status].astype(str).str.strip().str.lower() if c_status else ""
+
+    # (1) Lançado no período (pela data de lançamento)
+    fiado_lancado_periodo = float(fs[(fs["Data_d"]>=dt_ini) & (fs["Data_d"]<=dt_fim)]["ValorNum"].sum())
+
+    # (2) Recebido no período (pela data de pagamento)
+    fiado_recebido_periodo = float(fs[(fs["DataPag_d"]>=dt_ini) & (fs["DataPag_d"]<=dt_fim)]["ValorPagoNum"].sum())
+
+    # (3) Saldo em aberto (histórico): Valor - ValorPago
+    total_lanc = float(fs["ValorNum"].sum())
+    total_pago = float(fs["ValorPagoNum"].sum())
+    # Se existir coluna de Status, podemos considerar "pago/quitado" já liquidado
+    # mas como já usamos ValorPago, o saldo = lançamentos - pagamentos cobre tudo.
+    fiado_saldo_aberto = max(0.0, total_lanc - total_pago)
+else:
+    # Fallback sem aba Fiado: tenta usar "Forma = Fiado" dos cupons do período para (1),
+    # e considera (2)=0 e (3)=soma histórica de fiado ≈ período (não ideal, mas informativo)
+    if not cupom_grp.empty:
+        fiado_lancado_periodo = float(cupom_grp[_lower(cupom_grp["Forma"]).eq("fiado")]["ReceitaCupom"].sum())
+        fiado_saldo_aberto = fiado_lancado_periodo
+        fiado_recebido_periodo = 0.0
+
+f1, f2, f3 = st.columns(3)
+f1.metric("🧾 Fiado lançado (período)", _fmt_brl(fiado_lancado_periodo))
+f2.metric("🏦 Recebido de fiado (período)", _fmt_brl(fiado_recebido_periodo))
+f3.metric("📌 Fiado em aberto (saldo)", _fmt_brl(fiado_saldo_aberto))
 
 st.divider()
 
@@ -529,6 +608,6 @@ else:
     cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoMedio","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo"] if c in dfv.columns]
     st.dataframe(dfv[cols_show].rename(columns={
         "CustoMedio":"CustoAtual",
-        "EstoqueCalc":"EstoqueAtual",
+        "EstoqueCalc":"EstoqueAtual",  
         "ValorEstoqueCalc":"ValorEstoque"
     }) if cols_show else dfv, use_container_width=True, hide_index=True)
