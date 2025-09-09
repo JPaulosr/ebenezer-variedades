@@ -10,6 +10,14 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Produtos — Ebenezér Variedades", page_icon="📦", layout="wide")
 st.title("📦 Produtos — Catálogo & Busca")
 
+# Botão para atualizar dados (limpa cache e recarrega)
+if st.button("🔄 Atualizar dados"):
+    st.cache_data.clear()
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
+
 # =========================
 # Utilitários
 # =========================
@@ -121,16 +129,16 @@ col_custo_atual= _first_col(df_prod, ["CustoAtual", "Custo Médio", "CustoMedio"
 col_preco      = _first_col(df_prod, ["PreçoVenda", "PrecoVenda", "Preço", "Preco"])
 
 # Compras
-col_comp_idprod = _first_col(df_comp, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto"])
+col_comp_idprod = _first_col(df_comp, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto", "ID"])
 col_comp_qtd    = _first_col(df_comp, ["Qtd", "Quantidade", "Qtde", "Qde"])
 col_comp_custo  = _first_col(df_comp, ["Custo Unitário", "CustoUnitário", "CustoUnit", "Custo Unit", "Custo"])
 
 # Vendas
-col_vend_idprod = _first_col(df_vend, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto"])
+col_vend_idprod = _first_col(df_vend, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto", "ID"])
 col_vend_qtd    = _first_col(df_vend, ["Qtd", "Quantidade", "Qtde", "Qde"])
 
-# Ajustes (opcional)
-col_aj_idprod = _first_col(df_aj, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto"])
+# Ajustes (agora aceita também 'ID')
+col_aj_idprod = _first_col(df_aj, ["IDProduto", "IdProduto", "ProdutoID", "ID Prod", "ID_Produto", "ID"])
 col_aj_qtd    = _first_col(df_aj, ["Qtd", "Quantidade", "Qtde", "Qde", "Ajuste"])
 
 # =========================
