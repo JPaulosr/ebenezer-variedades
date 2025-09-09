@@ -73,11 +73,19 @@ def _to_num(s):
     s = str(s).strip()
     if s == "" or s.lower() in ("nan", "none"):
         return 0.0
+    # trata 1.234,56 ou 1234,56 etc.
     s = s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".") > 1 else s.replace(",", ".")
     try:
         return float(s)
     except Exception:
         return 0.0
+
+# --- util para pegar a 1ª coluna existente e converter p/ numérico
+def _pick_numeric(df: pd.DataFrame, candidates: list[str], default=0.0) -> pd.Series:
+    for c in candidates:
+        if c in df.columns:
+            return pd.to_numeric(df[c], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
 
 # =========================
 # Nomes das abas
@@ -187,15 +195,31 @@ if not col_id_prod:
     st.error("Não encontrei a coluna de ID na aba Produtos (ex.: 'ID')."); st.stop()
 
 df_prod["_ID_join"] = df_prod[col_id_prod].astype(str)
-df_merge = df_prod.merge(calc, how="left", left_on="_ID_join", right_on="ID_join").drop(columns=["ID_join"])
+df_merge = df_prod.merge(
+    calc, how="left",
+    left_on="_ID_join", right_on="ID_join",
+    suffixes=("_prod", "_calc")  # força sufixos estáveis se houver conflito
+).drop(columns=["ID_join"])
 
-# Colunas calculadas (internas)
-df_merge["EstoqueAtual_calc"] = df_merge["EstoqueCalc"].fillna(0.0).map(float)
-df_merge["CustoAtual_calc"]   = df_merge["CustoMedio"].fillna(0.0).map(float)
+# (Opcional) Debug: ver colunas vindas do merge
+# st.write("Cols df_merge:", sorted(df_merge.columns.tolist()))
+
+# Colunas calculadas (internas) com acesso defensivo
+df_merge["EstoqueAtual_calc"] = _pick_numeric(
+    df_merge,
+    ["EstoqueCalc_calc", "EstoqueCalc", "Estoque_calc", "Estoque", "EstoqueAtual_calc", "EstoqueAtual"],
+    default=0.0
+)
+
+df_merge["CustoAtual_calc"] = _pick_numeric(
+    df_merge,
+    ["CustoMedio", "CustoMedio_calc", "CustoAtual", "CustoAtual_calc", "Custo Médio", "CustoMedio_prod"],
+    default=0.0
+)
 
 # Para filtros
 col_cat  = col_cat or _first_col(df_merge, ["Categoria"])
-col_forn = col_forn_prod or _first_col(df_merge, ["Fornecedor"])
+col_forn = _first_col(df_merge, ["Fornecedor", "Fornecedor_prod"]) or col_forn_prod
 
 # =========================
 # Filtros de busca
@@ -246,8 +270,11 @@ dfv = df_merge[mask].reset_index(drop=True)
 # =========================
 dfv["EstoqueAtual"] = dfv["EstoqueAtual_calc"]
 dfv["CustoAtual"]   = dfv["CustoAtual_calc"]
-for c in ["EstoqueAtual_calc", "CustoAtual_calc", "EstoqueCalc", "CustoMedio", "_ID_join"]:
-    if c in dfv.columns: dfv.drop(columns=[c], inplace=True)
+
+for c in ["EstoqueAtual_calc", "CustoAtual_calc", "EstoqueCalc", "EstoqueCalc_calc", "CustoMedio", "_ID_join"]:
+    if c in dfv.columns:
+        dfv.drop(columns=[c], inplace=True)
+
 dfv = dfv.loc[:, ~dfv.columns.duplicated(keep="first")]
 
 cols_candidatas = [
