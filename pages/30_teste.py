@@ -1,95 +1,98 @@
-# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar) — COM FIADO + TELEGRAM + ESTOQUE + RESUMO DO DIA
 # -*- coding: utf-8 -*-
-import json, unicodedata
-from datetime import datetime, date, timedelta
+# pages/03_compras_entradas.py — Registrar compras/entradas de estoque + Telegram
+import json, unicodedata, re
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-import requests  # Telegram
+from datetime import datetime, date
 
-st.set_page_config(page_title="Vendas rápidas", page_icon="🧾", layout="wide")
-st.title("🧾 Vendas rápidas (carrinho)")
+st.set_page_config(page_title="Compras / Entradas", page_icon="🧾", layout="wide")
+st.title("🧾 Compras / Entradas de Estoque")
 
-# ================= Helpers =================
+# ========= credenciais =========
 def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str): return key
+    if not isinstance(key, str):
+        return key
     key = key.replace("\\n", "\n")
     key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
     return key
 
 def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+    if svc is None:
+        st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
     if isinstance(svc, str): svc = json.loads(svc)
-    svc = {**svc, "private_key": _normalize_private_key(svc["private_key"])}
+    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
     return svc
 
 @st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+def _client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL", "")
-    if not url_or_id: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
+    return gspread.authorize(creds)
 
-@st.cache_data(ttl=10)
-def carregar_aba(nome: str) -> pd.DataFrame:
-    ws = conectar_sheets().worksheet(nome)
+@st.cache_resource
+def _sheet():
+    gc = _client()
+    url_or_id = st.secrets.get("PLANILHA_URL")
+    if not url_or_id:
+        st.error("🛑 PLANILHA_URL ausente."); st.stop()
+    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
+
+@st.cache_data
+def _load_df(aba: str) -> pd.DataFrame:
+    ws = _sheet().worksheet(aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
-    return df
+    return df.fillna("")
 
-def _first_col(df: pd.DataFrame, candidates) -> str | None:
-    if df is None or df.empty: return None
-    for c in candidates:
-        if c in df.columns: return c
-    low = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in low: return low[c.lower()]
-    return None
+def _ensure_ws(name: str, headers: list[str]):
+    sh = _sheet()
+    try:
+        ws = sh.worksheet(name)
+        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+        if cur.empty or any(h not in cur.columns for h in headers):
+            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
+            df_head = pd.DataFrame(columns=cols)
+            ws.clear()
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
 
-def _to_num(x):
-    if x is None: return 0.0
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"): return 0.0
-    s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>1 else s.replace(",", ".")
+def _append_row(ws, row: dict):
+    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+    for col in cur.columns:
+        row.setdefault(col, "")
+    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+def _to_float(x):
+    if x is None or str(x).strip()=="":
+        return ""
+    s = str(x).strip().replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
     try: return float(s)
-    except: return 0.0
+    except: return ""
 
-def _fmt_brl_num(v):
+def _nz(x):
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan", "none") else s
+
+def _fmt_brl(v: float) -> str:
     return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
-def _gerar_id(prefixo="F"):
-    return f"{prefixo}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-def _garantir_aba(sh, nome, cols):
-    try:
-        ws = sh.worksheet(nome)
-    except Exception:
-        ws = sh.add_worksheet(title=nome, rows=3000, cols=max(10,len(cols)))
-        ws.update("A1", [cols])
-        return ws
-    headers = ws.row_values(1) or []
-    headers = [h.strip() for h in headers]
-    falt = [c for c in cols if c not in headers]
-    if falt:
-        ws.update("A1", [headers + falt])
-    return ws
-
-def _append_rows(ws, rows: list[dict]):
-    headers = ws.row_values(1)
-    hdr = [h.strip() for h in headers]
-    to_append = []
-    for d in rows:
-        to_append.append([d.get(h, "") for h in hdr])
-    if to_append:
-        ws.append_rows(to_append, value_input_option="USER_ENTERED")
-
-# -------- Telegram --------
+# ========= Telegram =========
 def _tg_enabled() -> bool:
     try:
         return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
@@ -106,566 +109,197 @@ def _tg_send(msg: str):
     token, chat_id = _tg_conf()
     if not token or not chat_id: return
     try:
+        import requests
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
         requests.post(url, json=payload, timeout=6)
     except Exception:
         pass
 
-# ---------------- Mapas de produto (nome, custo, estoque) ----------------
-def _build_prod_maps(dfp, col_id, col_nome, col_custo, col_estoque):
-    id_to_name = {}
-    id_to_cost = {}
-    id_to_stock = {}
-    for _, r in dfp.iterrows():
-        pid = str(r[col_id]).strip()
-        if pid:
-            id_to_name[pid] = str(r.get(col_nome, "") or "").strip()
-            if col_custo:  id_to_cost[pid]  = _to_num(r.get(col_custo))
-            if col_estoque: id_to_stock[pid] = _to_num(r.get(col_estoque))
-    return id_to_name, id_to_cost, id_to_stock
+# ========= headers e dados =========
+PRODUTOS_ABA = "Produtos"
+COMPRAS_ABA  = "Compras"
+VENDAS_ABA   = "Vendas"
+AJUSTES_ABA  = "Ajustes"
+MOVS_ABA     = "MovimentosEstoque"
 
-def _calc_profit(qtd, preco_unit, custo_unit) -> float:
-    return float(qtd) * (float(preco_unit) - float(custo_unit))
+COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
+# compatível com outras páginas
+MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"]
 
-# helper para exibir linhas de item no Telegram (com nome e subtotal e estoque)
-def _render_item_line_enriquecido(x: dict, id_to_name: dict, stock_before_after: dict, id_key="IDProduto") -> str:
-    pid   = x.get("IDProduto") or x.get("ProdutoID") or x.get("ID") or x.get("id") or "?"
-    qtd   = int(_to_num(x.get("Qtd") if "Qtd" in x else x.get("qtd", 1)))
-    preco = _to_num(x.get("PrecoUnit") if "PrecoUnit" in x else x.get("preco", 0))
-    nome  = id_to_name.get(str(pid), str(pid))
-    subtotal = qtd * preco
-    estoque_txt = ""
-    if pid in stock_before_after:
-        bef, aft = stock_before_after[pid]
-        estoque_txt = f" — <i>estoque: {int(bef)}</i> → <b>{int(aft)}</b>"
-    return f"• <b>{nome}</b> (#{pid}) — x{qtd} @ {_fmt_brl_num(preco)} = <b>{_fmt_brl_num(subtotal)}</b>{estoque_txt}"
-
-# ================= Abas principais =================
-ABA_PROD, ABA_VEND = "Produtos", "Vendas"
-ABA_FIADO = "Fiado"
-ABA_CLIENTES = "Clientes"
-
-COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
-COLS_CLIENTES = ["Cliente","Telefone","Obs"]
-
-def _carregar_clientes() -> list[str]:
-    try:
-        dfc = carregar_aba(ABA_CLIENTES)
-        if dfc.empty: return []
-        col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        return sorted(list(dict.fromkeys([str(x).strip() for x in dfc[col_cli].dropna()])))
-    except Exception:
-        return []
-
-# =============== Catálogo ===============
 try:
-    dfp = carregar_aba(ABA_PROD)
+    prod_df = _load_df(PRODUTOS_ABA)
 except Exception as e:
     st.error("Erro ao abrir a aba Produtos.")
-    with st.expander("Detalhes técnicos"): st.code(str(e))
+    with st.expander("Detalhes"):
+        st.code(str(e))
     st.stop()
 
-col_id   = _first_col(dfp, ["ID","Codigo","Código","SKU"])
-col_nome = _first_col(dfp, ["Nome","Produto","Descrição"])
-col_preco= _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"])
-col_unid = _first_col(dfp, ["Unidade","Und"])
-col_estoque = _first_col(dfp, ["Estoque","QtdEstoque","EstoqueAtual","Estoque atual","Saldo"])
-col_custo   = _first_col(dfp, ["Custo","PreçoCusto","PrecoCusto","CustoUnit","Custo Unidade"])
+def _pick_col(df, cands):
+    for c in cands:
+        if c in df.columns: return c
+    return None
 
-if not col_id or not col_nome:
-    st.error("A aba Produtos precisa ter colunas de ID e Nome."); st.stop()
+COL = {
+    "id":   _pick_col(prod_df, ["ID","Id","id","Codigo","Código","SKU"]),
+    "nome": _pick_col(prod_df, ["Nome","Produto","Descrição","Descricao"]),
+    "forn": _pick_col(prod_df, ["Fornecedor","FornecedorNome"]),
+    "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
+}
 
-# mapas auxiliares
-id_to_name, id_to_cost, id_to_stock = _build_prod_maps(dfp, col_id, col_nome, col_custo, col_estoque)
+# ------- cálculo de estoque (Compras - Vendas + Ajustes) -------
+def _estoque_atual(pid: str="", nome: str="") -> float:
+    pid = (pid or "").strip()
+    nome = (nome or "").strip()
 
-dfp["_label"] = dfp.apply(lambda r: f"{str(r[col_id])} — {str(r[col_nome])}", axis=1)
-cat_map = dfp.set_index("_label")[[col_id, col_nome, col_preco, col_unid]].to_dict("index")
-labels = ["(selecione)"] + sorted(cat_map.keys())
+    def _sum(df, col_q, filtro):
+        if df.empty or not col_q: return 0.0
+        try:
+            sub = df[filtro].copy()
+            if sub.empty: return 0.0
+            return pd.to_numeric(sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False), errors="coerce").fillna(0).sum()
+        except Exception:
+            return 0.0
 
-# ================= Prefill (duplicar cupom) =================
-if "prefill_cart" in st.session_state:
-    st.session_state["cart"]  = st.session_state["prefill_cart"].get("cart", [])
-    st.session_state["forma"] = st.session_state["prefill_cart"].get("forma", "Dinheiro")
-    st.session_state["obs"]   = st.session_state["prefill_cart"].get("obs", "")
-    st.session_state["data_venda"] = st.session_state["prefill_cart"].get("data", date.today())
-    st.session_state["desc"]  = float(st.session_state["prefill_cart"].get("desc", 0.0))
-    st.session_state.pop("prefill_cart")
+    try: comp = _load_df(COMPRAS_ABA)
+    except Exception: comp = pd.DataFrame()
+    try: vend = _load_df(VENDAS_ABA)
+    except Exception: vend = pd.DataFrame()
+    try: ajus = _load_df(AJUSTES_ABA)
+    except Exception: ajus = pd.DataFrame()
 
-# ================= Estado inicial =================
-if "cart" not in st.session_state: st.session_state["cart"] = []
-if "forma" not in st.session_state: st.session_state["forma"] = "Dinheiro"
-if "obs" not in st.session_state:   st.session_state["obs"] = ""
-if "data_venda" not in st.session_state: st.session_state["data_venda"] = date.today()
-if "desc" not in st.session_state:  st.session_state["desc"] = 0.0
-if "cliente" not in st.session_state: st.session_state["cliente"] = ""
-if "venc_fiado" not in st.session_state: st.session_state["venc_fiado"] = date.today() + timedelta(days=30)
+    # Compras
+    c_pid = _pick_col(comp, ["IDProduto","ProdutoID","ID"])
+    c_qtd = _pick_col(comp, ["Qtd","Quantidade"])
+    c_nom = _pick_col(comp, ["Produto","Nome"])
+    ent = 0.0
+    if c_qtd:
+        if pid and c_pid:
+            ent += _sum(comp, c_qtd, comp[c_pid].astype(str).str.strip()==pid)
+        if nome and c_nom:
+            ent += _sum(comp, c_qtd, (comp[c_nom].astype(str).str.strip()==nome) & (False if not c_pid else comp[c_pid].astype(str).str.strip().eq("").fillna(True)))
 
-# ================= Carrinho =================
-st.subheader("Nova venda / cupom")
+    # Vendas (qtd já considera estorno negativo)
+    v_pid = _pick_col(vend, ["IDProduto","ProdutoID","ID"])
+    v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
+    sai = 0.0
+    if v_qtd:
+        if pid and v_pid:
+            sai += _sum(vend, v_qtd, vend[v_pid].astype(str).str.strip()==pid)
+        if nome and _pick_col(vend, ["Produto","Nome"]):
+            # normalmente não tem nome em Vendas; deixo só por segurança
+            vn = _pick_col(vend, ["Produto","Nome"])
+            sai += _sum(vend, v_qtd, vend[vn].astype(str).str.strip()==nome)
 
-# Data
-cdate, = st.columns(1)
-with cdate:
-    st.session_state["data_venda"] = st.date_input("Data da venda", value=st.session_state["data_venda"])
+    # Ajustes
+    a_pid = _pick_col(ajus, ["ID","IDProduto","ProdutoID"])
+    a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
+    aj = 0.0
+    if a_qtd and a_pid:
+        if pid:
+            aj += _sum(ajus, a_qtd, ajus[a_pid].astype(str).str.strip()==pid)
+        elif nome:
+            # se não tem ID no ajuste, tente por nome (se houver)
+            an = _pick_col(ajus, ["Produto","Nome"])
+            if an:
+                aj += _sum(ajus, a_qtd, ajus[an].astype(str).str.strip()==nome)
 
-with st.form("add_item"):
-    sel = st.selectbox("Produto", labels, index=0)
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        qtd = st.number_input("Qtd", min_value=1, step=1, value=1)
-    with c2:
-        preco_sug = 0.0
-        if sel != "(selecione)" and col_preco:
-            preco_sug = _to_num(cat_map[sel].get(col_preco))
-        preco = st.number_input("Preço unitário (R$)", min_value=0.0, value=float(preco_sug), step=0.1, format="%.2f")
-    with c3:
-        unid_show = cat_map[sel].get(col_unid) if sel != "(selecione)" and col_unid else "un"
-        st.text_input("Unidade", value=str(unid_show), disabled=True)
-    add = st.form_submit_button("➕ Adicionar ao carrinho", use_container_width=True)
+    return float(ent - sai + aj)
 
-if add:
-    if sel == "(selecione)":
-        st.warning("Selecione um produto.")
+# ========= formulário =========
+st.subheader("Nova compra / entrada")
+with st.form("form_compra"):
+    usar_lista = st.checkbox("Selecionar produto da lista", value=True)
+    if usar_lista:
+        if prod_df.empty:
+            st.warning("Sem produtos cadastrados."); st.stop()
+
+        def _fmt(r):
+            n = _nz(r.get(COL["nome"], "")) or "(sem nome)"
+            f = _nz(r.get(COL["forn"], ""))
+            return n + (f" — " + f if f else "")
+
+        labels = prod_df.apply(_fmt, axis=1).tolist()
+        idx = st.selectbox("Produto", options=range(len(prod_df)), format_func=lambda i: labels[i])
+        row = prod_df.iloc[idx]
+        prod_nome = _nz(row.get(COL["nome"], ""))
+        prod_id   = _nz(row.get(COL["id"], ""))
+        unid_sug  = _nz(row.get(COL["unid"], ""))
+        forn_sug  = _nz(row.get(COL["forn"], ""))
     else:
-        info = cat_map[sel]
-        st.session_state["cart"].append({
-            "id": str(info[col_id]),
-            "nome": str(info[col_nome]),
-            "unid": str(info.get(col_unid, "un")),
-            "qtd": int(qtd),
-            "preco": float(preco)
-        })
-        st.success("Item adicionado.")
+        prod_nome = st.text_input("Produto (nome exato)")
+        prod_id   = st.text_input("ID (opcional)")
+        unid_sug  = ""
+        forn_sug  = ""
 
-# Tabela do carrinho
-st.subheader("Carrinho")
-if not st.session_state["cart"]:
-    st.info("Nenhum item no carrinho.")
-else:
-    for idx, it in enumerate(st.session_state["cart"]):
-        c1, c2, c3, c4, c5, c6 = st.columns([1.3, 3.2, 1, 1.4, 1.6, 0.8])
-        c1.write(f"#{it['id']}")
-        c2.write(f"**{it['nome']}**")
-        with c3:
-            st.session_state["cart"][idx]["qtd"] = st.number_input("Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"]))
-        with c4:
-            st.session_state["cart"][idx]["preco"] = st.number_input("Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=float(it["preco"]), format="%.2f")
-        subtotal = st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']
-        c5.write(f"Subtotal: <b>{_fmt_brl_num(subtotal)}</b>", unsafe_allow_html=True)
-        if c6.button("🗑️", key=f"rm_{idx}"):
-            st.session_state["cart"].pop(idx)
-            st.experimental_rerun()
+    c1, c2, c3, c4 = st.columns([1,1,1,1])
+    with c1: data_c = st.date_input("Data da compra", value=date.today())
+    with c2: qtd    = st.text_input("Qtd", placeholder="Ex.: 10")
+    with c3: custo  = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50")
+    with c4: unid   = st.text_input("Unidade", value=unid_sug or "un")
 
-    st.markdown("---")
-    total_itens = sum(i["qtd"] for i in st.session_state["cart"])
-    total_bruto = sum(i["qtd"]*i["preco"] for i in st.session_state["cart"])
+    fornecedor = st.text_input("Fornecedor", value=forn_sug)
+    obs        = st.text_input("Observações (opcional)")
+    salvar     = st.form_submit_button("➕ Registrar entrada", use_container_width=True)
 
-    cL, cR = st.columns([2, 1.2])
-    with cL:
-        formas = ["Dinheiro","Pix","Cartão Débito","Cartão Crédito","Fiado","Outros"]
-        idx_forma = formas.index(st.session_state["forma"]) if st.session_state["forma"] in formas else 0
-        st.session_state["forma"] = st.selectbox("Forma de pagamento", formas, index=idx_forma)
+if salvar:
+    if not prod_nome.strip():
+        st.error("Selecione ou digite um produto."); st.stop()
+    qtd_f = _to_float(qtd); cst_f = _to_float(custo)
+    if qtd_f in ("", None) or cst_f in ("", None):
+        st.error("Preencha **Qtd** e **Custo unitário**."); st.stop()
 
-        if st.session_state["forma"] == "Fiado":
-            clientes_existentes = _carregar_clientes()
-            usar_lista = st.checkbox("Selecionar cliente cadastrado", value=True)
+    # estoque antes (antes de gravar)
+    estoque_antes = _estoque_atual(pid=_nz(prod_id), nome=_nz(prod_nome))
+    estoque_depois = estoque_antes + float(qtd_f)
 
-            if usar_lista and clientes_existentes:
-                sel_cli = st.selectbox("Cliente (lista)", ["(selecione)"] + clientes_existentes, index=0)
-                novo_cli = st.text_input("Ou cadastrar novo cliente", value="")
-                st.session_state["cliente"] = (novo_cli.strip() or (sel_cli if sel_cli != "(selecione)" else "")).strip()
-            else:
-                st.session_state["cliente"] = st.text_input("Cliente (obrigatório para Fiado)", value=st.session_state["cliente"])
+    ws_compras = _ensure_ws(COMPRAS_ABA, COMPRAS_HEADERS)
+    ws_mov     = _ensure_ws(MOVS_ABA,     MOV_HEADERS)
 
-            st.session_state["venc_fiado"] = st.date_input("Vencimento do fiado", value=st.session_state["venc_fiado"])
-        else:
-            st.session_state["cliente"] = st.text_input("Cliente (opcional)", value=st.session_state["cliente"])
+    total = round(float(qtd_f) * float(cst_f), 2)
+    data_str = data_c.strftime("%d/%m/%Y")
 
-        st.session_state["obs"]   = st.text_input("Observações (opcional)", value=st.session_state["obs"])
-    with cR:
-        st.session_state["desc"]  = st.number_input("Desconto (R$)", min_value=0.0, value=float(st.session_state["desc"]), step=0.5, format="%.2f")
-        total_liq = max(0.0, total_bruto - float(st.session_state["desc"]))
-        st.metric("Total itens", total_itens)
-        st.metric("Total bruto", _fmt_brl_num(total_bruto))
-        st.metric("Total líquido", _fmt_brl_num(total_liq))
+    _append_row(ws_compras, {
+        "Data": data_str,
+        "Produto": _nz(prod_nome),
+        "Unidade": _nz(unid),
+        "Fornecedor": _nz(fornecedor),
+        "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+        "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+        "Total": f"{total:.2f}".replace(".", ","),
+        "IDProduto": _nz(prod_id),
+        "Obs": _nz(obs)
+    })
+    _append_row(ws_mov, {
+        "Data": data_str,
+        "IDProduto": _nz(prod_id),
+        "Produto": _nz(prod_nome),
+        "Tipo": "B entrada",
+        "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+        "Obs": ("Compra — " + _nz(obs)).strip(" —"),
+        "ID": "",
+        "Documento/NF": "",
+        "Origem": "Compras / Entradas",
+        "SaldoApós": str(int(estoque_depois)) if float(estoque_depois).is_integer() else str(estoque_depois).replace(".", ",")
+    })
 
-    colA, colB = st.columns([1, 1])
-    if colA.button("🧾 Registrar venda", type="primary", use_container_width=True):
-        if not st.session_state["cart"]:
-            st.warning("Carrinho vazio.")
-        else:
-            if st.session_state["forma"] == "Fiado" and not st.session_state["cliente"].strip():
-                st.error("Informe o Cliente para registrar fiado."); st.stop()
+    # ---- Telegram ----
+    msg = (
+        "🧾 <b>Entrada de estoque registrada</b>\n"
+        f"{data_str}\n"
+        f"Produto: <b>{_nz(prod_nome)}</b>\n"
+        f"Qtd: <b>{int(qtd_f) if float(qtd_f).is_integer() else qtd_f}</b> {_nz(unid) or 'un'}\n"
+        f"Custo unit.: <b>{_fmt_brl(float(cst_f))}</b>\n"
+        f"Total: <b>{_fmt_brl(total)}</b>\n"
+        + (f"Fornecedor: {_nz(fornecedor)}\n" if _nz(fornecedor) else "")
+        + (f"📦 Estoque: {int(estoque_antes)} → <b>{int(estoque_depois)}</b>\n" if isinstance(estoque_antes, (int,float)) else "")
+        + (f"Obs.: {_nz(obs)}" if _nz(obs) else "")
+    )
+    _tg_send(msg)
 
-            sh = conectar_sheets()
-
-            # garante aba Vendas
-            try:
-                ws_v = sh.worksheet(ABA_VEND)
-            except Exception:
-                ws_v = sh.add_worksheet(title=ABA_VEND, rows=2000, cols=16)
-                ws_v.update("A1:K1", [["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"]])
-
-            dfv = get_as_dataframe(ws_v, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
-            if dfv.empty:
-                dfv = pd.DataFrame(columns=["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"])
-            dfv.columns = [c.strip() for c in dfv.columns]
-            for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
-                if c not in dfv.columns: dfv[c] = None
-
-            # identifica worksheet de Produtos p/ atualizar estoque
-            ws_p = sh.worksheet(ABA_PROD)
-            headers_p = [h.strip() for h in ws_p.row_values(1)]
-            col_idx_estoque = headers_p.index(col_estoque)+1 if col_estoque and col_estoque in headers_p else None
-            col_idx_id      = headers_p.index(col_id)+1 if col_id in headers_p else None
-
-            venda_id = "V-" + datetime.now().strftime("%Y%m%d%H%M%S")
-            data_str = st.session_state["data_venda"].strftime("%d/%m/%Y")
-            desconto = float(st.session_state["desc"])
-            total_cupom = max(0.0, total_bruto - desconto)
-
-            # ---- FIADO: garante cliente e cria título
-            fiado_id = ""
-            fiado_msg = ""
-            if st.session_state["forma"] == "Fiado":
-                cli_nome = st.session_state.get("cliente","").strip()
-
-                ws_cli = _garantir_aba(sh, ABA_CLIENTES, COLS_CLIENTES)
-                try:
-                    dfc = carregar_aba(ABA_CLIENTES)
-                except Exception:
-                    dfc = pd.DataFrame(columns=COLS_CLIENTES)
-                ja_tem = False
-                if not dfc.empty:
-                    col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-                    ja_tem = any(str(x).strip().lower() == cli_nome.lower() for x in dfc[col_cli].dropna())
-                if cli_nome and not ja_tem:
-                    _append_rows(ws_cli, [{"Cliente": cli_nome, "Telefone": "", "Obs": ""}])
-
-                ws_f = _garantir_aba(sh, ABA_FIADO, COLS_FIADO)
-                fiado_id = _gerar_id("F")
-                venc_str = st.session_state["venc_fiado"].strftime("%d/%m/%Y") if isinstance(st.session_state["venc_fiado"], date) else ""
-                linha_fiado = {
-                    "ID": fiado_id,
-                    "Data": data_str,
-                    "Cliente": cli_nome,
-                    "Valor": float(total_cupom),
-                    "Vencimento": venc_str,
-                    "Status": "Em aberto",
-                    "Obs": st.session_state.get("obs",""),
-                    "DataPagamento": "",
-                    "FormaPagamento": "",
-                    "ValorPago": ""
-                }
-                _append_rows(ws_f, [linha_fiado])
-                fiado_msg = f"\n💳 <b>Fiado</b> criado: <code>{fiado_id}</code>\n👤 Cliente: <b>{cli_nome}</b>\n📅 Vencimento: {venc_str}"
-
-            # ===== monta as linhas da venda (cria `novas`) =====
-            novas = []
-            # para Telegram bonito + estoque restante + lucro
-            stock_before_after = {}   # {pid: (before, after)}
-            lucro_total_venda = 0.0
-
-            # map de ID -> linha no dfp (para pegar row number no sheet)
-            dfp_index_by_id = {str(r[col_id]).strip(): i for i, r in dfp.iterrows()}
-
-            for it in st.session_state["cart"]:
-                pid = str(it["id"])
-                qtd = int(it["qtd"])
-                preco_unit = float(it["preco"])
-                subtotal = qtd * preco_unit
-                custo_unit = id_to_cost.get(pid, 0.0)
-                lucro_total_venda += _calc_profit(qtd, preco_unit, custo_unit)
-
-                # estoque antes/depois (se existir)
-                if col_estoque:
-                    before = id_to_stock.get(pid, None)
-                    if before is not None:
-                        after = max(0, before - qtd)
-                        stock_before_after[pid] = (before, after)
-                        # atualiza localmente p/ próximos itens (caso mesmo produto em múltiplas linhas)
-                        id_to_stock[pid] = after
-
-                novas.append({
-                    "Data": data_str,
-                    "VendaID": venda_id,
-                    "IDProduto": pid,
-                    "Qtd": str(qtd),
-                    "PrecoUnit": f"{preco_unit:.2f}".replace(".", ","),
-                    "TotalLinha": f"{subtotal:.2f}".replace(".", ","),
-                    "FormaPagto": st.session_state["forma"],
-                    "Obs": st.session_state["obs"],
-                    "Desconto": f"{desconto:.2f}".replace(".", ","),
-                    "TotalCupom": f"{total_cupom:.2f}".replace(".", ","),
-                    "CupomStatus": "OK",
-                    "Cliente": st.session_state.get("cliente",""),
-                    "FiadoID": fiado_id
-                })
-
-            # grava Vendas
-            df_novo = pd.concat([dfv, pd.DataFrame(novas)], ignore_index=True)
-            ws_v.clear()
-            set_with_dataframe(ws_v, df_novo)
-
-            # atualiza estoque no sheet Produtos (se coluna existir)
-            if col_idx_estoque and col_idx_id:
-                for it in st.session_state["cart"]:
-                    pid = str(it["id"])
-                    if pid in stock_before_after:
-                        row_dfp = dfp_index_by_id.get(pid, None)
-                        if row_dfp is not None:
-                            row_number = row_dfp + 2  # +1 header +1 1-based
-                            novo_estoque = max(0, stock_before_after[pid][1])
-                            try:
-                                ws_p.update_cell(row_number, col_idx_estoque, str(int(novo_estoque)))
-                            except Exception:
-                                pass  # não interrompe a venda
-
-            # limpa carrinho e força refresh
-            st.session_state["cart"] = []
-            st.cache_data.clear()
-            st.session_state["_force_refresh"] = True
-
-            # ===== monta texto de itens (com nome e estoque) =====
-            itens_txt = "\n".join(_render_item_line_enriquecido(x, id_to_name, stock_before_after) for x in novas)
-            cliente_txt = st.session_state.get("cliente","").strip()
-            cliente_linha = f"\n👤 Cliente: <b>{cliente_txt}</b>" if cliente_txt else ""
-
-            lucro_bloco = f"\n💰 Lucro (estimado): <b>{_fmt_brl_num(lucro_total_venda)}</b>" if col_custo else ""
-
-            # ===== resumo do dia (até agora) =====
-            try:
-                vend_all = carregar_aba(ABA_VEND)
-            except Exception:
-                vend_all = pd.DataFrame()
-
-            resumo_dia_txt = ""
-            if not vend_all.empty:
-                col_data_v  = _first_col(vend_all, ["Data"])
-                col_venda_v = _first_col(vend_all, ["VendaID"])
-                col_qtd_v   = _first_col(vend_all, ["Qtd","Quantidade"])
-                col_preco_v = _first_col(vend_all, ["PrecoUnit","Preço","PreçoUnitário","Preco"])
-                col_total_v = _first_col(vend_all, ["TotalCupom"])
-                if col_data_v and col_venda_v:
-                    hoje_str = date.today().strftime("%d/%m/%Y")
-                    dia = vend_all[vend_all[col_data_v]==hoje_str].copy()
-                    if not dia.empty:
-                        # totais
-                        dia["_qtd"]   = dia[col_qtd_v].map(_to_num) if col_qtd_v else 0.0
-                        dia["_preco"] = dia[col_preco_v].map(_to_num) if col_preco_v else 0.0
-                        dia["_total"] = dia[col_total_v].map(_to_num) if col_total_v else (dia["_qtd"]*dia["_preco"])
-                        # por cupom
-                        cupons = dia.groupby(col_venda_v, dropna=False)["_total"].max().sum()
-                        total_desc = 0.0
-                        if "Desconto" in dia.columns:
-                            # desconto máximo por cupom
-                            total_desc = dia.groupby(col_venda_v)["Desconto"].max().map(_to_num).sum()
-                        total_bruto_dia = (dia["_qtd"]*dia["_preco"]).sum()
-                        total_liq_dia = cupons if cupons>0 else max(0.0, total_bruto_dia - total_desc)
-
-                        # lucro do dia (se houver custo)
-                        lucro_dia = 0.0
-                        if col_custo:
-                            dia["_pid"] = dia["IDProduto"] if "IDProduto" in dia.columns else dia.get("ProdutoID", "")
-                            for _, rr in dia.iterrows():
-                                pid = str(rr.get("_pid",""))
-                                qtdx = _to_num(rr.get("Qtd", 0))
-                                precx = _to_num(rr.get(col_preco_v, 0))
-                                cx = id_to_cost.get(pid, 0.0)
-                                lucro_dia += _calc_profit(qtdx, precx, cx)
-
-                        # top 3 produtos por quantidade
-                        top_txt = ""
-                        if "IDProduto" in dia.columns:
-                            topg = dia.groupby("IDProduto")["_qtd"].sum().sort_values(ascending=False).head(3)
-                            lines = []
-                            for pid, q in topg.items():
-                                nm = id_to_name.get(str(pid), str(pid))
-                                lines.append(f"• {nm} (#{pid}) — x{int(q)}")
-                            if lines:
-                                top_txt = "\n🏅 Top 3 (qtd):\n" + "\n".join(lines)
-
-                        resumo_lucro = f"\n💰 Lucro (estimado): <b>{_fmt_brl_num(lucro_dia)}</b>" if col_custo else ""
-                        resumo_dia_txt = (
-                            "\n\n📊 <b>Resumo do dia (até agora)</b>\n"
-                            f"Bruto: {_fmt_brl_num(total_bruto_dia)}\n"
-                            f"Descontos: {_fmt_brl_num(total_desc)}\n"
-                            f"Líquido: <b>{_fmt_brl_num(total_liq_dia)}</b>"
-                            f"{resumo_lucro}"
-                            f"{top_txt}"
-                        )
-
-            # ===== card Telegram moderno =====
-            msg = (
-                f"🧾 <b>Venda registrada</b>\n"
-                f"#{venda_id} • {data_str}\n"
-                f"Forma: <b>{st.session_state['forma']}</b>"
-                f"{cliente_linha}\n"
-                f"{'-'*24}\n"
-                f"{itens_txt}\n"
-                f"{'-'*24}\n"
-                f"{'Desconto: ' + _fmt_brl_num(desconto) + '\\n' if desconto>0 else ''}"
-                f"Total: <b>{_fmt_brl_num(total_cupom)}</b>"
-                f"{lucro_bloco}"
-                f"{fiado_msg}"
-                f"{resumo_dia_txt}"
-            )
-            _tg_send(msg)
-
-            if fiado_id:
-                st.success(f"Venda registrada ({venda_id}) e Fiado criado/vinculado (ID {fiado_id}, total {_fmt_brl_num(total_cupom)}).")
-            else:
-                st.success(f"Venda registrada ({venda_id})!")
-
-    if colB.button("🧹 Limpar carrinho", use_container_width=True):
-        st.session_state["cart"] = []
-        st.info("Carrinho limpo.")
+    st.success("Entrada registrada com sucesso! ✅")
+    st.toast("Compra lançada", icon="✅")
 
 st.divider()
-
-# ================= Histórico de cupons =================
-st.subheader("Histórico (últimos 10 cupons)")
-try:
-    vend = carregar_aba(ABA_VEND)
-except Exception:
-    vend = pd.DataFrame()
-
-if vend.empty:
-    st.info("Ainda não há vendas registradas.")
-else:
-    col_data  = _first_col(vend, ["Data"])
-    col_idp   = _first_col(vend, ["IDProduto","ProdutoID","ID"])
-    col_qtd   = _first_col(vend, ["Qtd","Quantidade","Qtde","Qde"])
-    col_preco = _first_col(vend, ["PrecoUnit","PreçoUnitário","Preço","Preco"])
-    col_venda = _first_col(vend, ["VendaID","Pedido","Cupom"])
-    col_forma = _first_col(vend, ["FormaPagto","FormaPagamento","Pagamento","Forma"])
-
-    vend["_Bruto"] = vend.apply(
-        lambda r: _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns
-        else (_to_num(r.get(col_qtd))*_to_num(r.get(col_preco)) if col_qtd and col_preco else 0.0), axis=1
-    )
-    vend["_Desc"]  = vend["Desconto"].map(_to_num) if "Desconto" in vend.columns else 0.0
-    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if "TotalCupom" in vend.columns else (vend["_Bruto"])
-
-    grp = vend.groupby(col_venda, dropna=False).agg({
-        col_data: "first",
-        col_forma: "first",
-        "_Bruto": "sum",
-        "_Desc": "max",
-        "_TotalC": "max",
-        "Obs": "first"
-    }).reset_index().rename(columns={col_venda:"VendaID", col_data:"Data", col_forma:"Forma"})
-
-    try:
-        grp["_ord"] = pd.to_datetime(grp["Data"], format="%d/%m/%Y", errors="coerce")
-    except Exception:
-        grp["_ord"] = pd.NaT
-    grp = grp.sort_values(["_ord","VendaID"], ascending=[False, False]).head(10).reset_index(drop=True)
-
-    for i, row in grp.iterrows():
-        b1, b2, b3, b4, _ = st.columns([1.8, 1.2, 1.2, 1.5, 2.2])
-        # Card mais amigável na UI
-        b1.write(f"**#{row['VendaID']}**")
-        b2.write(row["Data"])
-        b3.write(row["Forma"] if pd.notna(row["Forma"]) else "—")
-        bruto = row["_Bruto"]; desc = row["_Desc"]; total = row["_TotalC"] if row["_TotalC"]>0 else (bruto - desc)
-        b4.markdown(f"<div style='padding:4px 8px;border-radius:8px;background:#111;border:1px solid #333;display:inline-block'>{_fmt_brl_num(total)}</div>", unsafe_allow_html=True)
-        cancelado = str(row.get("Obs","")).upper().startswith("ESTORNO DE") or str(row["VendaID"]).startswith("CN-")
-
-        c1, c2, c3 = st.columns([0.9, 0.9, 4])
-
-        def _carrega_carrinho(venda_id):
-            linhas = vend[vend[col_venda]==venda_id].copy()
-            cart = []
-            for _, r in linhas.iterrows():
-                cart.append({
-                    "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "nome": "",  # opcional
-                    "unid": "un",
-                    "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
-                    "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
-                })
-            st.session_state["prefill_cart"] = {
-                "cart": cart,
-                "forma": row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro",
-                "obs": "",
-                "data": date.today(),
-                "desc": float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
-            }
-            st.experimental_rerun()
-
-        def _cancelar_cupom(venda_id):
-            if str(venda_id).startswith("CN-"):
-                st.warning("Esse cupom já é um estorno."); return
-            if any(str(x).startswith(f"CN-{venda_id}") for x in vend[col_venda].unique()):
-                st.warning("Estorno já registrado para esse cupom."); return
-
-            linhas = vend[vend[col_venda]==venda_id].copy()
-            if linhas.empty:
-                st.warning("Cupom não encontrado."); return
-
-            sh = conectar_sheets()
-            ws = sh.worksheet(ABA_VEND)
-            dfv2 = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
-            dfv2.columns = [c.strip() for c in dfv2.columns]
-            for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
-                if c not in dfv2.columns: dfv2[c] = None
-
-            cn_id = f"CN-{venda_id}"
-            data_str = date.today().strftime("%d/%m/%Y")
-            novas = []
-            total_estorno = 0.0
-            for _, r in linhas.iterrows():
-                qtd = -abs(_to_num(r[col_qtd])) if col_qtd else -1
-                preco = _to_num(r[col_preco]) if col_preco else 0.0
-                total_linha = qtd * preco
-                total_estorno += total_linha
-                novas.append({
-                    "Data": data_str,
-                    "VendaID": cn_id,
-                    "IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "Qtd": str(int(qtd)),
-                    "PrecoUnit": f"{preco:.2f}".replace(".", ","),
-                    "TotalLinha": f"{total_linha:.2f}".replace(".", ","),
-                    "FormaPagto": f"Estorno - {str(r.get('FormaPagto') or row['Forma'] or 'Dinheiro')}",
-                    "Obs": f"ESTORNO DE {venda_id}",
-                    "Desconto": "0,00",
-                    "TotalCupom": "0,00",
-                    "CupomStatus": "ESTORNO",
-                    "Cliente": str(r.get("Cliente") or ""),
-                    "FiadoID": ""  # estorno não herda fiado
-                })
-
-            df_novo2 = pd.concat([dfv2, pd.DataFrame(novas)], ignore_index=True)
-            ws.clear()
-            set_with_dataframe(ws, df_novo2)
-            st.cache_data.clear()
-            st.session_state["_force_refresh"] = True
-
-            # Telegram do estorno (enxuto)
-            itens_txt_estorno = "\n".join(
-                _render_item_line_enriquecido(x, id_to_name, {}) for x in novas
-            )
-            cliente_est = ""
-            if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty:
-                cliente_est = str(linhas["Cliente"].dropna().iloc[0])
-            cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
-            msg = (
-                f"⛔ <b>Estorno lançado</b>\n"
-                f"ID: <code>{cn_id}</code>\n"
-                f"De: <code>{venda_id}</code>\n"
-                f"Data: {data_str}\n"
-                f"Valor estorno (linhas): <b>{_fmt_brl_num(abs(total_estorno))}</b>"
-                f"{cliente_linha}\n"
-                f"{'-'*24}\n"
-                f"{itens_txt_estorno}"
-            )
-            _tg_send(msg)
-
-            st.success(f"Estorno lançado ({cn_id}).")
-
-        c1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_carrega_carrinho, args=(row["VendaID"],))
-        c2.button("⛔ Cancelar", key=f"cn_{i}", disabled=cancelado, on_click=_cancelar_cupom, args=(row["VendaID"],))
-        c3.caption(row.get("Obs","") if isinstance(row.get("Obs",""), str) else "")
-        st.markdown("---")
+st.page_link("pages/02_cadastrar_produto.py", label="↩️ Voltar ao Cadastro/Editar", icon="➕")
+st.page_link("pages/01_produtos.py", label="📦 Ir ao Catálogo", icon="📦")
