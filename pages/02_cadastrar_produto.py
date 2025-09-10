@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos
+# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos (com Telegram igual ao 00_vendas.py)
 import json, unicodedata, math
 import streamlit as st
 import pandas as pd
@@ -7,6 +7,7 @@ import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, date
+import requests  # Telegram
 
 st.set_page_config(page_title="Cadastrar/Editar Produto", page_icon="➕", layout="wide")
 st.title("➕ Cadastrar / Editar Produto")
@@ -104,6 +105,38 @@ def _append_row(ws, row: dict):
     out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+def _fmt_money(v) -> str:
+    try:
+        return f"R$ {float(v):.2f}".replace(".", ",")
+    except:
+        return str(v)
+
+# =============================================================================
+# Telegram — MESMO PADRÃO DO 00_vendas.py
+# =============================================================================
+def _tg_enabled() -> bool:
+    try:
+        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
+    except Exception:
+        return False
+
+def _tg_conf():
+    token = st.secrets.get("TELEGRAM_TOKEN", "")
+    # usa LOJINHA primeiro (como no 00_vendas.py); fallback para TELEGRAM_CHAT_ID
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
+    return token, chat_id
+
+def _tg_send(msg: str):
+    if not _tg_enabled(): return
+    token, chat_id = _tg_conf()
+    if not token or not chat_id: return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
+        requests.post(url, json=payload, timeout=6)
+    except Exception:
+        pass
 
 # =============================================================================
 # Mapeamentos flexíveis
@@ -396,6 +429,18 @@ if modo == "Editar existente":
             if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
             if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
 
+            # >>> Telegram (compra/entrada na edição) — igual 00_vendas.py
+            msg = (
+                "🧾 <b>Compra/Entrada registrada</b>\n"
+                f"<b>Produto:</b> {nome}\n"
+                f"<b>Qtd:</b> {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
+                f"<b>Custo unit.:</b> {_fmt_money(cst_f)}\n"
+                f"<b>Total:</b> {_fmt_money(total)}\n"
+                f"<b>Fornecedor:</b> {(forn_compra_e or '').strip() or '—'}\n"
+                f"<b>Data:</b> {data_compra_e.strftime('%d/%m/%Y')}"
+            )
+            _tg_send(msg)
+
         # Recalc automáticos (estoque min, lead etc.)
         if recalc_auto or fazer_compra_e:
             custo_prev, unid_prev = _last_cost_and_unit(nome, fornecedor)
@@ -526,6 +571,25 @@ else:
             new_row.setdefault(col, "")
         df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
         set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+        # >>> Telegram (cadastro de novo produto) — igual 00_vendas.py
+        msg = (
+            "➕ <b>Novo produto cadastrado</b>\n"
+            f"<b>Nome:</b> {nome.strip()}\n"
+            f"<b>Categoria:</b> {categoria.strip() or '—'}\n"
+            f"<b>Fornecedor:</b> {fornecedor.strip() or '—'}\n"
+            f"<b>Preço venda:</b> {_fmt_money(pf)}\n"
+            f"<b>ID:</b> {new_row.get(COL['id'], novo_id)}"
+        )
+        if fazer_compra:
+            msg += (
+                "\n<b>Estoque inicial:</b>\n"
+                f"• Qtd: {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
+                f"• Custo unit.: {_fmt_money(cst_f)}\n"
+                f"• Total: {_fmt_money(float(qtd_f)*float(cst_f))}\n"
+                f"• Data: {data_compra.strftime('%d/%m/%Y')}"
+            )
+        _tg_send(msg)
 
         _msg_ok("Produto cadastrado com sucesso! ✅")
         st.toast("Cadastro concluído", icon="✅")
