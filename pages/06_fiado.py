@@ -46,6 +46,32 @@ def conectar_sheets():
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
 # =========================
+# Telegram
+# =========================
+def _tg_enabled() -> bool:
+    try:
+        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
+    except Exception:
+        return False
+
+def _tg_conf():
+    token = st.secrets.get("TELEGRAM_TOKEN", "")
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
+    return token, chat_id
+
+def _tg_send(msg: str):
+    if not _tg_enabled(): return
+    token, chat_id = _tg_conf()
+    if not token or not chat_id: return
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
+        requests.post(url, json=payload, timeout=6)
+    except Exception:
+        pass
+
+# =========================
 # Utils
 # =========================
 def _norm_key(s: str) -> str:
@@ -242,6 +268,21 @@ with tab_novo:
             "ValorPago": ""
         }
         append_rows(ws_fiado, [linha])
+
+        # --- Telegram: novo fiado ---
+        try:
+            msg = (
+                "💳 <b>Novo fiado lançado</b>\n"
+                f"Cliente: <b>{cliente_final}</b>\n"
+                f"Data: {linha['Data']}\n"
+                f"Valor: <b>{_fmt_brl(linha['Valor'])}</b>\n"
+                + (f"Venc.: {linha['Vencimento']}\n" if linha.get("Vencimento") else "")
+                + (f"Obs.: {linha.get('Obs','')}\n" if linha.get('Obs') else "")
+            )
+            _tg_send(msg)
+        except Exception:
+            pass
+
         st.success(f"Fiado lançado para **{cliente_final}** no valor de **{_fmt_brl(valor)}** (ID {fid}).")
         st.cache_data.clear()
 
@@ -297,9 +338,10 @@ with tab_quitar:
                 ws_pagt  = garantir_aba(sh, ABA_PAGT,  COLS_PAGT)
 
                 # atualiza linhas selecionadas
+                df_sel = df_fiado[df_fiado["ID"].isin(ids_sel)].copy()
                 cmap = col_map(ws_fiado)
                 updates = []
-                for _, row in df_fiado[df_fiado["ID"].isin(ids_sel)].iterrows():
+                for _, row in df_sel.iterrows():
                     idx = int(row.name) + 2  # cabeçalho na linha 1
                     # campos a escrever
                     pairs = {
@@ -328,6 +370,42 @@ with tab_quitar:
                 }])
 
                 st.success(f"Pagamento registrado: **{_fmt_brl(total_sel)}** ({forma}).")
+
+                # --- Telegram: pagamento fiado ---
+                try:
+                    # Recalcula o saldo em aberto do cliente após o pagamento (se um único cliente informado)
+                    saldo_restante = None
+                    if cli:
+                        df_fiado_after = load_df(ABA_FIADO)  # recarrega
+                        df_fiado_after["ValorNum"] = df_fiado_after["Valor"].apply(_to_float)
+                        aberto_cli = df_fiado_after[
+                            (df_fiado_after["Cliente"].astype(str)==cli) &
+                            (df_fiado_after["Status"].astype(str).str.lower()=="em aberto")
+                        ]
+                        saldo_restante = float(aberto_cli["ValorNum"].sum()) if not aberto_cli.empty else 0.0
+
+                    # Monta linhas quitadas sem expor ID (se quiser IDs, inclua r['ID'])
+                    itens_txt = "\n".join(
+                        f"• {r['Data']} — {_fmt_brl(_to_float(r['Valor']))}"
+                        + (f" — Venc.: {r.get('Vencimento','')}" if r.get("Vencimento") else "")
+                        for _, r in df_sel.iterrows()
+                    )
+
+                    msg = (
+                        "✅ <b>Pagamento de fiado registrado</b>\n"
+                        f"Cliente: <b>{(cli or '(vários)')}</b>\n"
+                        f"Data: {data_pag.strftime('%d/%m/%Y')}\n"
+                        f"Forma: <b>{forma}</b>\n"
+                        f"Total pago: <b>{_fmt_brl(total_sel)}</b>\n"
+                        f"{'-'*24}\n"
+                        f"{itens_txt}\n"
+                        + (f"{'-'*24}\nSaldo restante do cliente: <b>{_fmt_brl(saldo_restante)}</b>\n" if saldo_restante is not None else "")
+                        + (f"Obs.: {obs_pag}" if obs_pag else "")
+                    )
+                    _tg_send(msg)
+                except Exception:
+                    pass
+
                 st.cache_data.clear()
 
 # ---------- EM ABERTO ----------
@@ -360,7 +438,7 @@ with tab_abertos:
         em_aberto["Venc_d"] = em_aberto["Vencimento"].apply(_as_date)
         em_aberto["AtrasoDias"] = em_aberto["Venc_d"].apply(lambda d: (hoje - d).days if (d and hoje>d) else 0)
         if so_vencidos:
-            em_aberto = em_aberto[em_aberto["AtrasoDias"] > 0]
+            em_aberto = em_aberto["AtrasoDias"].gt(0)
 
         # resumo por cliente
         resumo = em_aberto.groupby("Cliente", as_index=False)["ValorNum"].sum().rename(columns={"ValorNum":"Total"})
