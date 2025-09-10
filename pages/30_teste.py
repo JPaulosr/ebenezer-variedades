@@ -1,4 +1,4 @@
-# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar) — COM FIADO + TELEGRAM
+# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar) — COM FIADO + TELEGRAM + ESTOQUE + RESUMO DO DIA
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date, timedelta
@@ -112,13 +112,34 @@ def _tg_send(msg: str):
     except Exception:
         pass
 
-# helper para exibir linhas de item (corrige KeyError)
-def _render_item_line(x: dict) -> str:
+# ---------------- Mapas de produto (nome, custo, estoque) ----------------
+def _build_prod_maps(dfp, col_id, col_nome, col_custo, col_estoque):
+    id_to_name = {}
+    id_to_cost = {}
+    id_to_stock = {}
+    for _, r in dfp.iterrows():
+        pid = str(r[col_id]).strip()
+        if pid:
+            id_to_name[pid] = str(r.get(col_nome, "") or "").strip()
+            if col_custo:  id_to_cost[pid]  = _to_num(r.get(col_custo))
+            if col_estoque: id_to_stock[pid] = _to_num(r.get(col_estoque))
+    return id_to_name, id_to_cost, id_to_stock
+
+def _calc_profit(qtd, preco_unit, custo_unit) -> float:
+    return float(qtd) * (float(preco_unit) - float(custo_unit))
+
+# helper para exibir linhas de item no Telegram (com nome e subtotal e estoque)
+def _render_item_line_enriquecido(x: dict, id_to_name: dict, stock_before_after: dict, id_key="IDProduto") -> str:
     pid   = x.get("IDProduto") or x.get("ProdutoID") or x.get("ID") or x.get("id") or "?"
     qtd   = int(_to_num(x.get("Qtd") if "Qtd" in x else x.get("qtd", 1)))
     preco = _to_num(x.get("PrecoUnit") if "PrecoUnit" in x else x.get("preco", 0))
-    return f"• {pid} x{qtd} @ {_fmt_brl_num(preco)}"
-# ---------------------------
+    nome  = id_to_name.get(str(pid), str(pid))
+    subtotal = qtd * preco
+    estoque_txt = ""
+    if pid in stock_before_after:
+        bef, aft = stock_before_after[pid]
+        estoque_txt = f" — <i>estoque: {int(bef)}</i> → <b>{int(aft)}</b>"
+    return f"• <b>{nome}</b> (#{pid}) — x{qtd} @ {_fmt_brl_num(preco)} = <b>{_fmt_brl_num(subtotal)}</b>{estoque_txt}"
 
 # ================= Abas principais =================
 ABA_PROD, ABA_VEND = "Produtos", "Vendas"
@@ -149,8 +170,14 @@ col_id   = _first_col(dfp, ["ID","Codigo","Código","SKU"])
 col_nome = _first_col(dfp, ["Nome","Produto","Descrição"])
 col_preco= _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"])
 col_unid = _first_col(dfp, ["Unidade","Und"])
+col_estoque = _first_col(dfp, ["Estoque","QtdEstoque","EstoqueAtual","Estoque atual","Saldo"])
+col_custo   = _first_col(dfp, ["Custo","PreçoCusto","PrecoCusto","CustoUnit","Custo Unidade"])
+
 if not col_id or not col_nome:
     st.error("A aba Produtos precisa ter colunas de ID e Nome."); st.stop()
+
+# mapas auxiliares
+id_to_name, id_to_cost, id_to_stock = _build_prod_maps(dfp, col_id, col_nome, col_custo, col_estoque)
 
 dfp["_label"] = dfp.apply(lambda r: f"{str(r[col_id])} — {str(r[col_nome])}", axis=1)
 cat_map = dfp.set_index("_label")[[col_id, col_nome, col_preco, col_unid]].to_dict("index")
@@ -217,14 +244,15 @@ if not st.session_state["cart"]:
     st.info("Nenhum item no carrinho.")
 else:
     for idx, it in enumerate(st.session_state["cart"]):
-        c1, c2, c3, c4, c5, c6 = st.columns([1.8, 3, 1, 1.4, 1.6, 0.8])
-        c1.write(it["id"])
-        c2.write(it["nome"])
+        c1, c2, c3, c4, c5, c6 = st.columns([1.3, 3.2, 1, 1.4, 1.6, 0.8])
+        c1.write(f"#{it['id']}")
+        c2.write(f"**{it['nome']}**")
         with c3:
             st.session_state["cart"][idx]["qtd"] = st.number_input("Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"]))
         with c4:
             st.session_state["cart"][idx]["preco"] = st.number_input("Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=float(it["preco"]), format="%.2f")
-        c5.write(f"Subtotal: { _fmt_brl_num(st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']) }")
+        subtotal = st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']
+        c5.write(f"Subtotal: <b>{_fmt_brl_num(subtotal)}</b>", unsafe_allow_html=True)
         if c6.button("🗑️", key=f"rm_{idx}"):
             st.session_state["cart"].pop(idx)
             st.experimental_rerun()
@@ -271,19 +299,26 @@ else:
                 st.error("Informe o Cliente para registrar fiado."); st.stop()
 
             sh = conectar_sheets()
+
             # garante aba Vendas
             try:
-                ws = sh.worksheet(ABA_VEND)
+                ws_v = sh.worksheet(ABA_VEND)
             except Exception:
-                ws = sh.add_worksheet(title=ABA_VEND, rows=2000, cols=14)
-                ws.update("A1:K1", [["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"]])
+                ws_v = sh.add_worksheet(title=ABA_VEND, rows=2000, cols=16)
+                ws_v.update("A1:K1", [["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"]])
 
-            dfv = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
+            dfv = get_as_dataframe(ws_v, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
             if dfv.empty:
                 dfv = pd.DataFrame(columns=["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"])
             dfv.columns = [c.strip() for c in dfv.columns]
             for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
                 if c not in dfv.columns: dfv[c] = None
+
+            # identifica worksheet de Produtos p/ atualizar estoque
+            ws_p = sh.worksheet(ABA_PROD)
+            headers_p = [h.strip() for h in ws_p.row_values(1)]
+            col_idx_estoque = headers_p.index(col_estoque)+1 if col_estoque and col_estoque in headers_p else None
+            col_idx_id      = headers_p.index(col_id)+1 if col_id in headers_p else None
 
             venda_id = "V-" + datetime.now().strftime("%Y%m%d%H%M%S")
             data_str = st.session_state["data_venda"].strftime("%d/%m/%Y")
@@ -308,7 +343,7 @@ else:
                 if cli_nome and not ja_tem:
                     _append_rows(ws_cli, [{"Cliente": cli_nome, "Telefone": "", "Obs": ""}])
 
-                ws_fiado = _garantir_aba(sh, ABA_FIADO, COLS_FIADO)
+                ws_f = _garantir_aba(sh, ABA_FIADO, COLS_FIADO)
                 fiado_id = _gerar_id("F")
                 venc_str = st.session_state["venc_fiado"].strftime("%d/%m/%Y") if isinstance(st.session_state["venc_fiado"], date) else ""
                 linha_fiado = {
@@ -323,19 +358,42 @@ else:
                     "FormaPagamento": "",
                     "ValorPago": ""
                 }
-                _append_rows(ws_fiado, [linha_fiado])
+                _append_rows(ws_f, [linha_fiado])
                 fiado_msg = f"\n💳 <b>Fiado</b> criado: <code>{fiado_id}</code>\n👤 Cliente: <b>{cli_nome}</b>\n📅 Vencimento: {venc_str}"
 
             # ===== monta as linhas da venda (cria `novas`) =====
             novas = []
+            # para Telegram bonito + estoque restante + lucro
+            stock_before_after = {}   # {pid: (before, after)}
+            lucro_total_venda = 0.0
+
+            # map de ID -> linha no dfp (para pegar row number no sheet)
+            dfp_index_by_id = {str(r[col_id]).strip(): i for i, r in dfp.iterrows()}
+
             for it in st.session_state["cart"]:
+                pid = str(it["id"])
+                qtd = int(it["qtd"])
+                preco_unit = float(it["preco"])
+                subtotal = qtd * preco_unit
+                custo_unit = id_to_cost.get(pid, 0.0)
+                lucro_total_venda += _calc_profit(qtd, preco_unit, custo_unit)
+
+                # estoque antes/depois (se existir)
+                if col_estoque:
+                    before = id_to_stock.get(pid, None)
+                    if before is not None:
+                        after = max(0, before - qtd)
+                        stock_before_after[pid] = (before, after)
+                        # atualiza localmente p/ próximos itens (caso mesmo produto em múltiplas linhas)
+                        id_to_stock[pid] = after
+
                 novas.append({
                     "Data": data_str,
                     "VendaID": venda_id,
-                    "IDProduto": it["id"],
-                    "Qtd": str(int(it["qtd"])),
-                    "PrecoUnit": f"{float(it['preco']):.2f}".replace(".", ","),
-                    "TotalLinha": f"{it['qtd']*it['preco']:.2f}".replace(".", ","),
+                    "IDProduto": pid,
+                    "Qtd": str(qtd),
+                    "PrecoUnit": f"{preco_unit:.2f}".replace(".", ","),
+                    "TotalLinha": f"{subtotal:.2f}".replace(".", ","),
                     "FormaPagto": st.session_state["forma"],
                     "Obs": st.session_state["obs"],
                     "Desconto": f"{desconto:.2f}".replace(".", ","),
@@ -347,29 +405,111 @@ else:
 
             # grava Vendas
             df_novo = pd.concat([dfv, pd.DataFrame(novas)], ignore_index=True)
-            ws.clear()
-            set_with_dataframe(ws, df_novo)
+            ws_v.clear()
+            set_with_dataframe(ws_v, df_novo)
+
+            # atualiza estoque no sheet Produtos (se coluna existir)
+            if col_idx_estoque and col_idx_id:
+                for it in st.session_state["cart"]:
+                    pid = str(it["id"])
+                    if pid in stock_before_after:
+                        row_dfp = dfp_index_by_id.get(pid, None)
+                        if row_dfp is not None:
+                            row_number = row_dfp + 2  # +1 header +1 1-based
+                            novo_estoque = max(0, stock_before_after[pid][1])
+                            try:
+                                ws_p.update_cell(row_number, col_idx_estoque, str(int(novo_estoque)))
+                            except Exception:
+                                pass  # não interrompe a venda
 
             # limpa carrinho e força refresh
             st.session_state["cart"] = []
             st.cache_data.clear()
             st.session_state["_force_refresh"] = True
 
-            # ===== monta texto de itens APÓS criar `novas` =====
-            itens_txt = "\n".join(_render_item_line(x) for x in novas)
+            # ===== monta texto de itens (com nome e estoque) =====
+            itens_txt = "\n".join(_render_item_line_enriquecido(x, id_to_name, stock_before_after) for x in novas)
             cliente_txt = st.session_state.get("cliente","").strip()
             cliente_linha = f"\n👤 Cliente: <b>{cliente_txt}</b>" if cliente_txt else ""
+
+            lucro_bloco = f"\n💰 Lucro (estimado): <b>{_fmt_brl_num(lucro_total_venda)}</b>" if col_custo else ""
+
+            # ===== resumo do dia (até agora) =====
+            try:
+                vend_all = carregar_aba(ABA_VEND)
+            except Exception:
+                vend_all = pd.DataFrame()
+
+            resumo_dia_txt = ""
+            if not vend_all.empty:
+                col_data_v  = _first_col(vend_all, ["Data"])
+                col_venda_v = _first_col(vend_all, ["VendaID"])
+                col_qtd_v   = _first_col(vend_all, ["Qtd","Quantidade"])
+                col_preco_v = _first_col(vend_all, ["PrecoUnit","Preço","PreçoUnitário","Preco"])
+                col_total_v = _first_col(vend_all, ["TotalCupom"])
+                if col_data_v and col_venda_v:
+                    hoje_str = date.today().strftime("%d/%m/%Y")
+                    dia = vend_all[vend_all[col_data_v]==hoje_str].copy()
+                    if not dia.empty:
+                        # totais
+                        dia["_qtd"]   = dia[col_qtd_v].map(_to_num) if col_qtd_v else 0.0
+                        dia["_preco"] = dia[col_preco_v].map(_to_num) if col_preco_v else 0.0
+                        dia["_total"] = dia[col_total_v].map(_to_num) if col_total_v else (dia["_qtd"]*dia["_preco"])
+                        # por cupom
+                        cupons = dia.groupby(col_venda_v, dropna=False)["_total"].max().sum()
+                        total_desc = 0.0
+                        if "Desconto" in dia.columns:
+                            # desconto máximo por cupom
+                            total_desc = dia.groupby(col_venda_v)["Desconto"].max().map(_to_num).sum()
+                        total_bruto_dia = (dia["_qtd"]*dia["_preco"]).sum()
+                        total_liq_dia = cupons if cupons>0 else max(0.0, total_bruto_dia - total_desc)
+
+                        # lucro do dia (se houver custo)
+                        lucro_dia = 0.0
+                        if col_custo:
+                            dia["_pid"] = dia["IDProduto"] if "IDProduto" in dia.columns else dia.get("ProdutoID", "")
+                            for _, rr in dia.iterrows():
+                                pid = str(rr.get("_pid",""))
+                                qtdx = _to_num(rr.get("Qtd", 0))
+                                precx = _to_num(rr.get(col_preco_v, 0))
+                                cx = id_to_cost.get(pid, 0.0)
+                                lucro_dia += _calc_profit(qtdx, precx, cx)
+
+                        # top 3 produtos por quantidade
+                        top_txt = ""
+                        if "IDProduto" in dia.columns:
+                            topg = dia.groupby("IDProduto")["_qtd"].sum().sort_values(ascending=False).head(3)
+                            lines = []
+                            for pid, q in topg.items():
+                                nm = id_to_name.get(str(pid), str(pid))
+                                lines.append(f"• {nm} (#{pid}) — x{int(q)}")
+                            if lines:
+                                top_txt = "\n🏅 Top 3 (qtd):\n" + "\n".join(lines)
+
+                        resumo_lucro = f"\n💰 Lucro (estimado): <b>{_fmt_brl_num(lucro_dia)}</b>" if col_custo else ""
+                        resumo_dia_txt = (
+                            "\n\n📊 <b>Resumo do dia (até agora)</b>\n"
+                            f"Bruto: {_fmt_brl_num(total_bruto_dia)}\n"
+                            f"Descontos: {_fmt_brl_num(total_desc)}\n"
+                            f"Líquido: <b>{_fmt_brl_num(total_liq_dia)}</b>"
+                            f"{resumo_lucro}"
+                            f"{top_txt}"
+                        )
+
+            # ===== card Telegram moderno =====
             msg = (
                 f"🧾 <b>Venda registrada</b>\n"
-                f"ID: <code>{venda_id}</code>\n"
-                f"Data: {data_str}\n"
-                f"Forma: {st.session_state['forma']}\n"
+                f"#{venda_id} • {data_str}\n"
+                f"Forma: <b>{st.session_state['forma']}</b>"
+                f"{cliente_linha}\n"
+                f"{'-'*24}\n"
+                f"{itens_txt}\n"
+                f"{'-'*24}\n"
                 f"{'Desconto: ' + _fmt_brl_num(desconto) + '\\n' if desconto>0 else ''}"
                 f"Total: <b>{_fmt_brl_num(total_cupom)}</b>"
-                f"{cliente_linha}\n"
-                f"{'-'*18}\n"
-                f"{itens_txt}"
+                f"{lucro_bloco}"
                 f"{fiado_msg}"
+                f"{resumo_dia_txt}"
             )
             _tg_send(msg)
 
@@ -400,15 +540,13 @@ else:
     col_preco = _first_col(vend, ["PrecoUnit","PreçoUnitário","Preço","Preco"])
     col_venda = _first_col(vend, ["VendaID","Pedido","Cupom"])
     col_forma = _first_col(vend, ["FormaPagto","FormaPagamento","Pagamento","Forma"])
-    has_desc  = "Desconto"   in vend.columns
-    has_total = "TotalCupom" in vend.columns
 
     vend["_Bruto"] = vend.apply(
         lambda r: _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns
         else (_to_num(r.get(col_qtd))*_to_num(r.get(col_preco)) if col_qtd and col_preco else 0.0), axis=1
     )
-    vend["_Desc"]  = vend["Desconto"].map(_to_num) if has_desc else 0.0
-    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if has_total else (vend["_Bruto"])
+    vend["_Desc"]  = vend["Desconto"].map(_to_num) if "Desconto" in vend.columns else 0.0
+    vend["_TotalC"]= vend["TotalCupom"].map(_to_num) if "TotalCupom" in vend.columns else (vend["_Bruto"])
 
     grp = vend.groupby(col_venda, dropna=False).agg({
         col_data: "first",
@@ -426,12 +564,13 @@ else:
     grp = grp.sort_values(["_ord","VendaID"], ascending=[False, False]).head(10).reset_index(drop=True)
 
     for i, row in grp.iterrows():
-        b1, b2, b3, b4, _ = st.columns([1.5, 1.3, 1.2, 1.3, 2.2])
-        b1.write(f"**{row['VendaID']}**")
+        b1, b2, b3, b4, _ = st.columns([1.8, 1.2, 1.2, 1.5, 2.2])
+        # Card mais amigável na UI
+        b1.write(f"**#{row['VendaID']}**")
         b2.write(row["Data"])
         b3.write(row["Forma"] if pd.notna(row["Forma"]) else "—")
         bruto = row["_Bruto"]; desc = row["_Desc"]; total = row["_TotalC"] if row["_TotalC"]>0 else (bruto - desc)
-        b4.write(_fmt_brl_num(total))
+        b4.markdown(f"<div style='padding:4px 8px;border-radius:8px;background:#111;border:1px solid #333;display:inline-block'>{_fmt_brl_num(total)}</div>", unsafe_allow_html=True)
         cancelado = str(row.get("Obs","")).upper().startswith("ESTORNO DE") or str(row["VendaID"]).startswith("CN-")
 
         c1, c2, c3 = st.columns([0.9, 0.9, 4])
@@ -468,10 +607,10 @@ else:
 
             sh = conectar_sheets()
             ws = sh.worksheet(ABA_VEND)
-            dfv = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
-            dfv.columns = [c.strip() for c in dfv.columns]
+            dfv2 = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
+            dfv2.columns = [c.strip() for c in dfv2.columns]
             for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
-                if c not in dfv.columns: dfv[c] = None
+                if c not in dfv2.columns: dfv2[c] = None
 
             cn_id = f"CN-{venda_id}"
             data_str = date.today().strftime("%d/%m/%Y")
@@ -498,19 +637,20 @@ else:
                     "FiadoID": ""  # estorno não herda fiado
                 })
 
-            df_novo = pd.concat([dfv, pd.DataFrame(novas)], ignore_index=True)
+            df_novo2 = pd.concat([dfv2, pd.DataFrame(novas)], ignore_index=True)
             ws.clear()
-            set_with_dataframe(ws, df_novo)
+            set_with_dataframe(ws, df_novo2)
             st.cache_data.clear()
             st.session_state["_force_refresh"] = True
 
-            # Itens do estorno (APÓS criar `novas`)
-            itens_txt_estorno = "\n".join(_render_item_line(x) for x in novas)
+            # Telegram do estorno (enxuto)
+            itens_txt_estorno = "\n".join(
+                _render_item_line_enriquecido(x, id_to_name, {}) for x in novas
+            )
             cliente_est = ""
             if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty:
                 cliente_est = str(linhas["Cliente"].dropna().iloc[0])
             cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
-
             msg = (
                 f"⛔ <b>Estorno lançado</b>\n"
                 f"ID: <code>{cn_id}</code>\n"
@@ -518,7 +658,7 @@ else:
                 f"Data: {data_str}\n"
                 f"Valor estorno (linhas): <b>{_fmt_brl_num(abs(total_estorno))}</b>"
                 f"{cliente_linha}\n"
-                f"{'-'*18}\n"
+                f"{'-'*24}\n"
                 f"{itens_txt_estorno}"
             )
             _tg_send(msg)
