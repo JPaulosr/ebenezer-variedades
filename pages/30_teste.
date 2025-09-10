@@ -1,463 +1,368 @@
-# pages/06_fiado.py — Fiado simples para Ebenezér Variedades (com checkbox p/ clientes cadastrados e dedupe)
 # -*- coding: utf-8 -*-
-import json, unicodedata, re, difflib
-from datetime import datetime, date, timedelta
-
+# pages/04_estoque.py — Movimentos & Ajustes de Estoque (com normalização de tipos e refresh)
+import json, unicodedata as _ud, re
 import streamlit as st
 import pandas as pd
 import gspread
-from gspread_dataframe import get_as_dataframe
-from gspread.utils import rowcol_to_a1
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
+from datetime import date
 
-# ---- Config UI ----
-st.set_page_config(page_title="Fiado — Ebenezér Variedades", page_icon="💳", layout="wide")
-st.title("💳 Fiado — lançar, quitar e acompanhar")
+st.set_page_config(page_title="Estoque — Movimentos & Ajustes", page_icon="📦", layout="wide")
+st.title("📦 Estoque — Movimentos & Ajustes")
 
-# =========================
-# Autenticação / Sheets
-# =========================
+# ---- Refresh rápido (limpa cache e recarrega)
+if st.button("🔄 Atualizar estoques agora"):
+    st.cache_data.clear()
+    st.experimental_rerun()
+
+# ========= credenciais =========
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    # remove controles invisíveis (mantém \n \r \t)
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
+    key = "".join(ch for ch in key if _ud.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
     return key
 
-def _load_sa() -> dict:
+def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None:
-        st.error("🛑 GCP_SERVICE_ACCOUNT ausente no Secrets."); st.stop()
-    if isinstance(svc, str):
-        svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(str(svc["private_key"]))
+        st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+    if isinstance(svc, str): svc = json.loads(svc)
+    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
     return svc
 
 @st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
+def _client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL", "")
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def _sheet():
+    gc = _client()
+    url_or_id = st.secrets.get("PLANILHA_URL")
     if not url_or_id:
-        st.error("🛑 PLANILHA_URL ausente no Secrets."); st.stop()
+        st.error("🛑 PLANILHA_URL ausente."); st.stop()
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
-# =========================
-# Telegram
-# =========================
-def _tg_enabled() -> bool:
-    try:
-        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
-    except Exception:
-        return False
-
-def _tg_conf():
-    token = st.secrets.get("TELEGRAM_TOKEN", "")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
-    return token, chat_id
-
-def _tg_send(msg: str):
-    if not _tg_enabled(): return
-    token, chat_id = _tg_conf()
-    if not token or not chat_id: return
-    try:
-        import requests
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        requests.post(url, json=payload, timeout=6)
-    except Exception:
-        pass
-
-# =========================
-# Utils
-# =========================
-def _norm_key(s: str) -> str:
-    return unicodedata.normalize("NFKC", str(s or "")).strip().casefold()
-
-def _strip_accents_lower(s: str) -> str:
-    s = unicodedata.normalize("NFKD", str(s or "").strip())
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    # normaliza espaços internos (ex.: "  Maria  da  Silva " -> "maria da silva")
-    s = " ".join(s.split())
-    return s.casefold()
-
-def _fmt_brl(v) -> str:
-    try:
-        return ("R$ "+f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
-    except:
-        return "R$ 0,00"
-
-def _to_float(x, default=0.0):
-    if x is None: return default
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return default
-    s = s.replace("R$","").replace(" ","")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.\-]","", s)
-    if s.count(".")>1:
-        parts = s.split("."); s = "".join(parts[:-1]) + "." + parts[-1]
-    try: return float(s)
-    except: return default
-
-# =========================
-# Abas da planilha
-# =========================
-ABA_CLIENTES = "Clientes"
-ABA_FIADO    = "Fiado"
-ABA_PAGT     = "Fiado_Pagamentos"
-
-COLS_CLIENTES = ["Cliente","Telefone","Obs"]
-COLS_FIADO    = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
-COLS_PAGT     = ["PagamentoID","DataPagamento","Cliente","Forma","TotalPago","IDsFiado","Obs"]
-
-def garantir_aba(ss, nome, cols_padrao):
-    try:
-        ws = ss.worksheet(nome)
-    except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=nome, rows=5000, cols=max(10,len(cols_padrao)))
-        ws.append_row(cols_padrao)
-        return ws
-    # garante cabeçalhos (sem duplicatas, respeita nomes atuais)
-    headers = ws.row_values(1)
-    if not headers:
-        ws.append_row(cols_padrao)
-    else:
-        # remove duplicatas mantendo primeira ocorrência
-        fix = []
-        seen = set()
-        for h in headers:
-            k = _norm_key(h)
-            if k in seen: continue
-            seen.add(k); fix.append(h.strip())
-        if fix != headers:
-            ws.update('A1', [fix])
-        # adiciona colunas que estiverem faltando (por comparação normalizada)
-        have = {_norm_key(h) for h in fix}
-        missing = [c for c in cols_padrao if _norm_key(c) not in have]
-        if missing:
-            ws.update('A1', [fix + missing])
-    return ws
-
-def col_map(ws):
-    headers = ws.row_values(1)
-    mp = {}
-    for i,h in enumerate(headers):
-        k = _norm_key(h)
-        if k and k not in mp: mp[k] = i+1
-    return mp
-
-@st.cache_data(ttl=20, show_spinner=False)
-def load_df(aba: str) -> pd.DataFrame:
-    sh = conectar_sheets()
-    ws = garantir_aba(sh, aba, {
-        ABA_CLIENTES: COLS_CLIENTES,
-        ABA_FIADO:    COLS_FIADO,
-        ABA_PAGT:     COLS_PAGT
-    }[aba])
+@st.cache_data(ttl=5)
+def _load_df(aba: str) -> pd.DataFrame:
+    ws = _sheet().worksheet(aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
-    # garante colunas
-    base_cols = {ABA_CLIENTES: COLS_CLIENTES, ABA_FIADO: COLS_FIADO, ABA_PAGT: COLS_PAGT}[aba]
-    for c in base_cols:
-        if c not in df.columns: df[c] = ""
-    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
     return df.fillna("")
 
-def append_rows(ws, rows: list[dict]):
-    headers = ws.row_values(1)
-    if not headers:
-        ws.append_row(list(rows[0].keys()))
-        headers = ws.row_values(1)
-    hdr_norm = [_norm_key(h) for h in headers]
-    to_append = []
-    for d in rows:
-        dn = {_norm_key(k): v for k,v in d.items()}
-        to_append.append([dn.get(hn, "") for hn in hdr_norm])
-    if to_append:
-        ws.append_rows(to_append, value_input_option="USER_ENTERED")
+def _ensure_ws(name: str, headers: list[str]):
+    sh = _sheet()
+    try:
+        ws = sh.worksheet(name)
+        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+        if cur.empty or any(h not in cur.columns for h in headers):
+            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
+            df_head = pd.DataFrame(columns=cols)
+            ws.clear()
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
 
-def gerar_id(prefixo="F"):
-    # F-YYYYMMDDHHMMSSmmm
-    return f"{prefixo}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
+def _append_row(ws, row: dict):
+    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+    for col in cur.columns:
+        row.setdefault(col, "")
+    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-# =========================
-# UI — Tabs
-# =========================
-tab_novo, tab_quitar, tab_abertos = st.tabs(["➕ Novo fiado", "💰 Registrar pagamento", "📋 Em aberto"])
+# ========= utilidades =========
+def _to_float_or_zero(x):
+    """Converte '1,16', '11.60', '1.234,56' em float seguro."""
+    if x is None: return 0.0
+    s = str(x).strip()
+    if s == "": return 0.0
+    s = s.replace("R$", "").replace(" ", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.]", "", s)
+    if s.count(".") > 1:
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(s)
+    except:
+        return 0.0
 
-# ---------- NOVO FIADO ----------
-with tab_novo:
-    st.subheader("➕ Lançar fiado")
+def _nz(x):
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except Exception:
+        pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan", "none") else s
 
-    df_cli = load_df(ABA_CLIENTES)
-    # Lista e mapa normalizados para evitar duplicatas por acento/caixa/espaço
-    df_cli["_norm"] = df_cli["Cliente"].apply(_strip_accents_lower)
-    lista_clientes = sorted([c for c in df_cli["Cliente"].astype(str).str.strip().unique().tolist() if c])
-    norm_to_canon = {n: c for n, c in zip(df_cli["_norm"], df_cli["Cliente"]) if str(c).strip()}
+def _pick_col(df, cands):
+    for c in cands:
+        if c in df.columns: return c
+    return None
 
-    # Checkbox que controla se mostra a lista de clientes cadastrados
-    show_lista = st.checkbox(
-        "Escolher a partir dos clientes cadastrados",
-        value=True,
-        help="Desmarque para digitar um novo nome manualmente."
-    )
+# ========= Abas & headers =========
+ABA_PRODUTOS  = "Produtos"
+ABA_COMPRAS   = "Compras"
+ABA_MOV       = "MovimentosEstoque"
 
-    c1,c2 = st.columns([1,1])
-    with c1:
-        if show_lista:
-            cliente_sel = st.selectbox("Cliente (cadastrado)", options=[""] + lista_clientes, index=0)
-            cliente_novo = st.text_input("Ou digite um novo nome (se não encontrar)", value="")
-        else:
-            cliente_sel = ""
-            cliente_novo = st.text_input("Nome do cliente (novo)", value="")
-        tel_novo = st.text_input("Telefone (opcional)", value="")
-    with c2:
-        data_fiado = st.date_input("Data do fiado", value=date.today())
-        venc = st.date_input("Vencimento (opcional)", value=date.today())
-        valor = st.number_input("Valor (R$)", min_value=0.0, step=1.0, format="%.2f")
-        obs = st.text_input("Observações (opcional)", value="")
+COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
+MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"]
 
-    if st.button("Salvar fiado", use_container_width=True):
-        # 1) Determina o nome final, com dedupe por normalização
-        digitado = (cliente_novo or "").strip()
-        escolhido = (cliente_sel or "").strip()
-        cliente_final = (escolhido or digitado)
+# ========= Carregar bases =========
+try:
+    prod_df = _load_df(ABA_PRODUTOS)
+except Exception as e:
+    st.error("Erro ao abrir a aba Produtos.")
+    with st.expander("Detalhes"):
+        st.code(str(e))
+    st.stop()
 
-        if not cliente_final:
-            st.error("Informe o cliente (selecione ou digite um novo).")
-            st.stop()
+COLP = {
+    "id":   _pick_col(prod_df, ["ID","Id","id","Codigo","Código","SKU"]),
+    "nome": _pick_col(prod_df, ["Nome","Produto","Descrição","Descricao"]),
+    "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
+}
+for k,v in COLP.items():
+    if v is None and k in ("id","nome"):
+        prod_df[k.upper()] = ""
+        COLP[k] = k.upper()
 
-        # normalização/anti-duplicata
-        k = _strip_accents_lower(cliente_final)
-        if k in norm_to_canon:
-            # existe um cadastro equivalente (ex.: "MARIA" vs "Maria")
-            cliente_final = norm_to_canon[k]
-            st.info(f"Usando o cliente já cadastrado: **{cliente_final}** (evitando duplicidade).")
-        else:
-            # ainda não existe exatamente igual (normalizado); mantém o digitado
-            pass
+try:
+    compras_df = _load_df(ABA_COMPRAS)
+except Exception:
+    compras_df = pd.DataFrame(columns=COMPRAS_HEADERS)
 
-        sh = conectar_sheets()
-        ws_cli  = garantir_aba(sh, ABA_CLIENTES, COLS_CLIENTES)
-        ws_fiado= garantir_aba(sh, ABA_FIADO, COLS_FIADO)
+try:
+    mov_df = _load_df(ABA_MOV)
+except Exception:
+    mov_df = pd.DataFrame(columns=MOV_HEADERS)
 
-        # 2) Se for realmente novo (não existe equivalente normalizado), cadastra na aba Clientes
-        if _strip_accents_lower(cliente_final) not in norm_to_canon:
-            append_rows(ws_cli, [{"Cliente": cliente_final, "Telefone": tel_novo, "Obs": ""}])
-            # atualiza cache e mapas locais
-            st.cache_data.clear()
-            df_cli = load_df(ABA_CLIENTES)
-            df_cli["_norm"] = df_cli["Cliente"].apply(_strip_accents_lower)
-            norm_to_canon = {n: c for n, c in zip(df_cli["_norm"], df_cli["Cliente"]) if str(c).strip()}
+# ======== Normalização: Compras ========
+for c in COMPRAS_HEADERS:
+    if c not in compras_df.columns:
+        compras_df[c] = ""
+compras_df["Qtd_num"]   = compras_df["Qtd"].apply(_to_float_or_zero)
+compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_float_or_zero)
 
-        # 3) Salva o fiado
-        fid = gerar_id("F")
-        linha = {
-            "ID": fid,
-            "Data": data_fiado.strftime("%d/%m/%Y"),
-            "Cliente": cliente_final,
-            "Valor": float(valor),
-            "Vencimento": venc.strftime("%d/%m/%Y") if venc else "",
-            "Status": "Em aberto",
-            "Obs": obs,
-            "DataPagamento": "",
-            "FormaPagamento": "",
-            "ValorPago": ""
-        }
-        append_rows(ws_fiado, [linha])
+def _key_prod(row):
+    pid = _nz(row.get("IDProduto",""))
+    nome = _nz(row.get("Produto",""))
+    return (pid or "").strip() + "||" + (nome or "").strip()
 
-        # --- Telegram: novo fiado ---
-        try:
-            msg = (
-                "💳 <b>Novo fiado lançado</b>\n"
-                f"Cliente: <b>{cliente_final}</b>\n"
-                f"Data: {linha['Data']}\n"
-                f"Valor: <b>{_fmt_brl(linha['Valor'])}</b>\n"
-                + (f"Venc.: {linha['Vencimento']}\n" if linha.get("Vencimento") else "")
-                + (f"Obs.: {linha.get('Obs','')}\n" if linha.get('Obs') else "")
-            )
-            _tg_send(msg)
-        except Exception:
-            pass
+if not compras_df.empty:
+    compras_df["__key"] = compras_df.apply(_key_prod, axis=1)
+    last_cost = compras_df.dropna(subset=["__key"]).groupby("__key", as_index=True).tail(1)
+    custo_atual_map = {k: v for k, v in zip(last_cost["__key"], last_cost["Custo_num"])}
+else:
+    custo_atual_map = {}
 
-        st.success(f"Fiado lançado para **{cliente_final}** no valor de **{_fmt_brl(valor)}** (ID {fid}).")
-        st.cache_data.clear()
+# ======== Normalização: Movimentos ========
+for c in MOV_HEADERS:
+    if c not in mov_df.columns:
+        mov_df[c] = ""
+# --- Normalizador de tipo (resolve 'B entrada', 'B saída', 'Baixa', 'Estorno', etc.)
+def _strip_accents_low(s: str) -> str:
+    s = _ud.normalize("NFKD", str(s or ""))
+    s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
+    return s.lower()
 
-# ---------- REGISTRAR PAGAMENTO ----------
-with tab_quitar:
-    st.subheader("💰 Registrar pagamento de fiados")
+def _norm_tipo(t: str) -> str:
+    t = _strip_accents_low(t)
+    t = re.sub(r"[^a-z]", "", t)  # remove espaços, hífens, etc.: "b entrada" -> "bentrada"
+    if "entrada" in t or "compra" in t or "estorno" in t:
+        return "entrada"
+    if "saida" in t or "venda" in t or "baixa" in t:
+        return "saida"
+    if "ajuste" in t:
+        return "ajuste"
+    return "outro"
 
-    df_fiado = load_df(ABA_FIADO)
-    df_fiado["ValorNum"] = df_fiado["Valor"].apply(_to_float)
-    abertos = df_fiado[df_fiado["Status"].astype(str).str.lower()=="em aberto"].copy()
+mov_df["Qtd_num"]   = mov_df["Qtd"].apply(_to_float_or_zero)
+mov_df["Tipo_norm"] = mov_df["Tipo"].apply(_norm_tipo)
 
-    if abertos.empty:
-        st.info("Nenhum fiado em aberto.")
+def _signed_qty(row):
+    q = row["Qtd_num"]
+    b = row["Tipo_norm"]
+    if b == "entrada":
+        return abs(q)
+    if b == "saida":
+        return -abs(q)
+    if b == "ajuste":
+        return q  # mantém o sinal informado nos ajustes
+    return 0.0
+
+mov_df["Qtd_signed"] = mov_df.apply(_signed_qty, axis=1)
+
+# ======== Montagem do estoque ========
+def _prod_key_from(prod_id, prod_nome):
+    return f"{_nz(prod_id)}||{_nz(prod_nome)}".strip("|")
+
+base = prod_df.copy()
+base["__key"] = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
+base["Produto"] = base[COLP["nome"]]
+base["IDProduto"] = base[COLP["id"]] if COLP["id"] else ""
+
+if not mov_df.empty:
+    mov_df["__key"] = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
+    saldos = mov_df.groupby("__key")["Qtd_signed"].sum().rename("SaldoMov").reset_index()
+else:
+    saldos = pd.DataFrame(columns=["__key","SaldoMov"])
+
+df_estoque = base[["__key","Produto","IDProduto"]].merge(saldos, on="__key", how="left").fillna({"SaldoMov":0.0})
+
+def _sum_bucket(bucket_name: str):
+    if mov_df.empty:
+        return pd.DataFrame(columns=["__key","sum"])
+    m = mov_df[mov_df["Tipo_norm"]==bucket_name].copy()
+    if m.empty:
+        return pd.DataFrame(columns=["__key","sum"])
+    m["__key"] = m.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
+    return m.groupby("__key")["Qtd_num"].sum().reset_index().rename(columns={"Qtd_num":"sum"})
+
+entradas_sum = _sum_bucket("entrada").rename(columns={"sum":"Entradas"})
+saidas_sum   = _sum_bucket("saida").rename(columns={"sum":"Saidas"})
+ajustes_sum  = _sum_bucket("ajuste").rename(columns={"sum":"Ajustes"})
+
+for part in (entradas_sum, saidas_sum, ajustes_sum):
+    df_estoque = df_estoque.merge(part, on="__key", how="left")
+
+df_estoque[["Entradas","Saidas","Ajustes"]] = df_estoque[["Entradas","Saidas","Ajustes"]].fillna(0.0)
+
+df_estoque["EstoqueAtual"] = df_estoque["SaldoMov"].fillna(0.0)
+df_estoque["CustoAtual"]   = df_estoque["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
+df_estoque["ValorTotal"]   = df_estoque["EstoqueAtual"].astype(float) * df_estoque["CustoAtual"].astype(float)
+
+# ======== RESUMO ========
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("🧮 Itens com estoque > 0", int((df_estoque["EstoqueAtual"] > 0).sum()))
+with c2:
+    st.metric("📦 Quantidade total em estoque", f"{df_estoque['EstoqueAtual'].sum():.0f}")
+with c3:
+    st.metric("💰 Valor total (R$)", f"R$ {df_estoque['ValorTotal'].sum():.2f}")
+
+st.subheader("Tabela de Estoque")
+cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
+for c in cols_show:
+    if c not in df_estoque.columns:
+        df_estoque[c] = 0 if c not in ("IDProduto","Produto") else ""
+st.dataframe(df_estoque[cols_show].sort_values("Produto"), use_container_width=True, hide_index=True)
+
+# Debug opcional: ver últimos movimentos já normalizados
+with st.expander("🧾 Últimos movimentos (debug)"):
+    if mov_df.empty:
+        st.caption("Sem movimentos ainda.")
     else:
-        clientes_abertos = sorted(abertos["Cliente"].astype(str).str.strip().unique().tolist())
-        # Para quem é leigo: pode mostrar ou não a lista de clientes (mesma lógica do Novo fiado)
-        show_lista_pag = st.checkbox("Mostrar lista de clientes com fiado em aberto", value=True)
-        c1,c2 = st.columns([1,1])
-        with c1:
-            if show_lista_pag:
-                cli = st.selectbox("Cliente", options=[""]+clientes_abertos, index=0)
-            else:
-                cli = st.text_input("Cliente (digite)", value="")
-        with c2:
-            data_pag = st.date_input("Data do pagamento", value=date.today())
+        dbg_cols = [c for c in ["Data","Produto","IDProduto","Tipo","Tipo_norm","Qtd","Qtd_num","Qtd_signed","Obs"] if c in mov_df.columns]
+        st.dataframe(mov_df[dbg_cols].tail(30), use_container_width=True, hide_index=True)
 
-        subset = abertos if not cli else abertos[abertos["Cliente"]==cli].copy()
+st.divider()
 
-        if subset.empty:
-            st.info("Nenhum lançamento em aberto para esse cliente.")
-        else:
-            # Multi-seleção por ID
-            subset["ValorNum"] = subset["ValorNum"].astype(float)
-            subset["Label"] = subset.apply(
-                lambda r: f"{r['ID']} • {r['Data']} • {_fmt_brl(r['ValorNum'])} • Venc: {r.get('Vencimento','') or '-'} • {r.get('Obs','') or ''}",
-                axis=1
-            )
-            ids = subset["ID"].tolist()
-            labels = {row["ID"]: row["Label"] for _, row in subset.iterrows()}
+# ======== FORM: Registrar Saída ========
+st.subheader("➖ Registrar Saída / Baixa de Estoque")
+with st.form("form_saida"):
+    usar_lista_s = st.checkbox("Selecionar produto da lista", value=True, key="saida_lista")
+    if usar_lista_s:
+        if df_estoque.empty:
+            st.warning("Sem produtos para saída."); st.stop()
 
-            ids_sel = st.multiselect("Selecione os fiados a quitar", options=ids, format_func=lambda x: labels.get(x, x))
+        def _fmt_saida(i):
+            r = df_estoque.iloc[i]
+            return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
 
-            forma = st.selectbox("Forma de pagamento", ["Dinheiro","Pix","Cartão","Transferência","Outro"], index=1)
-            obs_pag = st.text_input("Observação (opcional)", value="")
-
-            total_sel = float(subset[subset["ID"].isin(ids_sel)]["ValorNum"].sum()) if ids_sel else 0.0
-            st.metric("Total selecionado", _fmt_brl(total_sel))
-
-            can_save = bool(ids_sel) and total_sel > 0
-            if st.button("Quitar selecionados", use_container_width=True, disabled=not can_save):
-                sh = conectar_sheets()
-                ws_fiado = garantir_aba(sh, ABA_FIADO, COLS_FIADO)
-                ws_pagt  = garantir_aba(sh, ABA_PAGT,  COLS_PAGT)
-
-                # atualiza linhas selecionadas
-                df_sel = df_fiado[df_fiado["ID"].isin(ids_sel)].copy()
-                cmap = col_map(ws_fiado)
-                updates = []
-                for _, row in df_sel.iterrows():
-                    idx = int(row.name) + 2  # cabeçalho na linha 1
-                    # campos a escrever
-                    pairs = {
-                        "Status": "Pago",
-                        "DataPagamento": data_pag.strftime("%d/%m/%Y"),
-                        "FormaPagamento": forma,
-                        "ValorPago": _to_float(row["Valor"])
-                    }
-                    for k,v in pairs.items():
-                        c = cmap.get(_norm_key(k))
-                        if c:
-                            updates.append({"range": rowcol_to_a1(idx, c), "values": [[v]]})
-                if updates:
-                    ws_fiado.batch_update(updates, value_input_option="USER_ENTERED")
-
-                # escreve resumo do pagamento
-                pid = gerar_id("P")
-                append_rows(ws_pagt, [{
-                    "PagamentoID": pid,
-                    "DataPagamento": data_pag.strftime("%d/%m/%Y"),
-                    "Cliente": cli or "(vários)",
-                    "Forma": forma,
-                    "TotalPago": total_sel,
-                    "IDsFiado": ";".join(ids_sel),
-                    "Obs": obs_pag
-                }])
-
-                st.success(f"Pagamento registrado: **{_fmt_brl(total_sel)}** ({forma}).")
-
-                # --- Telegram: pagamento fiado ---
-                try:
-                    # Recalcula o saldo em aberto do cliente após o pagamento (se um único cliente informado)
-                    saldo_restante = None
-                    if cli:
-                        df_fiado_after = load_df(ABA_FIADO)  # recarrega
-                        df_fiado_after["ValorNum"] = df_fiado_after["Valor"].apply(_to_float)
-                        aberto_cli = df_fiado_after[
-                            (df_fiado_after["Cliente"].astype(str)==cli) &
-                            (df_fiado_after["Status"].astype(str).str.lower()=="em aberto")
-                        ]
-                        saldo_restante = float(aberto_cli["ValorNum"].sum()) if not aberto_cli.empty else 0.0
-
-                    # Monta linhas quitadas sem expor ID (se quiser IDs, inclua r['ID'])
-                    itens_txt = "\n".join(
-                        f"• {r['Data']} — {_fmt_brl(_to_float(r['Valor']))}"
-                        + (f" — Venc.: {r.get('Vencimento','')}" if r.get("Vencimento") else "")
-                        for _, r in df_sel.iterrows()
-                    )
-
-                    msg = (
-                        "✅ <b>Pagamento de fiado registrado</b>\n"
-                        f"Cliente: <b>{(cli or '(vários)')}</b>\n"
-                        f"Data: {data_pag.strftime('%d/%m/%Y')}\n"
-                        f"Forma: <b>{forma}</b>\n"
-                        f"Total pago: <b>{_fmt_brl(total_sel)}</b>\n"
-                        f"{'-'*24}\n"
-                        f"{itens_txt}\n"
-                        + (f"{'-'*24}\nSaldo restante do cliente: <b>{_fmt_brl(saldo_restante)}</b>\n" if saldo_restante is not None else "")
-                        + (f"Obs.: {obs_pag}" if obs_pag else "")
-                    )
-                    _tg_send(msg)
-                except Exception:
-                    pass
-
-                st.cache_data.clear()
-
-# ---------- EM ABERTO ----------
-with tab_abertos:
-    st.subheader("📋 Fiados em aberto")
-
-    df_fiado = load_df(ABA_FIADO)
-    if df_fiado.empty:
-        st.info("Sem registros.")
+        idx = st.selectbox("Produto", options=range(len(df_estoque)), format_func=_fmt_saida)
+        row = df_estoque.iloc[idx]
+        prod_nome_s = _nz(row["Produto"])
+        prod_id_s   = _nz(row["IDProduto"])
     else:
-        df_fiado["ValorNum"] = df_fiado["Valor"].apply(_to_float)
-        em_aberto = df_fiado[df_fiado["Status"].astype(str).str.lower()=="em aberto"].copy()
+        prod_nome_s = st.text_input("Produto (nome exato)", key="saida_nome")
+        prod_id_s   = st.text_input("ID (opcional)", key="saida_id")
 
-        c1,c2 = st.columns([1,1])
-        with c1:
-            filtro_cli = st.text_input("Filtrar por cliente", "")
-        with c2:
-            so_vencidos = st.checkbox("Somente vencidos", value=False)
+    csa, csb = st.columns(2)
+    with csa:
+        data_s = st.date_input("Data da saída", value=date.today(), key="saida_data")
+    with csb:
+        qtd_s  = st.text_input("Qtd", placeholder="Ex.: 2", key="saida_qtd")
+    obs_s = st.text_input("Observações (opcional)", key="saida_obs")
+    salvar_s = st.form_submit_button("Registrar saída")
 
-        if filtro_cli.strip():
-            em_aberto = em_aberto[
-                em_aberto["Cliente"].astype(str).str.contains(filtro_cli.strip(), case=False, na=False)
-            ]
+if salvar_s:
+    if not prod_nome_s.strip():
+        st.error("Selecione ou digite um produto."); st.stop()
+    q = _to_float_or_zero(qtd_s)
+    if q <= 0:
+        st.error("Informe uma quantidade válida (> 0)."); st.stop()
+    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
+    _append_row(ws_mov, {
+        "Data": data_s.strftime("%d/%m/%Y"),
+        "IDProduto": _nz(prod_id_s),
+        "Produto": prod_nome_s,
+        "Tipo": "saida",
+        "Qtd": (str(int(q)) if float(q).is_integer() else str(q)).replace(".", ","),
+        "Obs": _nz(obs_s)
+    })
+    st.success("Saída registrada com sucesso! ✅")
+    st.toast("Saída lançada", icon="➖")
+    st.cache_data.clear()
 
-        # atraso
-        def _as_date(s):
-            try: return datetime.strptime(str(s), "%d/%m/%Y").date()
-            except: return None
-        hoje = date.today()
-        em_aberto["Venc_d"] = em_aberto["Vencimento"].apply(_as_date)
-        em_aberto["AtrasoDias"] = em_aberto["Venc_d"].apply(lambda d: (hoje - d).days if (d and hoje>d) else 0)
-        if so_vencidos:
-            em_aberto = em_aberto["AtrasoDias"].gt(0)
+st.divider()
 
-        # resumo por cliente
-        resumo = em_aberto.groupby("Cliente", as_index=False)["ValorNum"].sum().rename(columns={"ValorNum":"Total"})
-        k1,k2 = st.columns(2)
-        with k1: st.metric("Clientes com fiado", f"{len(resumo)}")
-        with k2: st.metric("Total em aberto", _fmt_brl(resumo["Total"].sum()))
+# ======== FORM: Registrar Ajuste ========
+st.subheader("🛠️ Registrar Ajuste de Estoque")
+with st.form("form_ajuste"):
+    usar_lista_a = st.checkbox("Selecionar produto da lista", value=True, key="ajuste_lista")
+    if usar_lista_a:
+        if df_estoque.empty:
+            st.warning("Sem produtos para ajuste."); st.stop()
 
-        st.markdown("**Por cliente**")
-        st.dataframe(resumo.sort_values("Total", ascending=False), use_container_width=True, hide_index=True)
+        def _fmt_aj(i):
+            r = df_estoque.iloc[i]
+            return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
 
-        st.markdown("---")
-        st.markdown("**Lançamentos**")
-        cols_show = ["ID","Data","Cliente","Valor","Vencimento","AtrasoDias","Obs"]
-        cols_show = [c for c in cols_show if c in em_aberto.columns]
-        st.dataframe(
-            em_aberto.sort_values(["AtrasoDias","ValorNum"], ascending=[False,False])[cols_show],
-            use_container_width=True, hide_index=True
-        )
+        idxa = st.selectbox("Produto", options=range(len(df_estoque)), format_func=_fmt_aj, key="ajuste_idx")
+        rowa = df_estoque.iloc[idxa]
+        prod_nome_a = _nz(rowa["Produto"])
+        prod_id_a   = _nz(rowa["IDProduto"])
+    else:
+        prod_nome_a = st.text_input("Produto (nome exato)", key="ajuste_nome")
+        prod_id_a   = st.text_input("ID (opcional)", key="ajuste_id")
 
-        # export
-        csv_bytes = em_aberto[cols_show].to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Exportar (CSV)", data=csv_bytes, file_name="fiado_em_aberto.csv")
+    ca1, ca2 = st.columns(2)
+    with ca1:
+        data_a = st.date_input("Data do ajuste", value=date.today(), key="ajuste_data")
+    with ca2:
+        qtd_a  = st.text_input("Qtd (use negativo para baixar, positivo para repor)", placeholder="Ex.: -1 ou 5", key="ajuste_qtd")
+
+    obs_a = st.text_input("Motivo/Observações", key="ajuste_obs")
+    salvar_a = st.form_submit_button("Registrar ajuste")
+
+if salvar_a:
+    if not prod_nome_a.strip():
+        st.error("Selecione ou digite um produto."); st.stop()
+    qa = _to_float_or_zero(qtd_a)  # pode ser negativo
+    if qa == 0:
+        st.error("Informe uma quantidade diferente de zero."); st.stop()
+    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
+    _append_row(ws_mov, {
+        "Data": data_a.strftime("%d/%m/%Y"),
+        "IDProduto": _nz(prod_id_a),
+        "Produto": prod_nome_a,
+        "Tipo": "ajuste",
+        "Qtd": (str(int(qa)) if float(qa).is_integer() else str(qa)).replace(".", ","),
+        "Obs": _nz(obs_a)
+    })
+    st.success("Ajuste registrado com sucesso! ✅")
+    st.toast("Ajuste lançado", icon="🛠️")
+    st.cache_data.clear()
+
+st.divider()
+st.page_link("pages/03_compras_entradas.py", label="🧾 Registrar Compras / Entradas", icon="🧾")
+st.page_link("pages/01_produtos.py", label="📦 Ir ao Catálogo", icon="📦")
