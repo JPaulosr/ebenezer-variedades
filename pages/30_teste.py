@@ -1,28 +1,27 @@
 # -*- coding: utf-8 -*-
-# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos (com trava anti-duplicidade)
-import json, unicodedata, math, re
-import unicodedata as _ud
+# pages/05_fracionar.py — Fracionar GRANEL (L) em fracionados (1L, 500ml, etc.)
+import json, unicodedata, hashlib
+from datetime import datetime, date, timedelta
+
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta, date
 
-st.set_page_config(page_title="Cadastrar/Editar Produto", page_icon="➕", layout="wide")
-st.title("➕ Cadastrar / Editar Produto")
+st.set_page_config(page_title="Fracionar (Granel → Fracionados)", page_icon="🧪", layout="wide")
+st.title("🧪 Fracionar — converter GRANEL (L) em fracionados")
 
 # =============================================================================
-# Credenciais / Sheets
+# Auth / Sheets helpers
 # =============================================================================
 def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str):
-        return key
+    if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
+    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
     return key
 
-def _load_sa():
+def _load_sa() -> dict:
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None:
         st.error("🛑 GCP_SERVICE_ACCOUNT ausente em st.secrets."); st.stop()
@@ -55,15 +54,45 @@ def _load_df(aba: str) -> pd.DataFrame:
     return df
 
 def _safe_load(aba):
-    try:
-        return _load_df(aba)
-    except Exception:
-        return pd.DataFrame()
+    try: return _load_df(aba)
+    except Exception: return pd.DataFrame()
 
+def _ensure_ws(name: str, headers: list[str]):
+    sh = _sheet()
+    try:
+        ws = sh.worksheet(name)
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+    # garante colunas sem perder dados
+    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
+    cur.columns = [c.strip() for c in cur.columns]
+    missing = [h for h in headers if h not in cur.columns]
+    if missing:
+        for h in missing: cur[h] = ""
+        ws.clear()
+        set_with_dataframe(ws, cur.fillna(""), include_index=False, include_column_header=True, resize=True)
+    return ws
+
+def _rewrite_append(ws, row: dict):
+    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
+    if cur is None or cur.empty:
+        cur = pd.DataFrame(columns=list(row.keys()))
+    for c in cur.columns:
+        row.setdefault(c, "")
+    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+# =============================================================================
+# Normalização / números
+# =============================================================================
 def _to_float(x):
     if x is None or str(x).strip()=="":
         return ""
-    s = str(x).strip().replace("R$", "").replace(".", "").replace(",", ".")
+    s = str(x).strip().replace("R$","").replace(".","").replace(",",".")
     try: return float(s)
     except: return ""
 
@@ -73,78 +102,24 @@ def _to_int(x):
     try: return int(float(str(x).strip().replace(",", ".")))
     except: return ""
 
-def _gen_id():
-    return "P-" + datetime.now().strftime("%Y%m%d%H%M%S")
-
-def _msg_ok(msg):
-    st.success(msg)
-    try: st.cache_data.clear()
-    except: pass
-
-def _ensure_ws(name: str, headers: list[str]):
-    sh = _sheet()
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            df_head = pd.DataFrame(columns=cols)
-            ws.clear()
-            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-    except Exception:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-
-def _append_row(ws, row: dict):
-    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-    for col in cur.columns:
-        row.setdefault(col, "")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
 # =============================================================================
-# Mapeamentos flexíveis
+# Mapas de colunas
 # =============================================================================
 def _pick_col(df, candidates):
     for c in candidates:
-        if c in df.columns:
-            return c
+        if c in df.columns: return c
     return None
 
 def _map_cols_produtos(df):
     return {
         "id":        _pick_col(df, ["ID","Id","id"]),
         "nome":      _pick_col(df, ["Nome","Produto","Descrição","Descricao"]),
-        "categoria": _pick_col(df, ["Categoria","Grupo"]),
         "unidade":   _pick_col(df, ["Unidade","Unid"]),
-        "forn":      _pick_col(df, ["Fornecedor","FornecedorNome","Fornecedor ID","FornecedorID"]),
+        "forn":      _pick_col(df, ["Fornecedor","FornecedorNome"]),
         "custo":     _pick_col(df, ["CustoAtual","Custo","Custo Atual"]),
-        "preco":     _pick_col(df, ["PreçoVenda","PrecoVenda","Preço Venda","Preco Venda","Preço","Valor"]),
-        "markup":    _pick_col(df, ["Markup %","Markup%","Markup"]),
-        "margem":    _pick_col(df, ["Margem %","Margem%","Margem"]),
+        "preco":     _pick_col(df, ["PreçoVenda","PrecoVenda","Preço","Valor"]),
         "estoque":   _pick_col(df, ["EstoqueAtual","Estoque","QtdEstoque","Quantidade"]),
-        "est_min":   _pick_col(df, ["EstoqueMin","Estoque Min","Minimo","Mínimo"]),
-        "lead":      _pick_col(df, ["LeadTimeDias","LeadTime","Lead Time"]),
         "ativo":     _pick_col(df, ["Ativo?","Ativo","Status"]),
-        "codb":      _pick_col(df, ["Código de Barras","Codigo de Barras","EAN","EAN13","Barcode"]),
-        "desc":      _pick_col(df, ["Descrição","Descricao","Observações","Observacoes"]),
-        "atualizado": _pick_col(df, ["AtualizadoEm","Atualizado Em","Atualizado"])
-    }
-
-def _map_cols_compras(df):
-    return {
-        "data": _pick_col(df, ["Data","DATA"]),
-        "nome": _pick_col(df, ["Produto","Nome","Descrição","Descricao"]),
-        "unid": _pick_col(df, ["Unidade","Unid"]),
-        "forn": _pick_col(df, ["Fornecedor","FornecedorNome"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Custo Unit","PrecoUnitario","Preço Unitário"]),
-        "total": _pick_col(df, ["Total","ValorTotal"]),
-        "id": _pick_col(df, ["IDProduto","ID"])
     }
 
 def _map_cols_mov(df):
@@ -153,478 +128,312 @@ def _map_cols_mov(df):
         "id":   _pick_col(df, ["IDProduto","ID"]),
         "nome": _pick_col(df, ["Produto","Nome"]),
         "tipo": _pick_col(df, ["Tipo","Movimento","Mov"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"])
+        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
+        "obs":  _pick_col(df, ["Obs","Observação","Observacoes","Observações"]),
     }
 
-def _map_cols_vendas(df):
+def _map_cols_compras(df):
     return {
         "data": _pick_col(df, ["Data","DATA"]),
-        "id":   _pick_col(df, ["IDProduto","ID"]),
         "nome": _pick_col(df, ["Produto","Nome"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"])
+        "unid": _pick_col(df, ["Unidade","Unid"]),
+        "forn": _pick_col(df, ["Fornecedor","FornecedorNome"]),
+        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
+        "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Preço Unitário"]),
+        "total": _pick_col(df, ["Total","ValorTotal"]),
+        "id": _pick_col(df, ["IDProduto","ID"]),
+        "refid": _pick_col(df, ["RefID"]),
+        "obs": _pick_col(df, ["Obs","Observação","Observacoes","Observações"]),
     }
 
-def _map_cols_forn(df):
-    return {"forn": _pick_col(df, ["Fornecedor","Nome"]),
-            "lead": _pick_col(df, ["LeadTimeDias","Lead Time","Lead"])}
-
 # =============================================================================
-# Carregar dados
+# Carrega bases
 # =============================================================================
-ABA = "Produtos"
-try:
-    df = _load_df(ABA)
-except Exception as e:
-    st.error("Erro ao abrir a aba Produtos.")
-    with st.expander("Detalhes técnicos"):
-        st.code(str(e))
-    st.stop()
+df_prod = _safe_load("Produtos")
+df_mov  = _safe_load("MovimentosEstoque")
+df_comp = _safe_load("Compras")
 
-COL = _map_cols_produtos(df)
-compras_df   = _safe_load("Compras")
-movest_df    = _safe_load("MovimentosEstoque")
-vendas_df    = _safe_load("Vendas")
-forn_df      = _safe_load("Fornecedores")
+COLP = _map_cols_produtos(df_prod) if not df_prod.empty else {}
+COLM = _map_cols_mov(df_mov) if not df_mov.empty else {}
+COLC = _map_cols_compras(df_comp) if not df_comp.empty else {}
 
-CMP = _map_cols_compras(compras_df) if not compras_df.empty else {}
-MOV = _map_cols_mov(movest_df) if not movest_df.empty else {}
-VEN = _map_cols_vendas(vendas_df) if not vendas_df.empty else {}
-FD  = _map_cols_forn(forn_df) if not forn_df.empty else {}
-
-# Cabeçalhos padrão (se criar do zero)
-COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
+COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs","RefID"]
 MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
 
 # =============================================================================
-# Funções de cálculo
+# Estoque (saldo) a partir de Movimentos
 # =============================================================================
-def _last_cost_and_unit(nome: str, fornecedor: str|None):
-    if compras_df.empty or not CMP:
-        return None, None
-    base = compras_df.copy()
-    if CMP.get("nome"):
-        base = base[ base[CMP["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-    if fornecedor and CMP.get("forn"):
-        base = base[ base[CMP["forn"]].astype(str).str.strip().str.lower() == fornecedor.strip().lower() ]
-    if base.empty:
-        return None, None
-    row = base.assign(__d=pd.to_datetime(base.get(CMP.get("data",""), None), errors="coerce")).sort_values("__d", ascending=False).iloc[0]
-    custo = _to_float(row.get(CMP.get("custo_unit",""), ""))
-    unid  = str(row.get(CMP.get("unid",""), "")).strip() or None
-    return (custo if custo not in ("", None) else None), unid
-
 def _stock_balance(prod_id: str|None, nome: str):
-    saldo = 0
-    has_any = False
-    if not movest_df.empty and MOV:
-        base = movest_df.copy()
-        if prod_id and MOV.get("id"):
-            base = base[ base[MOV["id"]].astype(str) == str(prod_id) ]
-        elif MOV.get("nome"):
-            base = base[ base[MOV["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-        if not base.empty:
-            has_any = True
-            ent = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["entrada","compra","ajuste+","entrada manual","in"]) ][MOV["qtd"]].apply(_to_float).sum()
-            sai = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out"]) ][MOV["qtd"]].apply(_to_float).sum()
-            saldo = (ent or 0) - (sai or 0)
-    if not has_any and (not vendas_df.empty) and VEN:
-        base = vendas_df.copy()
-        if prod_id and VEN.get("id"):
-            base = base[ base[VEN["id"]].astype(str) == str(prod_id) ]
-        elif VEN.get("nome"):
-            base = base[ base[VEN["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-        if not base.empty:
-            return 0
-    return int(round(saldo, 0))
-
-def _avg_daily_sales_30d(prod_id: str|None, nome: str):
-    if vendas_df.empty or not VEN or VEN.get("data") is None:
-        return 0.0
-    base = vendas_df.copy()
-    base["__d"] = pd.to_datetime(base[VEN["data"]], errors="coerce")
-    maxd = base["__d"].max()
-    if pd.isna(maxd): return 0.0
-    start = maxd - timedelta(days=30)
-    base = base[ base["__d"] >= start ]
-    if prod_id and VEN.get("id"):
-        base = base[ base[VEN["id"]].astype(str) == str(prod_id) ]
-    elif VEN.get("nome"):
-        base = base[ base[VEN["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-    if base.empty: return 0.0
-    qty = base[VEN["qtd"]].apply(_to_float).sum()
-    days = max((maxd - start).days, 1)
-    return float(qty) / float(days)
-
-def _lead_time_fornecedor(fornecedor: str|None):
-    if forn_df.empty or not FD or not fornecedor:
-        return None
-    base = forn_df.copy()
-    base = base[ base[FD["forn"]].astype(str).str.strip().str.lower() == fornecedor.strip().lower() ]
-    if base.empty: return None
-    v = _to_int(base.iloc[0].get(FD["lead"], ""))
-    return v if v != "" else None
-
-def _calc_est_min(avg_daily: float, lead_time_days: int|None):
-    lt = lead_time_days if lead_time_days not in (None, "", 0) else 7
-    safety = 1.2
-    estmin = math.ceil(avg_daily * lt * safety)
-    return estmin if estmin > 0 else 5
+    if df_mov.empty or not COLM: return 0
+    base = df_mov.copy()
+    if prod_id and COLM.get("id"):
+        base = base[ base[COLM["id"]].astype(str) == str(prod_id) ]
+    elif COLM.get("nome"):
+        base = base[ base[COLM["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
+    if base.empty: return 0
+    ent = base[ base[COLM["tipo"]].astype(str).str.lower().isin(["entrada","ajuste+","entrada manual","compra","in"]) ][COLM["qtd"]].apply(_to_float).sum()
+    sai = base[ base[COLM["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out"]) ][COLM["qtd"]].apply(_to_float).sum()
+    saldo = (ent or 0) - (sai or 0)
+    try: return round(float(saldo), 3)
+    except: return 0
 
 # =============================================================================
-# 🔒 Helpers de anti-duplicidade (Nome+Fornecedor)
+# Anti duplicidade para "Compras internas"
 # =============================================================================
-def _strip_accents(s: str) -> str:
-    if not isinstance(s, str): return ""
-    return "".join(ch for ch in _ud.normalize("NFD", s) if _ud.category(ch) != "Mn")
+def _norm_val_str(x) -> str:
+    if x is None: return ""
+    s = str(x).strip().replace("R$","").replace(".","").replace(",",".")
+    try: return f"{float(s):.6f}"
+    except: return str(x).strip().lower()
 
-def _norm_key(nome: str, fornecedor: str) -> str:
-    n = re.sub(r"\s+", " ", (_strip_accents(nome or "")).strip().lower())
-    f = re.sub(r"\s+", " ", (_strip_accents(fornecedor or "")).strip().lower())
-    return f"{n}|{f}" if f else n
+def _make_refid_compra(data_str, produto, fornecedor, qtd, custo_unit) -> str:
+    base = "|".join([
+        (data_str or "").strip(),
+        (produto or "").strip().lower(),
+        (fornecedor or "").strip().lower(),
+        _norm_val_str(qtd),
+        _norm_val_str(custo_unit),
+    ])
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
-@st.cache_data(ttl=15)
-def _prod_index_by_key(df_prod: pd.DataFrame, COL: dict) -> dict[str, int]:
-    ix = {}
-    if df_prod is None or df_prod.empty: return ix
-    for i, r in df_prod.iterrows():
-        k = _norm_key(str(r.get(COL.get("nome",""), "")), str(r.get(COL.get("forn",""), "")))
-        if k: ix[k] = i
-    return ix
+def _seen_refid_in_session(refid: str) -> bool:
+    bag = st.session_state.setdefault("_seen_compra_refids", set())
+    if refid in bag: return True
+    bag.add(refid); return False
+
+def _compra_exists(ws, refid: str) -> bool:
+    try:
+        cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    except Exception:
+        return False
+    if cur.empty or "RefID" not in [c.strip() for c in cur.columns]: return False
+    return refid in cur["RefID"].astype(str).tolist()
 
 # =============================================================================
-# UI — ação
+# UI — seleção do granel e linhas de saída
 # =============================================================================
-m1, m2 = st.columns([1.4, 2])
-with m1:
-    modo = st.radio("Ação", ["Cadastrar novo", "Editar existente"], horizontal=True)
-with m2:
-    st.caption("Campos como **CustoAtual**, **EstoqueAtual**, **EstoqueMin**, **Unidade** e **LeadTimeDias** são calculados automaticamente quando possível.")
+if df_prod.empty or not COLP:
+    st.error("Aba 'Produtos' vazia ou não mapeada."); st.stop()
+
+# candidatos a granel: unidade 'L' ou nome contém 'granel'
+def _is_granel_row(r):
+    un = str(r.get(COLP["unidade"], "")).strip().lower()
+    nm = str(r.get(COLP["nome"], "")).strip().lower()
+    return ("l" in un) or ("litro" in un) or ("granel" in nm)
+
+df_granel = df_prod[df_prod.apply(_is_granel_row, axis=1)].copy()
+if df_granel.empty:
+    st.warning("Nenhum produto granel (L) encontrado. Cadastre um SKU de matéria-prima em litros.")
+    st.stop()
+
+# formatador
+def _fmt_prod(r):
+    nm = str(r.get(COLP["nome"], "(sem nome)"))
+    un = str(r.get(COLP["unidade"], "") or "").strip()
+    forn = str(r.get(COLP["forn"], "") or "").strip()
+    return f"{nm} [{un}]" + (f" — {forn}" if forn else "")
+
+labels_granel = df_granel.apply(_fmt_prod, axis=1).tolist()
+idx = st.selectbox("Materia-prima (GRANEL em L)", options=range(len(df_granel)), format_func=lambda i: labels_granel[i])
+row_g = df_granel.iloc[idx].to_dict()
+
+prod_id_g   = row_g.get(COLP["id"], "")
+nome_g      = str(row_g.get(COLP["nome"], ""))
+unid_g      = str(row_g.get(COLP["unidade"], "") or "")
+saldo_l     = _stock_balance(prod_id_g, nome_g)  # em litros
+
+c1, c2, c3 = st.columns([1,1,1])
+with c1: st.metric("Estoque atual do GRANEL (L)", f"{saldo_l}")
+with c2: data_op = st.date_input("Data da operação", value=date.today())
+with c3: gerar_compras = st.checkbox("Gerar 'Compras internas' p/ fracionados (ajusta CustoAtual)", value=True)
+
+st.caption("Dica: se não quiser afetar CustoAtual dos fracionados, desmarque a opção de 'Compras internas' e deixe só os MovimentosEstoque.")
+
+st.markdown("### Saídas (fracionados)")
+# linhas dinâmicas
+if "_frac_rows" not in st.session_state:
+    st.session_state["_frac_rows"] = [
+        {"label":"SKU 1L", "sku": "", "vol_l": "1", "qtd": "", "embalagem": ""},   # custo adicional da embalagem
+        {"label":"SKU 500 ml", "sku": "", "vol_l": "0,5", "qtd": "", "embalagem": ""},
+    ]
+
+# catálogo para saída (todos exceto o granel selecionado)
+df_out_options = df_prod.copy()
+df_out_options = df_out_options[df_out_options[COLP["id"]] != prod_id_g]
+
+def _fmt_out(r):
+    nm = str(r.get(COLP["nome"], "(sem nome)"))
+    un = str(r.get(COLP["unidade"], "") or "").strip()
+    return f"{nm} [{un}]"
+
+labels_out = df_out_options.apply(_fmt_out, axis=1).tolist()
+
+# editor simples de linhas
+rows = st.session_state["_frac_rows"]
+for i, row in enumerate(rows):
+    st.write(f"**Linha {i+1} — {row['label']}**")
+    c1, c2, c3, c4 = st.columns([2,1,1,1])
+    with c1:
+        idx_out = st.selectbox("SKU de saída", options=["(selecione)"] + labels_out, key=f"sku_{i}")
+        row["sku"] = idx_out
+    with c2:
+        row["vol_l"] = st.text_input("Volume por unidade (L)", value=row["vol_l"], key=f"vol_{i}")
+    with c3:
+        row["qtd"] = st.text_input("Quantidade a produzir", value=row["qtd"], key=f"qtd_{i}")
+    with c4:
+        row["embalagem"] = st.text_input("Custo embalagem por un. (R$)", value=row["embalagem"], key=f"emb_{i}")
+    st.divider()
+
+colb1, colb2, colb3 = st.columns([1,1,2])
+with colb1:
+    if st.button("➕ Adicionar linha"):
+        rows.append({"label":f"SKU extra {len(rows)+1}", "sku":"", "vol_l":"", "qtd":"", "embalagem":""})
+with colb2:
+    if st.button("🗑️ Limpar linhas"):
+        st.session_state["_frac_rows"] = []
+        st.rerun()
+
+# =============================================================================
+# Simulação
+# =============================================================================
+def _find_row_by_label(label):
+    if label == "(selecione)": return None
+    if label not in labels_out: return None
+    pos = labels_out.index(label)
+    return df_out_options.iloc[pos].to_dict()
+
+def _calc_litros_usados(rows):
+    total = 0.0
+    for r in rows:
+        if not r.get("sku") or r["sku"]=="(selecione)": 
+            continue
+        vol = _to_float(r.get("vol_l", ""))
+        qtd = _to_float(r.get("qtd", ""))
+        if vol not in ("", None) and qtd not in ("", None):
+            total += float(vol) * float(qtd)
+    return round(total, 3)
+
+litros_usados = _calc_litros_usados(rows)
+st.metric("Litros que serão usados", f"{litros_usados}")
+
+if litros_usados > saldo_l:
+    st.error("Litros usados excedem o estoque atual do granel.")
+elif litros_usados == 0:
+    st.info("Preencha volume e quantidade das saídas para simular.")
+
+# =============================================================================
+# Confirmar
+# =============================================================================
+batch_id = "FRAC-" + datetime.now().strftime("%Y%m%d%H%M%S")
+
+def _append_mov_saida_granel(ws_mov, data_str, qtd_l):
+    _rewrite_append(ws_mov, {
+        "Data": data_str,
+        "IDProduto": prod_id_g,
+        "Produto": nome_g,
+        "Tipo": "ajuste-",
+        "Qtd": str(qtd_l).replace(".", ","),
+        "Obs": f"{batch_id} — saída para fracionamento"
+    })
+
+def _append_mov_entrada_saida(ws_mov, data_str, prod_dict, qtd_un):
+    _rewrite_append(ws_mov, {
+        "Data": data_str,
+        "IDProduto": prod_dict.get(COLP["id"], ""),
+        "Produto": prod_dict.get(COLP["nome"], ""),
+        "Tipo": "ajuste+",
+        "Qtd": str(int(qtd_un)) if float(qtd_un).is_integer() else str(qtd_un).replace(".", ","),
+        "Obs": f"{batch_id} — entrada de fracionado"
+    })
+
+def _upsert_compra_interna(ws_cmp, data_str, prod_dict, qtd_un, custo_unit, obs_extra=""):
+    refid = _make_refid_compra(
+        data_str,
+        prod_dict.get(COLP["nome"], ""),
+        "Produção interna",
+        str(int(qtd_un)) if float(qtd_un).is_integer() else str(qtd_un).replace(".", ","),
+        f"{float(custo_unit):.2f}".replace(".", ","),
+    )
+    if _seen_refid_in_session(refid):
+        return False, refid
+    if _compra_exists(ws_cmp, refid):
+        return False, refid
+
+    total = round(float(qtd_un) * float(custo_unit), 2)
+    _rewrite_append(ws_cmp, {
+        "Data": data_str,
+        "Produto": prod_dict.get(COLP["nome"], ""),
+        "Unidade": prod_dict.get(COLP["unidade"], "") or "un",
+        "Fornecedor": "Produção interna",
+        "Qtd": str(int(qtd_un)) if float(qtd_un).is_integer() else str(qtd_un).replace(".", ","),
+        "Custo Unitário": f"{float(custo_unit):.2f}".replace(".", ","),
+        "Total": f"{total:.2f}".replace(".", ","),
+        "IDProduto": prod_dict.get(COLP["id"], ""),
+        "Obs": (obs_extra or "").strip(),
+        "RefID": refid
+    })
+    return True, refid
+
+st.markdown("### Confirmar operação")
+ok_btn = st.button("✅ Gerar fracionamento agora")
+
+if ok_btn:
+    data_str = data_op.strftime("%d/%m/%Y")
+
+    if litros_usados <= 0:
+        st.error("Preencha pelo menos uma linha válida (SKU, volume e quantidade)."); st.stop()
+    if litros_usados > saldo_l:
+        st.error("Litros usados excedem o estoque atual do granel."); st.stop()
+
+    # prepara planilhas
+    ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+    ws_cmp = _ensure_ws("Compras", COMPRAS_HEADERS)
+
+    # 1) saída do granel
+    _append_mov_saida_granel(ws_mov, data_str, litros_usados)
+
+    # 2) entradas dos fracionados (+ compras internas opcionais)
+    criados = []
+    for r in rows:
+        if not r.get("sku") or r["sku"] == "(selecione)": 
+            continue
+        vol = _to_float(r.get("vol_l", ""))
+        qtd = _to_float(r.get("qtd", ""))
+        emb = _to_float(r.get("embalagem", "")) or 0.0
+        if vol in ("", None) or qtd in ("", None) or qtd == 0:
+            continue
+
+        prod_out = _find_row_by_label(r["sku"])
+        if not prod_out:
+            continue
+
+        # custo do fracionado = (custo por litro do GRANEL) * vol + embalagem
+        # custo por litro: usamos CustoAtual do granel (se existir), senão 0
+        custo_granel = _to_float(row_g.get(COLP["custo"], "")) or 0.0
+        custo_unit_out = round(custo_granel * float(vol) + float(emb), 4)
+
+        # entrada no MOV
+        _append_mov_entrada_saida(ws_mov, data_str, prod_out, qtd)
+
+        # compra interna (opcional)
+        if gerar_compras:
+            ok, rid = _upsert_compra_interna(
+                ws_cmp, data_str, prod_out, qtd, custo_unit_out,
+                obs_extra=f"{batch_id} — produção interna (vol={vol}L; emb={emb})"
+            )
+            # ok=False significa duplicado (já existia), mas o MOV já entrou; tudo certo
+        criados.append({
+            "Produto": prod_out.get(COLP["nome"], ""),
+            "Qtd": qtd,
+            "CustoUnit(calc)": custo_unit_out
+        })
+
+    st.success("Fracionamento lançado com sucesso! ✅")
+    if criados:
+        st.write("**Entradas geradas (fracionados):**")
+        st.dataframe(pd.DataFrame(criados))
+    st.info(f"Batch: {batch_id} • Saída do granel: {litros_usados} L • Data: {data_str}")
 
 st.divider()
-
-# =============================================================================
-# EDITAR EXISTENTE
-# =============================================================================
-if modo == "Editar existente":
-    cc0, cc1, cc2, cc3 = st.columns([1.6, 1.1, 1.1, 1.2])
-    with cc0: usar_lista = st.checkbox("Selecionar da lista (auto-sugestão)", value=True)
-    with cc1: apenas_ativos = st.checkbox("Apenas ativos", value=True)
-    with cc2: so_estoque = st.checkbox("Somente com estoque (>0)", value=False)
-    with cc3: recalc_auto = st.checkbox("Atualizar campos calculados", value=True)
-
-    base = df.copy()
-    if COL["ativo"] and apenas_ativos:
-        base = base[ base[COL["ativo"]].astype(str).str.strip().str.lower().isin(["1","true","sim","ativo","yes"]) ]
-    if COL["estoque"] and so_estoque:
-        def _gt0(x):
-            try: return float(str(x).replace(",", ".").strip()) > 0
-            except: return False
-        base = base[ base[COL["estoque"]].apply(_gt0) ]
-
-    if usar_lista:
-        if base.empty:
-            st.info("Nada encontrado."); st.stop()
-        def _fmt_row(r):
-            nome = str(r.get(COL["nome"], "(sem nome)"))
-            forn = str(r.get(COL["forn"], "")).strip()
-            preco = str(r.get(COL["preco"], "")).strip()
-            return f"{nome}" + (f" — {forn}" if forn else "") + (f" — R$ {preco}" if preco else "")
-        labels = base.apply(_fmt_row, axis=1).tolist()
-        escolha = st.selectbox("Produto (digite para filtrar…)", ["(selecione)"] + labels, index=0)
-        if escolha == "(selecione)":
-            st.stop()
-        pos = labels.index(escolha)
-        sel = base.iloc[pos].to_dict()
-    else:
-        termo = st.text_input("🔎 Buscar", placeholder="Nome, fornecedor, categoria, código de barras…").strip()
-        if termo:
-            t = termo.lower()
-            base = base[base.apply(lambda row: t in " ".join([str(x).lower() for x in row.values]), axis=1)]
-        if base.empty:
-            st.info("Nada encontrado."); st.stop()
-        nomes_fmt = base.apply(
-            lambda r: f'{str(r.get(COL["nome"],"(sem nome)"))} — {str(r.get(COL["forn"],"")).strip() or "s/ forn"} — R$ {str(r.get(COL["preco"],"")).strip()}',
-            axis=1
-        ).tolist()
-        pos = st.selectbox("Selecione", options=range(len(base)), format_func=lambda i: nomes_fmt[i])
-        sel = base.iloc[pos].to_dict()
-
-    st.subheader("Editar")
-    with st.form("editar_produto"):
-        c1, c2, c3 = st.columns([1.6,1,1])
-        with c1: nome = st.text_input("Nome", value=str(sel.get(COL["nome"],"")).strip())
-        with c2: categoria = st.text_input("Categoria", value=str(sel.get(COL["categoria"],"")).strip())
-        with c3: fornecedor = st.text_input("Fornecedor", value=str(sel.get(COL["forn"],"")).strip())
-        c4, c5, c6 = st.columns([1,1,1])
-        with c4: preco = st.text_input("Preço venda (R$)", value=str(sel.get(COL["preco"],"")).strip())
-        with c5: estoque = st.text_input("Estoque atual (un)", value=str(sel.get(COL["estoque"],"")).strip())
-        with c6:
-            ativo_flag = str(sel.get(COL["ativo"],"")).strip().lower() in ["1","true","sim","ativo","yes"]
-            ativo = st.checkbox("Ativo", value=ativo_flag)
-
-        # --- compra/entrada opcional na edição ---
-        st.markdown("#### 🧾 Lançar nova compra/entrada (opcional)")
-        c7, c8, c9, c10 = st.columns([1,1,1,1])
-        with c7: data_compra_e = st.date_input("Data da compra", value=date.today(), key="dc_e")
-        with c8: qtd_compra_e  = st.text_input("Qtd comprada", placeholder="Ex.: 10", key="qc_e")
-        with c9: custo_unit_e  = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50", key="cu_e")
-        with c10: unid_compra_e = st.text_input("Unidade", value=str(sel.get(COL["unidade"],"")), key="un_e")
-        forn_compra_e = st.text_input("Fornecedor (compra)", value=fornecedor, key="fo_e")
-        obs_compra_e  = st.text_input("Observações (opcional)", key="ob_e")
-
-        salvar = st.form_submit_button("💾 Atualizar produto")
-
-    if salvar:
-        if not nome.strip():
-            st.error("Informe o **Nome**."); st.stop()
-        pf = _to_float(preco)
-        if pf == "": st.error("Preço inválido. Use números (ex: 19,90)."); st.stop()
-        est_in = _to_int(estoque); est_in = None if est_in == "" else est_in
-
-        updates = {}
-        if COL["nome"]:      updates[COL["nome"]] = nome.strip()
-        if COL["categoria"]: updates[COL["categoria"]] = categoria.strip()
-        if COL["forn"]:      updates[COL["forn"]] = fornecedor.strip()
-        if COL["preco"]:     updates[COL["preco"]] = f"{pf:.2f}".replace(".", ",")
-
-        # compra/entrada opcional
-        qtd_f = _to_float(qtd_compra_e)
-        cst_f = _to_float(custo_unit_e)
-        fazer_compra_e = (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0))
-        if fazer_compra_e:
-            ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
-            total = round(float(qtd_f) * float(cst_f), 2)
-            prod_id = sel.get(COL["id"], sel.get("ID", ""))
-            _append_row(ws_compras, {
-                "Data": data_compra_e.strftime("%d/%m/%Y"),
-                "Produto": nome.strip(),
-                "Unidade": (unid_compra_e or "").strip(),
-                "Fornecedor": (forn_compra_e or "").strip(),
-                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
-                "Total": f"{total:.2f}".replace(".", ","),
-                "IDProduto": prod_id,
-                "Obs": obs_compra_e or ""
-            })
-            ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-            _append_row(ws_mov, {
-                "Data": data_compra_e.strftime("%d/%m/%Y"),
-                "IDProduto": prod_id,
-                "Produto": nome.strip(),
-                "Tipo": "entrada",
-                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                "Obs": f"Compra — {obs_compra_e or ''}".strip()
-            })
-            if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-            if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
-
-        # Recalc automáticos (estoque min, lead etc.)
-        if recalc_auto or fazer_compra_e:
-            custo_prev, unid_prev = _last_cost_and_unit(nome, fornecedor)
-            lead_prev = _lead_time_fornecedor(fornecedor)
-            avg30 = _avg_daily_sales_30d(sel.get(COL["id"], ""), nome)
-            estmin = _calc_est_min(avg30, lead_prev)
-            if (custo_prev is not None) and COL["custo"]:   updates.setdefault(COL["custo"], f"{custo_prev:.2f}".replace(".", ","))
-            if unid_prev and COL["unidade"]:                updates.setdefault(COL["unidade"], unid_prev)
-            if (lead_prev is not None) and COL["lead"]:     updates.setdefault(COL["lead"], str(lead_prev))
-            saldo = _stock_balance(sel.get(COL["id"], ""), nome)
-            if COL["estoque"]:                               updates.setdefault(COL["estoque"], str(saldo if saldo is not None else (est_in or 0)))
-            if COL["est_min"]:                               updates[COL["est_min"]] = str(estmin)
-        else:
-            if est_in is not None and COL["estoque"]:
-                updates[COL["estoque"]] = str(est_in)
-
-        if COL["ativo"]:       updates[COL["ativo"]] = "sim" if ativo else "não"
-        if COL["atualizado"]:  updates[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-        id_col = COL["id"] or "ID"
-        if id_col not in df.columns:
-            st.error("Coluna de ID não encontrada."); st.stop()
-        row_mask = (df[id_col] == sel.get(id_col, ""))
-        if not row_mask.any():
-            st.error("Linha não localizada."); st.stop()
-
-        ws = _sheet().worksheet(ABA)
-        df_old = _load_df(ABA)
-        ids = df_old[id_col].tolist()
-        i = ids.index(sel.get(id_col, "")) if sel.get(id_col, "") in ids else None
-        if i is None:
-            st.error("Falha ao localizar a linha."); st.stop()
-        for col, val in updates.items():
-            if col in df_old.columns:
-                df_old.loc[i, col] = val
-        ws.clear()
-        set_with_dataframe(ws, df_old.fillna(""), include_index=False, include_column_header=True, resize=True)
-        _msg_ok("Produto atualizado com sucesso! 👍")
-
-# =============================================================================
-# CADASTRAR NOVO (com trava anti-duplicidade Nome+Fornecedor)
-# =============================================================================
-else:
-    st.subheader("Cadastrar novo produto")
-    with st.form("cadastrar_produto"):
-        c1, c2, c3 = st.columns([1.6,1,1])
-        with c1: nome = st.text_input("Nome")
-        with c2: categoria = st.text_input("Categoria", placeholder="Ex.: limpeza, higiene…")
-        with c3: fornecedor = st.text_input("Fornecedor")
-        c4, c5 = st.columns([1,1])
-        with c4: preco = st.text_input("Preço venda (R$)", placeholder="19,90")
-        with c5: ativo = st.checkbox("Ativo", value=True)
-
-        st.markdown("#### 📦 Estoque inicial (opcional, recomendado)")
-        c6, c7, c8, c9 = st.columns([1,1,1,1])
-        with c6: qtd_compra = st.text_input("Qtd comprada", placeholder="Ex.: 10")
-        with c7: custo_unit = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50")
-        with c8: unid_compra = st.text_input("Unidade", placeholder="Ex.: un, cx, pct")
-        with c9: data_compra = st.date_input("Data da compra", value=date.today())
-        forn_compra = st.text_input("Fornecedor (compra)", value=fornecedor)
-        obs_compra  = st.text_input("Observações (opcional)")
-
-        atualizar_se_existir = st.checkbox("Se já existir (mesmo Nome+Fornecedor), atualizar em vez de criar", value=True)
-
-        salvar = st.form_submit_button("➕ Cadastrar produto")
-
-    if salvar:
-        if not nome.strip():
-            st.error("Informe o **Nome**."); st.stop()
-        pf = _to_float(preco)
-        if pf == "":
-            st.error("Preço inválido. Use números (ex: 19,90)."); st.stop()
-
-        # Índice por chave normalizada Nome+Fornecedor
-        df_atual = _load_df(ABA)
-        key_map = _prod_index_by_key(df_atual, COL)
-        this_key = _norm_key(nome, fornecedor)
-        dup_idx = key_map.get(this_key)
-
-        if dup_idx is not None and not atualizar_se_existir:
-            st.error("Produto já cadastrado (mesmo Nome+Fornecedor). Use **Editar existente**.")
-            st.stop()
-
-        if dup_idx is not None:
-            # ===== ATUALIZA LINHA EXISTENTE =====
-            existing_id = str(df_atual.iloc[dup_idx].get(COL["id"] or "ID", "")).strip() or _gen_id()
-
-            custo_hist, unid_hist = _last_cost_and_unit(nome, fornecedor)
-            lead = _lead_time_fornecedor(fornecedor)
-            saldo = _stock_balance(existing_id, nome)
-            avg30 = _avg_daily_sales_30d(existing_id, nome)
-            estmin = _calc_est_min(avg30, lead)
-
-            updates = {}
-            if COL["nome"]:      updates[COL["nome"]] = nome.strip()
-            if COL["categoria"]: updates[COL["categoria"]] = categoria.strip()
-            if COL["forn"]:      updates[COL["forn"]] = fornecedor.strip()
-            if COL["preco"]:     updates[COL["preco"]] = f"{float(pf):.2f}".replace(".", ",")
-            if (custo_hist is not None) and COL["custo"]: updates[COL["custo"]] = f"{float(custo_hist):.2f}".replace(".", ",")
-            if COL["estoque"]:   updates[COL["estoque"]] = str(saldo if saldo is not None else 0)
-            if COL["est_min"]:   updates[COL["est_min"]] = str(estmin)
-            if (lead is not None) and COL["lead"]: updates[COL["lead"]] = str(lead)
-            if unid_hist and COL["unidade"]: updates[COL["unidade"]] = unid_hist
-            if COL["ativo"]:     updates[COL["ativo"]] = "sim" if ativo else "não"
-            if COL["atualizado"]: updates[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-            for col, val in updates.items():
-                if col in df_atual.columns:
-                    df_atual.loc[dup_idx, col] = val
-
-            # compra/entrada opcional
-            qtd_f = _to_float(qtd_compra)
-            cst_f = _to_float(custo_unit)
-            if (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0)):
-                ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
-                total = round(float(qtd_f) * float(cst_f), 2)
-                _append_row(ws_compras, {
-                    "Data": data_compra.strftime("%d/%m/%Y"),
-                    "Produto": nome.strip(),
-                    "Unidade": (unid_compra or "").strip(),
-                    "Fornecedor": (forn_compra or fornecedor or "").strip(),
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
-                    "Total": f"{total:.2f}".replace(".", ","),
-                    "IDProduto": existing_id,
-                    "Obs": obs_compra or ""
-                })
-                ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-                _append_row(ws_mov, {
-                    "Data": data_compra.strftime("%d/%m/%Y"),
-                    "IDProduto": existing_id,
-                    "Produto": nome.strip(),
-                    "Tipo": "entrada",
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Obs": f"Compra inicial — {obs_compra or ''}".strip()
-                })
-
-            ws = _sheet().worksheet(ABA)
-            ws.clear()
-            set_with_dataframe(ws, df_atual.fillna(""), include_index=False, include_column_header=True, resize=True)
-            _msg_ok("✅ Produto já existia — dados atualizados (sem duplicar).")
-            st.toast("Atualizado (sem duplicar).", icon="✅")
-
-        else:
-            # ===== CRIA NOVA LINHA =====
-            novo_id = _gen_id()
-
-            # calculados básicos
-            custo_hist, unid_hist = _last_cost_and_unit(nome, fornecedor)
-            lead = _lead_time_fornecedor(fornecedor)
-            saldo = _stock_balance(None, nome)
-            avg30 = _avg_daily_sales_30d(None, nome)
-            estmin = _calc_est_min(avg30, lead)
-
-            new_row = {}
-            if COL["id"]:        new_row[COL["id"]] = novo_id
-            if COL["nome"]:      new_row[COL["nome"]] = nome.strip()
-            if COL["categoria"]: new_row[COL["categoria"]] = categoria.strip()
-            if COL["forn"]:      new_row[COL["forn"]] = fornecedor.strip()
-            if COL["preco"]:     new_row[COL["preco"]] = f"{float(pf):.2f}".replace(".", ",")
-            if (custo_hist is not None) and COL["custo"]: new_row[COL["custo"]] = f"{float(custo_hist):.2f}".replace(".", ",")
-            if COL["estoque"]:   new_row[COL["estoque"]] = str(saldo if saldo is not None else 0)
-            if COL["est_min"]:   new_row[COL["est_min"]] = str(estmin)
-            if (lead is not None) and COL["lead"]: new_row[COL["lead"]] = str(lead)
-            if unid_hist and COL["unidade"]: new_row[COL["unidade"]] = unid_hist
-            if COL["ativo"]:     new_row[COL["ativo"]] = "sim" if ativo else "não"
-            if COL["atualizado"]: new_row[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-            # estoque inicial (opcional)
-            qtd_f = _to_float(qtd_compra)
-            cst_f = _to_float(custo_unit)
-            if (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0)):
-                ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
-                total = round(float(qtd_f) * float(cst_f), 2)
-                _append_row(ws_compras, {
-                    "Data": data_compra.strftime("%d/%m/%Y"),
-                    "Produto": nome.strip(),
-                    "Unidade": (unid_compra or "").strip(),
-                    "Fornecedor": (forn_compra or fornecedor or "").strip(),
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
-                    "Total": f"{total:.2f}".replace(".", ","),
-                    "IDProduto": new_row.get(COL["id"], novo_id),
-                    "Obs": obs_compra or ""
-                })
-                ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-                _append_row(ws_mov, {
-                    "Data": data_compra.strftime("%d/%m/%Y"),
-                    "IDProduto": new_row.get(COL["id"], novo_id),
-                    "Produto": nome.strip(),
-                    "Tipo": "entrada",
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Obs": f"Compra inicial — {obs_compra or ''}".strip()
-                })
-                if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-
-            # grava Produtos
-            for col in df_atual.columns: new_row.setdefault(col, "")
-            df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
-            ws = _sheet().worksheet(ABA)
-            ws.clear()
-            set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
-            _msg_ok("Produto cadastrado com sucesso! ✅")
-            st.toast("Cadastro concluído", icon="✅")
-            st.balloons()
-
-st.divider()
-st.page_link("pages/01_produtos.py", label="↩️ Ir para Catálogo de Produtos", icon="📦")
+st.page_link("pages/01_produtos.py", label="📦 Ir para Catálogo de Produtos", icon="📦")
 st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
