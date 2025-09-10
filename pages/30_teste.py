@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos
-import json, unicodedata, math, hashlib
+# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos (com Telegram)
+import json, unicodedata, math
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta, date
+import requests  # <<< NOVO: Telegram
 
 st.set_page_config(page_title="Cadastrar/Editar Produto", page_icon="➕", layout="wide")
 st.title("➕ Cadastrar / Editar Produto")
@@ -80,117 +81,62 @@ def _msg_ok(msg):
     try: st.cache_data.clear()
     except: pass
 
-# =============================================================================
-# Helpers de planilha (não-destrutivos)
-# =============================================================================
-def _ensure_headers_preserving(ws, required_headers: list[str]):
-    """
-    Garante que as colunas existam, preservando os dados.
-    Se faltar coluna, regrava o DF atual acrescido das colunas faltantes (vazias).
-    """
-    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
-    cur.columns = [c.strip() for c in cur.columns]
-    missing = [h for h in required_headers if h not in cur.columns]
-    if not missing:
-        return
-
-    # acrescenta colunas faltantes vazias e reordena: [existentes] + [faltantes]
-    for h in missing:
-        cur[h] = ""
-    cols_out = list(cur.columns)  # já contém existentes + faltantes no final
-    ws.clear()
-    set_with_dataframe(ws, cur.reindex(columns=cols_out).fillna(""),
-                       include_index=False, include_column_header=True, resize=True)
-
-def _append_row_fullrewrite(ws, row: dict):
-    """
-    Lê tudo, concatena a nova linha e regrava a planilha inteira (manter consistência).
-    """
-    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
-    cur.columns = [c.strip() for c in cur.columns]
-    # garante que todas as colunas atuais estejam no row
-    for col in cur.columns:
-        row.setdefault(col, "")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
 def _ensure_ws(name: str, headers: list[str]):
-    """
-    Cria worksheet se não existir. Se existir, só garante colunas (sem perder dados).
-    """
     sh = _sheet()
     try:
         ws = sh.worksheet(name)
+        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+        if cur.empty or any(h not in cur.columns for h in headers):
+            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
+            df_head = pd.DataFrame(columns=cols)
+            ws.clear()
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
     except Exception:
         ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
         df_head = pd.DataFrame(columns=headers)
         set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
         return ws
 
-    _ensure_headers_preserving(ws, headers)
-    return ws
+def _append_row(ws, row: dict):
+    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+    for col in cur.columns:
+        row.setdefault(col, "")
+    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
 # =============================================================================
-# Anti-duplicidade (RefID de compra) + guarda de sessão
+# Telegram — utilitários
 # =============================================================================
-def _norm_val_str(x) -> str:
-    """Normaliza números/moedas p/ string padronizada p/ hash."""
-    if x is None: return ""
-    s = str(x).strip()
-    s = s.replace("R$", "").replace(".", "").replace(",", ".")
+TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID_PRODUTOS") or st.secrets.get("TELEGRAM_CHAT_ID")
+TELEGRAM_ENABLED = str(st.secrets.get("TELEGRAM_ENABLED", "1")).strip() == "1"
+
+def _tg_ready() -> bool:
+    return TELEGRAM_ENABLED and bool(TELEGRAM_TOKEN) and bool(TELEGRAM_CHAT_ID)
+
+def _tg_send(text: str) -> bool:
+    if not _tg_ready():
+        return False
     try:
-        v = float(s)
-        return f"{v:.6f}"
-    except:
-        return str(x).strip().lower()
-
-def _make_refid_compra(data_str: str, produto: str, fornecedor: str, qtd: str, custo_unit: str) -> str:
-    """
-    Gera RefID estável baseado em Data|Produto|Fornecedor|Qtd|CustoUnit (data em 'dd/mm/aaaa').
-    """
-    base = "|".join([
-        (data_str or "").strip(),
-        (produto or "").strip().lower(),
-        (fornecedor or "").strip().lower(),
-        _norm_val_str(qtd),
-        _norm_val_str(custo_unit),
-    ])
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
-
-def _seen_refid_in_session(refid: str) -> bool:
-    bag = st.session_state.setdefault("_seen_compra_refids", set())
-    if refid in bag:
-        return True
-    bag.add(refid)
-    return False
-
-def _compra_ja_existe_df(df: pd.DataFrame, refid: str) -> bool:
-    if df.empty: return False
-    cols = [c.strip() for c in df.columns]
-    if "RefID" not in cols: return False
-    return refid in df["RefID"].astype(str).tolist()
-
-def _upsert_compra(ws_compras, row_with_refid: dict) -> bool:
-    """
-    Retorna True se inseriu, False se já existia (pelo RefID).
-    Opera como 'upsert' p/ reduzir janela de corrida.
-    """
-    _ensure_headers_preserving(ws_compras, COMPRAS_HEADERS)
-    cur = get_as_dataframe(ws_compras, evaluate_formulas=True, dtype=str, header=0)
-    cur.columns = [c.strip() for c in cur.columns]
-
-    refid = str(row_with_refid.get("RefID", "")).strip()
-    if refid and _compra_ja_existe_df(cur, refid):
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, data=payload, timeout=8)
+        return r.ok
+    except Exception:
         return False
 
-    # append e regrava
-    for col in cur.columns:
-        row_with_refid.setdefault(col, "")
-    out = pd.concat([cur, pd.DataFrame([row_with_refid])], ignore_index=True)
-    ws_compras.clear()
-    set_with_dataframe(ws_compras, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-    return True
+def _fmt_money(v) -> str:
+    try:
+        return f"R$ {float(v):.2f}".replace(".", ",")
+    except:
+        return str(v)
 
 # =============================================================================
 # Mapeamentos flexíveis
@@ -230,8 +176,7 @@ def _map_cols_compras(df):
         "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
         "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Custo Unit","PrecoUnitario","Preço Unitário"]),
         "total": _pick_col(df, ["Total","ValorTotal"]),
-        "id": _pick_col(df, ["IDProduto","ID"]),
-        "refid": _pick_col(df, ["RefID"])
+        "id": _pick_col(df, ["IDProduto","ID"])
     }
 
 def _map_cols_mov(df):
@@ -279,7 +224,7 @@ VEN = _map_cols_vendas(vendas_df) if not vendas_df.empty else {}
 FD  = _map_cols_forn(forn_df) if not forn_df.empty else {}
 
 # Cabeçalhos padrão (se criar do zero)
-COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs","RefID"]
+COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
 MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
 
 # =============================================================================
@@ -438,6 +383,9 @@ if modo == "Editar existente":
         forn_compra_e = st.text_input("Fornecedor (compra)", value=fornecedor, key="fo_e")
         obs_compra_e  = st.text_input("Observações (opcional)", key="ob_e")
 
+        # Telegram na edição (para compra/entrada)
+        notif_tg_edit = st.checkbox("Notificar no Telegram esta compra/entrada", value=True)
+
         salvar = st.form_submit_button("💾 Atualizar produto")
 
     if salvar:
@@ -461,45 +409,41 @@ if modo == "Editar existente":
             ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
             total = round(float(qtd_f) * float(cst_f), 2)
             prod_id = sel.get(COL["id"], sel.get("ID", ""))
+            _append_row(ws_compras, {
+                "Data": data_compra_e.strftime("%d/%m/%Y"),
+                "Produto": nome.strip(),
+                "Unidade": (unid_compra_e or "").strip(),
+                "Fornecedor": (forn_compra_e or "").strip(),
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+                "Total": f"{total:.2f}".replace(".", ","),
+                "IDProduto": prod_id,
+                "Obs": obs_compra_e or ""
+            })
+            ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+            _append_row(ws_mov, {
+                "Data": data_compra_e.strftime("%d/%m/%Y"),
+                "IDProduto": prod_id,
+                "Produto": nome.strip(),
+                "Tipo": "entrada",
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Obs": f"Compra — {obs_compra_e or ''}".strip()
+            })
+            if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+            if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
 
-            refid = _make_refid_compra(
-                data_compra_e.strftime("%d/%m/%Y"),
-                nome.strip(),
-                (forn_compra_e or "").strip(),
-                str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                f"{float(cst_f):.2f}".replace(".", ","),
-            )
-
-            # trava de sessão (evita duplo submit/refresh)
-            if _seen_refid_in_session(refid):
-                st.warning("⚠️ Detected submit repetido desta compra nesta sessão. Nada foi gravado novamente.")
-            else:
-                ok = _upsert_compra(ws_compras, {
-                    "Data": data_compra_e.strftime("%d/%m/%Y"),
-                    "Produto": nome.strip(),
-                    "Unidade": (unid_compra_e or "").strip(),
-                    "Fornecedor": (forn_compra_e or "").strip(),
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
-                    "Total": f"{total:.2f}".replace(".", ","),
-                    "IDProduto": prod_id,
-                    "Obs": obs_compra_e or "",
-                    "RefID": refid
-                })
-                if not ok:
-                    st.warning("⚠️ Esta compra já existe (RefID duplicado). Lançamento ignorado.")
-                else:
-                    ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-                    _append_row_fullrewrite(ws_mov, {
-                        "Data": data_compra_e.strftime("%d/%m/%Y"),
-                        "IDProduto": prod_id,
-                        "Produto": nome.strip(),
-                        "Tipo": "entrada",
-                        "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                        "Obs": f"Compra — {obs_compra_e or ''}".strip()
-                    })
-                    if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-                    if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
+            # >>> Telegram (compra/entrada na edição)
+            if notif_tg_edit:
+                msg = (
+                    "🧾 <b>Compra/Entrada registrada</b>\n"
+                    f"<b>Produto:</b> {nome}\n"
+                    f"<b>Qtd:</b> {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
+                    f"<b>Custo unit.:</b> {_fmt_money(cst_f)}\n"
+                    f"<b>Total:</b> {_fmt_money(total)}\n"
+                    f"<b>Fornecedor:</b> {(forn_compra_e or '').strip() or '—'}\n"
+                    f"<b>Data:</b> {data_compra_e.strftime('%d/%m/%Y')}"
+                )
+                _tg_send(msg)
 
         # Recalc automáticos (estoque min, lead etc.)
         if recalc_auto or fazer_compra_e:
@@ -563,6 +507,9 @@ else:
         forn_compra = st.text_input("Fornecedor (compra)", value=fornecedor)
         obs_compra  = st.text_input("Observações (opcional)")
 
+        # Telegram no cadastro
+        notif_tg_new = st.checkbox("Notificar no Telegram este cadastro", value=True)
+
         salvar = st.form_submit_button("➕ Cadastrar produto")
 
     if salvar:
@@ -601,43 +548,28 @@ else:
         if fazer_compra:
             ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
             total = round(float(qtd_f) * float(cst_f), 2)
-            refid = _make_refid_compra(
-                data_compra.strftime("%d/%m/%Y"),
-                nome.strip(),
-                (forn_compra or fornecedor or "").strip(),
-                str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                f"{float(cst_f):.2f}".replace(".", ","),
-            )
-
-            if _seen_refid_in_session(refid):
-                st.warning("⚠️ Submit repetido desta compra nesta sessão. Ignorado.")
-            else:
-                ok = _upsert_compra(ws_compras, {
-                    "Data": data_compra.strftime("%d/%m/%Y"),
-                    "Produto": nome.strip(),
-                    "Unidade": (unid_compra or "").strip(),
-                    "Fornecedor": (forn_compra or fornecedor or "").strip(),
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
-                    "Total": f"{total:.2f}".replace(".", ","),
-                    "IDProduto": new_row.get(COL["id"], novo_id),
-                    "Obs": obs_compra or "",
-                    "RefID": refid
-                })
-                if not ok:
-                    st.warning("⚠️ Estoque inicial não lançado: compra idêntica já existe (RefID duplicado).")
-                else:
-                    ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-                    _append_row_fullrewrite(ws_mov, {
-                        "Data": data_compra.strftime("%d/%m/%Y"),
-                        "IDProduto": new_row.get(COL["id"], novo_id),
-                        "Produto": nome.strip(),
-                        "Tipo": "entrada",
-                        "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                        "Obs": f"Compra inicial — {obs_compra or ''}".strip()
-                    })
-                    if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-                    if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
+            _append_row(ws_compras, {
+                "Data": data_compra.strftime("%d/%m/%Y"),
+                "Produto": nome.strip(),
+                "Unidade": (unid_compra or "").strip(),
+                "Fornecedor": (forn_compra or fornecedor or "").strip(),
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+                "Total": f"{total:.2f}".replace(".", ","),
+                "IDProduto": new_row.get(COL["id"], novo_id),
+                "Obs": obs_compra or ""
+            })
+            ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+            _append_row(ws_mov, {
+                "Data": data_compra.strftime("%d/%m/%Y"),
+                "IDProduto": new_row.get(COL["id"], novo_id),
+                "Produto": nome.strip(),
+                "Tipo": "entrada",
+                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                "Obs": f"Compra inicial — {obs_compra or ''}".strip()
+            })
+            if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+            if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
 
         # grava na aba Produtos
         ws = _sheet().worksheet(ABA)
@@ -646,6 +578,26 @@ else:
             new_row.setdefault(col, "")
         df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
         set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+        # >>> Telegram (cadastro de novo produto)
+        if notif_tg_new:
+            msg = (
+                "➕ <b>Novo produto cadastrado</b>\n"
+                f"<b>Nome:</b> {nome.strip()}\n"
+                f"<b>Categoria:</b> {categoria.strip() or '—'}\n"
+                f"<b>Fornecedor:</b> {fornecedor.strip() or '—'}\n"
+                f"<b>Preço venda:</b> {_fmt_money(pf)}\n"
+                f"<b>ID:</b> {new_row.get(COL['id'], novo_id)}"
+            )
+            if fazer_compra:
+                msg += (
+                    "\n<b>Estoque inicial:</b>\n"
+                    f"• Qtd: {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
+                    f"• Custo unit.: {_fmt_money(cst_f)}\n"
+                    f"• Total: {_fmt_money(float(qtd_f)*float(cst_f))}\n"
+                    f"• Data: {data_compra.strftime('%d/%m/%Y')}"
+                )
+            _tg_send(msg)
 
         _msg_ok("Produto cadastrado com sucesso! ✅")
         st.toast("Cadastro concluído", icon="✅")
