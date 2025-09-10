@@ -1,4 +1,4 @@
-# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com _rerun, clamps e Telegram
+# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com _rerun e clamps de Qtd/Preço
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date
@@ -7,7 +7,6 @@ import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-import requests  # <-- para Telegram
 
 st.set_page_config(page_title="Vendas", page_icon="🧾", layout="wide")
 st.title("🧾 Vendas (carrinho)")
@@ -78,138 +77,6 @@ def _fmt_brl_num(v):
 # ================= Abas/colunas =================
 ABA_PROD = "Produtos"
 ABA_VEND = "Vendas"
-
-# ==================== TELEGRAM (lojinha) ====================
-def _tg_token() -> str | None:
-    try:
-        v = st.secrets.get("TELEGRAM_TOKEN", "").strip()
-        return v or None
-    except Exception:
-        return None
-
-def _tg_chat() -> str | None:
-    try:
-        v = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "").strip()
-        return v or None
-    except Exception:
-        return None
-
-def _tg_ready() -> bool:
-    return bool((_tg_token() or "").strip() and (_tg_chat() or "").strip())
-
-def tg_send_loja(text: str) -> tuple[bool, str]:
-    """Envia texto para o canal da lojinha. Retorna (ok, erro_str)."""
-    token, chat_id = _tg_token(), _tg_chat()
-    if not token or not chat_id:
-        return (False, "🛑 TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID_LOJINHA ausente nos secrets.")
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=30)
-        js = {}
-        try: js = r.json()
-        except Exception: pass
-        if r.ok and js.get("ok"): return (True, "")
-        return (False, f"Telegram erro: HTTP {r.status_code} • {js}")
-    except Exception as e:
-        return (False, f"Exceção Telegram: {e}")
-
-def _fmt_brl2(v: float) -> str:
-    try: v = float(v)
-    except Exception: v = 0.0
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-
-def make_card_caption_venda(venda_id: str, data_str: str, forma: str,
-                            itens: list[dict], desconto: float, total_bruto: float, total_liq: float) -> str:
-    linhas = [
-        "🧾 <b>Venda registrada</b>",
-        f"🗓️ Data: <b>{data_str}</b>",
-        f"🆔 Cupom: <code>{venda_id}</code>",
-        f"💳 Pagamento: <b>{forma}</b>",
-        "",
-        "📦 <b>Itens</b>",
-    ]
-    if itens:
-        for it in itens:
-            nome = (it.get("nome") or it.get("id") or "-")
-            qtd  = int(it.get("qtd", 0) or 0)
-            pu   = float(it.get("preco", 0) or 0.0)
-            linhas.append(f"• {nome} — {qtd} × {_fmt_brl2(pu)} = <b>{_fmt_brl2(qtd*pu)}</b>")
-    else:
-        linhas.append("—")
-    linhas += [
-        "",
-        "📊 <b>Totais</b>",
-        f"Bruto: <b>{_fmt_brl2(total_bruto)}</b>",
-    ]
-    if float(desconto or 0) > 0:
-        linhas.append(f"Desconto: <b>{_fmt_brl2(desconto)}</b>")
-    linhas.append(f"Líquido: <b>{_fmt_brl2(total_liq)}</b>")
-    return "\n".join(linhas)
-
-def make_resumo_do_dia_vendas(df_vend: pd.DataFrame, data_str: str) -> str:
-    if df_vend is None or df_vend.empty:
-        return f"📊 <b>Resumo do Dia (Lojinha)</b>\n🗓️ {data_str}\n—\nSem vendas."
-    d = df_vend.copy()
-    d["Data"] = d["Data"].astype(str).str.strip()
-    d = d[d["Data"] == data_str].copy()
-    if d.empty:
-        return f"📊 <b>Resumo do Dia (Lojinha)</b>\n🗓️ {data_str}\n—\nSem vendas."
-    d["_Qtd"]   = pd.to_numeric(d.get("Qtd", 0), errors="coerce").fillna(0).astype(int)
-    d["_Preco"] = pd.to_numeric(d.get("PrecoUnit", "0").astype(str).str.replace(",", "."), errors="coerce").fillna(0.0)
-    d["_Linha"] = d["_Qtd"] * d["_Preco"]
-    agg = d.groupby("VendaID", dropna=False).agg({
-        "_Linha":"sum",
-        "Desconto": lambda x: str(x.dropna().iloc[0]) if "Desconto" in d.columns else None,
-        "TotalCupom": lambda x: str(x.dropna().iloc[0]) if "TotalCupom" in d.columns else None,
-        "FormaPagto": lambda x: str(x.dropna().iloc[0]) if "FormaPagto" in d.columns else None
-    }).reset_index()
-
-    def _num_pt(s):
-        try:
-            ss = str(s).strip()
-            if not ss: return 0.0
-            ss = ss.replace(".", "").replace(",", ".")
-            return float(ss)
-        except: return 0.0
-
-    agg["_Desc"]   = agg["Desconto"].map(_num_pt) if "Desconto" in agg.columns else 0.0
-    agg["_TotalC"] = agg["TotalCupom"].map(_num_pt) if "TotalCupom" in agg.columns else 0.0
-
-    bruto_dia   = float(agg["_Linha"].sum())
-    desc_dia    = float(pd.to_numeric(agg["_Desc"], errors="coerce").fillna(0).sum())
-    liquido_dia = float(pd.to_numeric(agg["_TotalC"].replace(0, pd.NA), errors="coerce").fillna((agg["_Linha"]-agg["_Desc"])).sum())
-
-    if "FormaPagto" in agg.columns:
-        fser = agg["FormaPagto"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna()
-        formas_str = " • ".join(f"{k}: {v}" for k, v in fser.value_counts().to_dict().items()) if not fser.empty else "—"
-    else:
-        formas_str = "—"
-
-    linhas = [
-        "📊 <b>Resumo do Dia (Lojinha)</b>",
-        f"🗓️ {data_str}",
-        "—",
-        f"🧾 Cupons: <b>{len(agg)}</b>",
-        f"📦 Itens (linhas): <b>{int(d['_Qtd'].sum())}</b>",
-        f"💵 Bruto: <b>{_fmt_brl2(bruto_dia)}</b>",
-        f"🏷️ Descontos: <b>{_fmt_brl2(desc_dia)}</b>",
-        f"🪙 Líquido: <b>{_fmt_brl2(liquido_dia)}</b>",
-        f"💳 Formas: {formas_str}",
-    ]
-    return "\n".join(linhas)
-
-with st.expander("🔧 Debug Telegram (lojinha) — remova depois"):
-    def _mask(s, keep=6):
-        if not s: return "—"
-        s = str(s); return s[:keep] + "…" if len(s) > keep else s
-    tok, cid = _tg_token(), _tg_chat()
-    st.write("TOKEN presente?", bool(tok), _mask(tok or ""))
-    st.write("CHAT_ID_LOJINHA presente?", bool(cid), _mask(cid or ""))
-    st.write("Chaves carregadas:", list(st.secrets.keys()))
-    if st.button("📨 Testar Telegram (lojinha)"):
-        ok, err = tg_send_loja("✅ Teste lojinha (Streamlit).")
-        st.success("Mensagem enviada!") if ok else st.error(err or "Falhou")
 
 # ================= Catálogo =================
 try:
@@ -334,16 +201,10 @@ else:
         st.metric("Total líquido", _fmt_brl_num(total_liq))
 
     colA, colB = st.columns([1, 1])
-
-    # ========= registrar venda =========
     if colA.button("🧾 Registrar venda", type="primary", use_container_width=True):
         if not st.session_state["cart"]:
             st.warning("Carrinho vazio.")
         else:
-            # Mantém uma cópia do carrinho para o card do Telegram
-            cart_backup = list(st.session_state["cart"])
-            st.session_state["_last_cart"] = cart_backup
-
             # abre/cria Vendas
             sh = conectar_sheets()
             try:
@@ -386,47 +247,10 @@ else:
             ws.clear()
             set_with_dataframe(ws, df_novo)
 
-            # limpa cache e força refresh
+            # limpa carrinho e força refresh nas outras páginas
+            st.session_state["cart"] = []
             st.cache_data.clear()
             st.session_state["_force_refresh"] = True
-
-            # ========= Envio Telegram (card + resumo do dia) =========
-            try:
-                # Card da venda
-                card_txt = make_card_caption_venda(
-                    venda_id=venda_id,
-                    data_str=data_str,
-                    forma=st.session_state["forma"],
-                    itens=[{"id": it["id"], "nome": it.get("nome") or "", "qtd": int(it["qtd"]), "preco": float(it["preco"])} for it in cart_backup],
-                    desconto=desconto,
-                    total_bruto=total_bruto,
-                    total_liq=total_cupom
-                )
-                ok1, err1 = tg_send_loja(card_txt)
-
-                # Resumo do dia (recarrega Vendas da planilha)
-                try:
-                    vend_all = carregar_aba(ABA_VEND)
-                except Exception:
-                    vend_all = pd.DataFrame()
-                resumo_txt = make_resumo_do_dia_vendas(vend_all, data_str)
-                ok2, err2 = tg_send_loja(resumo_txt)
-
-                if ok1 and ok2:
-                    st.success(f"Venda registrada ({venda_id})! 📲 Card + resumo enviados.")
-                elif ok1 or ok2:
-                    st.warning(f"Venda registrada ({venda_id}). Só um dos envios do Telegram funcionou.")
-                    if not ok1 and err1: st.caption(f"Card: {err1}")
-                    if not ok2 and err2: st.caption(f"Resumo: {err2}")
-                else:
-                    st.warning(f"Venda registrada ({venda_id}), mas o Telegram falhou.")
-                    if err1: st.caption(f"Card: {err1}")
-                    if err2: st.caption(f"Resumo: {err2}")
-            except Exception as e:
-                st.warning(f"Venda registrada ({venda_id}), mas não consegui enviar ao Telegram: {e}")
-
-            # por último, limpa carrinho e avisa
-            st.session_state["cart"] = []
             st.success(f"Venda registrada ({venda_id})!")
 
     if colB.button("🧹 Limpar carrinho", use_container_width=True):
@@ -504,6 +328,7 @@ else:
                 p = float(_to_num(r[col_preco])) if col_preco else 0.0
                 if p < 0:
                     p = 0.0
+                # se por algum motivo veio 0, pula
                 if q == 0:
                     continue
                 cart.append({
@@ -526,6 +351,7 @@ else:
         def _cancelar_cupom(venda_id):
             if str(venda_id).startswith("CN-"):
                 st.warning("Esse cupom já é um estorno."); return
+            # evita duplo estorno
             if any(str(x).startswith(f"CN-{venda_id}") for x in vend[col_venda].unique()):
                 st.warning("Estorno já registrado para esse cupom."); return
 
@@ -569,4 +395,4 @@ else:
         c1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_carrega_carrinho, args=(row["VendaID"],))
         c2.button("⛔ Cancelar", key=f"cn_{i}", disabled=cancelado, on_click=_cancelar_cupom, args=(row["VendaID"],))
         c3.caption(row.get("Obs","") if isinstance(row.get("Obs",""), str) else "")
-        st.markdown("---")
+        st.markdown("---") 
