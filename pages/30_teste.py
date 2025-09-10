@@ -1,4 +1,4 @@
-# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar) — COM FIADO AUTOMÁTICO + CLIENTES CADASTRADOS
+# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date, timedelta
@@ -7,6 +7,7 @@ import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
+import requests  # <<< Telegram
 
 st.set_page_config(page_title="Vendas rápidas", page_icon="🧾", layout="wide")
 st.title("🧾 Vendas rápidas (carrinho)")
@@ -74,7 +75,6 @@ def _garantir_aba(sh, nome, cols):
         return ws
     headers = ws.row_values(1) or []
     headers = [h.strip() for h in headers]
-    # adiciona colunas faltantes ao final, mantendo as atuais
     falt = [c for c in cols if c not in headers]
     if falt:
         ws.update("A1", [headers + falt])
@@ -88,6 +88,38 @@ def _append_rows(ws, rows: list[dict]):
         to_append.append([d.get(h, "") for h in hdr])
     if to_append:
         ws.append_rows(to_append, value_input_option="USER_ENTERED")
+
+# -------------- Telegram helpers --------------
+def _tg_enabled() -> bool:
+    try:
+        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
+    except Exception:
+        return False
+
+def _tg_conf():
+    token = st.secrets.get("TELEGRAM_TOKEN", "")
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
+    return token, chat_id
+
+def _tg_send(msg: str):
+    """Envia mensagem para o Telegram se habilitado. Silencioso em erro."""
+    if not _tg_enabled():
+        return
+    token, chat_id = _tg_conf()
+    if not token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": str(chat_id),
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        requests.post(url, json=payload, timeout=6)
+    except Exception:
+        pass
+# ---------------------------------------------
 
 # ================= Abas principais =================
 ABA_PROD, ABA_VEND = "Produtos", "Vendas"
@@ -271,6 +303,7 @@ else:
 
             # ---- Se for FIADO, garante cadastro do cliente e cria o fiado
             fiado_id = ""
+            fiado_msg = ""
             if st.session_state["forma"] == "Fiado":
                 cli_nome = st.session_state.get("cliente","").strip()
 
@@ -292,12 +325,13 @@ else:
                 # cria fiado
                 ws_fiado = _garantir_aba(sh, ABA_FIADO, COLS_FIADO)
                 fiado_id = _gerar_id("F")
+                venc_str = st.session_state["venc_fiado"].strftime("%d/%m/%Y") if isinstance(st.session_state["venc_fiado"], date) else ""
                 linha_fiado = {
                     "ID": fiado_id,
                     "Data": data_str,
                     "Cliente": cli_nome,
                     "Valor": float(total_cupom),
-                    "Vencimento": st.session_state["venc_fiado"].strftime("%d/%m/%Y") if isinstance(st.session_state["venc_fiado"], date) else "",
+                    "Vencimento": venc_str,
                     "Status": "Em aberto",
                     "Obs": st.session_state.get("obs",""),
                     "DataPagamento": "",
@@ -305,6 +339,7 @@ else:
                     "ValorPago": ""
                 }
                 _append_rows(ws_fiado, [linha_fiado])
+                fiado_msg = f"\n💳 <b>Fiado</b> criado: <code>{fiado_id}</code>\n👤 Cliente: <b>{cli_nome}</b>\n📅 Vencimento: {venc_str}"
 
             # monta as linhas da venda (já com Cliente e FiadoID quando aplicável)
             novas = []
@@ -334,6 +369,25 @@ else:
             st.session_state["cart"] = []
             st.cache_data.clear()
             st.session_state["_force_refresh"] = True
+
+            # -------- Telegram: venda -----------
+            itens_txt = "\n".join([f"• {x['id']} x{x['qtd']} @ {_fmt_brl_num(x['preco'])}" for x in novas])
+            cliente_txt = st.session_state.get("cliente","").strip()
+            cliente_linha = f"\n👤 Cliente: <b>{cliente_txt}</b>" if cliente_txt else ""
+            msg = (
+                f"🧾 <b>Venda registrada</b>\n"
+                f"ID: <code>{venda_id}</code>\n"
+                f"Data: {data_str}\n"
+                f"Forma: {st.session_state['forma']}\n"
+                f"{'Desconto: ' + _fmt_brl_num(desconto) + '\\n' if desconto>0 else ''}"
+                f"Total: <b>{_fmt_brl_num(total_cupom)}</b>"
+                f"{cliente_linha}\n"
+                f"{'-'*18}\n"
+                f"{itens_txt}"
+                f"{fiado_msg}"
+            )
+            _tg_send(msg)
+            # -----------------------------------
 
             if fiado_id:
                 st.success(f"Venda registrada ({venda_id}) e Fiado criado/vinculado (ID {fiado_id}, total {_fmt_brl_num(total_cupom)}).")
@@ -439,16 +493,19 @@ else:
             cn_id = f"CN-{venda_id}"
             data_str = date.today().strftime("%d/%m/%Y")
             novas = []
+            total_estorno = 0.0
             for _, r in linhas.iterrows():
                 qtd = -abs(_to_num(r[col_qtd])) if col_qtd else -1
                 preco = _to_num(r[col_preco]) if col_preco else 0.0
+                total_linha = qtd*preco
+                total_estorno += total_linha
                 novas.append({
                     "Data": data_str,
                     "VendaID": cn_id,
                     "IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
                     "Qtd": str(int(qtd)),
                     "PrecoUnit": f"{preco:.2f}".replace(".", ","),
-                    "TotalLinha": f"{qtd*preco:.2f}".replace(".", ","),
+                    "TotalLinha": f"{total_linha:.2f}".replace(".", ","),
                     "FormaPagto": f"Estorno - {str(r.get('FormaPagto') or row['Forma'] or 'Dinheiro')}",
                     "Obs": f"ESTORNO DE {venda_id}",
                     "Desconto": "0,00",
@@ -462,6 +519,21 @@ else:
             set_with_dataframe(ws, df_novo)
             st.cache_data.clear()
             st.session_state["_force_refresh"] = True
+
+            # -------- Telegram: estorno ----------
+            cliente_est = str(linhas.get("Cliente", [""])[0]) if "Cliente" in linhas.columns and not linhas.empty else ""
+            cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
+            msg = (
+                f"⛔ <b>Estorno lançado</b>\n"
+                f"ID: <code>{cn_id}</code>\n"
+                f"De: <code>{venda_id}</code>\n"
+                f"Data: {data_str}\n"
+                f"Valor estorno (linhas): <b>{_fmt_brl_num(abs(total_estorno))}</b>"
+                f"{cliente_linha}"
+            )
+            _tg_send(msg)
+            # -------------------------------------
+
             st.success(f"Estorno lançado ({cn_id}).")
 
         c1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_carrega_carrinho, args=(row["VendaID"],))
