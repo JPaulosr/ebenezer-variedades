@@ -1,8 +1,12 @@
-# pages/04_vendas_rapidas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar)
-# COM FIADO + TELEGRAM + ESTOQUE (Compras/Vendas/Ajustes) + MOVIMENTOS + RESUMO DO DIA
+# pages/00_vendas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar)
+# COM CLIENTES (selectbox + dedupe), FIADO, TELEGRAM, ESTOQUE (Compras/Vendas/Ajustes),
+# MOVIMENTOS, RESUMO DO DIA e LUCRO (estimado)
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date, timedelta
+import re
+import unicodedata as _ud
+
 import streamlit as st
 import pandas as pd
 import gspread
@@ -113,13 +117,42 @@ def _tg_send(msg: str):
     except Exception:
         pass
 
-# ---------------- Clientes ----------------
+# ---------------- Clientes (normalização e dedupe) ----------------
 ABA_CLIENTES = "Clientes"
 COLS_CLIENTES = ["Cliente","Telefone","Obs"]
 
+def _strip_accents(s: str) -> str:
+    if not isinstance(s, str): return ""
+    return "".join(ch for ch in _ud.normalize("NFD", s) if _ud.category(ch) != "Mn")
+
+def _normalize_cliente(nome: str) -> str:
+    nome = (nome or "").strip()
+    nome = re.sub(r"\s+", " ", nome)
+    return nome.title()
+
+def _cliente_key(nome: str) -> str:
+    base = _normalize_cliente(nome)
+    base = _strip_accents(base).lower()
+    return re.sub(r"\s+", " ", base).strip()
+
+def _carregar_clientes() -> list[str]:
+    try:
+        dfc = carregar_aba(ABA_CLIENTES)
+        if dfc.empty: return []
+        col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
+        vistos = {}
+        for raw in dfc[col_cli].dropna().astype(str):
+            norm = _normalize_cliente(raw)
+            k = _cliente_key(norm)
+            if k and k not in vistos:
+                vistos[k] = norm
+        return sorted(vistos.values())
+    except Exception:
+        return []
+
 def _ensure_cliente(cli_nome: str):
-    """Garante que o cliente exista na aba Clientes; se não existir, cadastra."""
-    cli_nome = (cli_nome or "").strip()
+    """Garante cadastro do cliente (sem duplicar variações)."""
+    cli_nome = _normalize_cliente(cli_nome)
     if not cli_nome:
         return
     sh = conectar_sheets()
@@ -128,21 +161,16 @@ def _ensure_cliente(cli_nome: str):
         dfc = carregar_aba(ABA_CLIENTES)
     except Exception:
         dfc = pd.DataFrame(columns=COLS_CLIENTES)
+
     ja_tem = False
     if not dfc.empty:
         col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        ja_tem = any(str(x).strip().lower() == cli_nome.lower() for x in dfc[col_cli].dropna())
+        for raw in dfc[col_cli].dropna().astype(str):
+            if _cliente_key(raw) == _cliente_key(cli_nome):
+                ja_tem = True
+                break
     if not ja_tem:
         _append_rows(ws_cli, [{"Cliente": cli_nome, "Telefone": "", "Obs": ""}])
-
-def _carregar_clientes() -> list[str]:
-    try:
-        dfc = carregar_aba(ABA_CLIENTES)
-        if dfc.empty: return []
-        col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        return sorted(list(dict.fromkeys([str(x).strip() for x in dfc[col_cli].dropna()])))
-    except Exception:
-        return []
 
 # ---------------- Catálogo / Estoque / Custo ----------------
 ABA_PROD, ABA_VEND = "Produtos", "Vendas"
@@ -153,12 +181,11 @@ ABA_FIADO  = "Fiado"
 
 COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
 
-# Calcula custo e estoque
 def _build_maps_e_estoque():
     # Produtos
     try:
         dfp = carregar_aba(ABA_PROD)
-    except Exception as e:
+    except Exception:
         st.error("Erro ao abrir a aba Produtos."); st.stop()
     col_id   = _first_col(dfp, ["ID","Codigo","Código","SKU"])
     col_nome = _first_col(dfp, ["Nome","Produto","Descrição"])
@@ -180,7 +207,7 @@ def _build_maps_e_estoque():
             id_to_name[pid] = str(r.get(col_nome,"") or "").strip()
             if col_custo: id_to_cost[pid] = _to_num(r.get(col_custo))
 
-    # Tenta obter custo (fallback) da última compra
+    # Fallback custo: última compra
     try:
         dcc = carregar_aba(ABA_COMPRAS)
     except Exception:
@@ -188,10 +215,9 @@ def _build_maps_e_estoque():
     if not dcc.empty:
         col_cc_pid = _first_col(dcc, ["IDProduto","ProdutoID","ID"])
         col_cc_qtd = _first_col(dcc, ["Qtd","Quantidade"])
-        col_cc_cus = _first_col(dcc, ["Custo Unitário","CustoUnit","CustoUnitário","Custo Unit","CustoUnitario"])
+        col_cc_cus = _first_col(dcc, ["Custo Unitário","CustoUnit","CustoUnitário","Custo Unit","CustoUnitario","CustoUnit"])
         col_cc_dat = _first_col(dcc, ["Data"])
         if col_cc_pid and col_cc_cus:
-            # último custo por produto
             dcc["_dt"] = pd.to_datetime(dcc[col_cc_dat], format="%d/%m/%Y", errors="coerce") if col_cc_dat else pd.NaT
             dcc = dcc.sort_values("_dt")
             last_cost = dcc.groupby(col_cc_pid)[col_cc_cus].last()
@@ -200,12 +226,15 @@ def _build_maps_e_estoque():
                 if pid and (pid not in id_to_cost or id_to_cost[pid]==0):
                     id_to_cost[pid] = _to_num(cus)
 
-    # ------- ESTOQUE: Entradas(Compras) - Saídas(Vendas, líquido) + Ajustes -------
+    # ------- ESTOQUE: Entradas(Compras) - Saídas(Vendas líquidas) + Ajustes -------
     entradas = {}
-    if not dcc.empty and col_cc_pid and col_cc_qtd:
-        for _, r in dcc.iterrows():
-            pid = str(r.get(col_cc_pid,"")).strip()
-            entradas[pid] = entradas.get(pid, 0.0) + _to_num(r.get(col_cc_qtd))
+    if not dcc.empty:
+        col_cc_pid = _first_col(dcc, ["IDProduto","ProdutoID","ID"])
+        col_cc_qtd = _first_col(dcc, ["Qtd","Quantidade"])
+        if col_cc_pid and col_cc_qtd:
+            for _, r in dcc.iterrows():
+                pid = str(r.get(col_cc_pid,"")).strip()
+                entradas[pid] = entradas.get(pid, 0.0) + _to_num(r.get(col_cc_qtd))
 
     try:
         dv = carregar_aba(ABA_VEND)
@@ -216,10 +245,9 @@ def _build_maps_e_estoque():
         col_v_pid = _first_col(dv, ["IDProduto","ProdutoID","ID"])
         col_v_qtd = _first_col(dv, ["Qtd","Quantidade"])
         if col_v_pid and col_v_qtd:
-            # soma Qtd (estorno vem negativo, então já liquida)
             for _, r in dv.iterrows():
                 pid = str(r.get(col_v_pid,"")).strip()
-                saidas[pid] = saidas.get(pid, 0.0) + _to_num(r.get(col_v_qtd))
+                saidas[pid] = saidas.get(pid, 0.0) + _to_num(r.get(col_v_qtd))  # estorno vem negativo
 
     try:
         daj = carregar_aba(ABA_AJUSTES)
@@ -241,10 +269,24 @@ def _build_maps_e_estoque():
         a = ajustes.get(pid, 0.0)
         id_to_stock[pid] = e - s + a
 
-    return dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, _first_col(dfp, ["Nome","Produto","Descrição"]), _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"]), _first_col(dfp, ["Unidade","Und"])
+    return dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid
 
 # ====== carrega mapas/estoque uma vez ======
 dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid = _build_maps_e_estoque()
+
+# ---------- Render universal do item (carrinho/linhas) ----------
+def _render_item_line_universal(x: dict, id_to_name: dict, stock_before_after: dict) -> str:
+    # aceita carrinho (id/qtd/preco) ou linhas salvas (IDProduto/Qtd/PrecoUnit)
+    pid   = str(x.get("IDProduto") or x.get("ProdutoID") or x.get("ID") or x.get("id") or "?")
+    qtd   = int(_to_num(x.get("Qtd") if "Qtd" in x else x.get("qtd", 1)))
+    preco = _to_num(x.get("PrecoUnit") if "PrecoUnit" in x else x.get("preco", 0))
+    nome  = id_to_name.get(pid, "Produto")
+    subtotal = qtd * preco
+    estoque_txt = ""
+    if pid in stock_before_after:
+        bef, aft = stock_before_after[pid]
+        estoque_txt = f" — <i>estoque:</i> {int(bef)} → <b>{int(aft)}</b>"
+    return f"• <b>{nome}</b> — x{qtd} @ {_fmt_brl_num(preco)} = <b>{_fmt_brl_num(subtotal)}</b>{estoque_txt}"
 
 # ================= Estado inicial =================
 if "cart" not in st.session_state: st.session_state["cart"] = []
@@ -298,14 +340,14 @@ if not st.session_state["cart"]:
     st.info("Nenhum item no carrinho.")
 else:
     for idx, it in enumerate(st.session_state["cart"]):
-        c1, c2, c3, c4, c5, c6 = st.columns([1.3, 3.2, 1, 1.4, 1.6, 0.8])
-        c1.write(f"{it['nome']}")
+        c1, c2, c3, c4, c5, c6 = st.columns([2.6, 1, 1.2, 1.6, 1.8, 0.8])
+        c1.write(f"**{it['nome']}**")
+        c2.caption(f"Estoque: {int(id_to_stock.get(it['id'], 0))}")
         with c3:
             st.session_state["cart"][idx]["qtd"] = st.number_input("Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"]))
         with c4:
             st.session_state["cart"][idx]["preco"] = st.number_input("Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=float(it["preco"]), format="%.2f")
         subtotal = st.session_state['cart'][idx]['qtd']*st.session_state['cart'][idx]['preco']
-        c2.caption(f"Estoque atual: {int(id_to_stock.get(it['id'], 0))}")
         c5.write(f"Subtotal: <b>{_fmt_brl_num(subtotal)}</b>", unsafe_allow_html=True)
         if c6.button("🗑️", key=f"rm_{idx}"):
             st.session_state["cart"].pop(idx)
@@ -321,22 +363,25 @@ else:
         idx_forma = formas.index(st.session_state["forma"]) if st.session_state["forma"] in formas else 0
         st.session_state["forma"] = st.selectbox("Forma de pagamento", formas, index=idx_forma)
 
+        # ----- Cliente (selectbox + novo + normalização) -----
+        clientes_existentes = _carregar_clientes()
         if st.session_state["forma"] == "Fiado":
-            clientes_existentes = _carregar_clientes()
             usar_lista = st.checkbox("Selecionar cliente cadastrado", value=True)
-
-            if usar_lista and clientes_existentes:
-                sel_cli = st.selectbox("Cliente (lista)", ["(selecione)"] + clientes_existentes, index=0)
-                novo_cli = st.text_input("Ou cadastrar novo cliente", value="")
-                st.session_state["cliente"] = (novo_cli.strip() or (sel_cli if sel_cli != "(selecione)" else "")).strip()
+            if usar_lista:
+                sel_cli = st.selectbox("Cliente", ["(selecione)"] + clientes_existentes, index=0)
+                novo_cli = st.text_input("Ou cadastrar novo cliente")
+                escolhido = (novo_cli.strip() or (sel_cli if sel_cli != "(selecione)" else "")).strip()
             else:
-                st.session_state["cliente"] = st.text_input("Cliente (obrigatório para Fiado)", value=st.session_state["cliente"])
-
+                escolhido = st.text_input("Cliente (obrigatório para Fiado)", value=st.session_state.get("cliente",""))
+            st.session_state["cliente"] = _normalize_cliente(escolhido)
             st.session_state["venc_fiado"] = st.date_input("Vencimento do fiado", value=st.session_state["venc_fiado"])
         else:
-            st.session_state["cliente"] = st.text_input("Cliente (opcional)", value=st.session_state["cliente"])
+            sel_cli = st.selectbox("Cliente (opcional)", ["(sem cliente)"] + clientes_existentes, index=0)
+            novo_cli = st.text_input("Ou cadastrar novo")
+            escolhido = (novo_cli.strip() or (sel_cli if sel_cli != "(sem cliente)" else "")).strip()
+            st.session_state["cliente"] = _normalize_cliente(escolhido)
 
-        st.session_state["obs"]   = st.text_input("Observações (opcional)", value=st.session_state["obs"])
+        st.session_state["obs"] = st.text_input("Observações (opcional)", value=st.session_state["obs"])
     with cR:
         st.session_state["desc"]  = st.number_input("Desconto (R$)", min_value=0.0, value=float(st.session_state["desc"]), step=0.5, format="%.2f")
         total_liq = max(0.0, total_bruto - float(st.session_state["desc"]))
@@ -353,7 +398,6 @@ else:
             cli_nome = st.session_state.get("cliente","").strip()
             if cli_nome:
                 _ensure_cliente(cli_nome)
-
             if st.session_state["forma"] == "Fiado" and not cli_nome:
                 st.error("Informe o Cliente para registrar fiado."); st.stop()
 
@@ -424,8 +468,7 @@ else:
                 before = id_to_stock.get(pid, 0.0)
                 after  = before - qtd
                 stock_before_after[pid] = (before, after)
-                # atualiza um mapa local para caso tenha o mesmo produto repetido
-                id_to_stock[pid] = after
+                id_to_stock[pid] = after  # atualiza mapa local
 
                 novas.append({
                     "Data": data_str,
@@ -469,24 +512,9 @@ else:
                 })
             _append_rows(ws_m, movs)
 
-            # limpa carrinho e força refresh
-            st.session_state["cart"] = []
-            st.cache_data.clear()
-            st.session_state["_force_refresh"] = True
-
             # ===== TELEGRAM (sem IDs públicos) =====
-            def _render_item_line(pid, bef_aft, qtd, preco):
-                nome  = id_to_name.get(pid, "Produto")
-                subtotal = qtd * preco
-                estoque_txt = ""
-                if pid in bef_aft:
-                    b,a = bef_aft[pid]
-                    estoque_txt = f" — <i>estoque:</i> {int(b)} → <b>{int(a)}</b>"
-                return f"• <b>{nome}</b> — x{qtd} @ {_fmt_brl_num(preco)} = <b>{_fmt_brl_num(subtotal)}</b>{estoque_txt}"
-
-            itens_txt = "\n".join(_render_item_line(str(it['id']), stock_before_after, int(it['qtd']), float(it['preco'])) for it in st.session_state.get("_last_cart", st.session_state["cart"]) or novas)
-            # OBS: acima usamos backup se a sessão recarregar; mas normalmente `st.session_state["cart"]` ainda existe aqui.
-
+            fonte_itens = novas if novas else st.session_state.get("cart", [])
+            itens_txt = "\n".join(_render_item_line_universal(x, id_to_name, stock_before_after) for x in fonte_itens)
             cliente_linha = f"\n👤 Cliente: <b>{cli_nome}</b>" if cli_nome else ""
             lucro_bloco = f"\n💰 Lucro (estimado): <b>{_fmt_brl_num(lucro_total_venda)}</b>" if id_to_cost else ""
 
@@ -564,6 +592,11 @@ else:
             )
             _tg_send(msg)
 
+            # limpa carrinho e força refresh
+            st.session_state["cart"] = []
+            st.cache_data.clear()
+            st.session_state["_force_refresh"] = True
+
             st.success("Venda registrada!")
 
     if colB.button("🧹 Limpar carrinho", use_container_width=True):
@@ -613,7 +646,6 @@ else:
 
     for i, row in grp.iterrows():
         b1, b2, b3, b4, _ = st.columns([2.4, 1.2, 1.2, 1.5, 2.2])
-        # UI amigável
         b1.write(f"**{row['Data']}**")
         b2.write(row["Forma"] if pd.notna(row["Forma"]) else "—")
         bruto = row["_Bruto"]; desc = row["_Desc"]; total = row["_TotalC"] if row["_TotalC"]>0 else (bruto - desc)
@@ -701,7 +733,6 @@ else:
                 pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
                 nome_prod = id_to_name.get(pid, pid)
                 qtd = int(abs(_to_num(r[col_qtd]))) if col_qtd else 1
-                # saldo após (aproximado): estoque atual + qtd
                 bef = id_to_stock.get(pid, 0.0)
                 aft = bef + qtd
                 id_to_stock[pid] = aft
@@ -719,8 +750,16 @@ else:
                 })
             _append_rows(ws_m, movs)
 
-            # Telegram enxuto (sem IDs)
-            itens_txt_estorno = "\n".join(f"• <b>{id_to_name.get(str(r.get('IDProduto') or r.get('ProdutoID') or r.get('ID')), 'Produto')}</b> — x{int(abs(_to_num(r[col_qtd])) if col_qtd else 1)}" for _, r in linhas.iterrows())
+            # Telegram (enxuto, sem IDs)
+            itens_txt_estorno = "\n".join(
+                _render_item_line_universal(
+                    {"IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
+                     "Qtd": str(int(abs(_to_num(r[col_qtd])) if col_qtd else 1)),
+                     "PrecoUnit": str(_to_num(r[col_preco]))},
+                    id_to_name, {}
+                )
+                for _, r in linhas.iterrows()
+            )
             cliente_est = ""
             if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty:
                 cliente_est = str(linhas["Cliente"].dropna().iloc[0])
