@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos (com Telegram igual ao 00_vendas.py)
-import json, unicodedata, math
+# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra + Telegram (anti-duplicação)
+import json, unicodedata, math, hashlib, re
 import streamlit as st
 import pandas as pd
 import gspread
@@ -73,6 +73,12 @@ def _to_int(x):
     try: return int(float(str(x).strip().replace(",", ".")))
     except: return ""
 
+def _fmt_money(v) -> str:
+    try: f = float(v)
+    except: f = 0.0
+    s = f"R$ {f:,.2f}"
+    return s.replace(",", "X").replace(".", ",").replace("X",".")
+
 def _gen_id():
     return "P-" + datetime.now().strftime("%Y%m%d%H%M%S")
 
@@ -106,37 +112,82 @@ def _append_row(ws, row: dict):
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-def _fmt_money(v) -> str:
-    try:
-        return f"R$ {float(v):.2f}".replace(".", ",")
-    except:
-        return str(v)
-
 # =============================================================================
-# Telegram — MESMO PADRÃO DO 00_vendas.py
+# Telegram + Anti-duplicação por RefID (persistido em planilha)
 # =============================================================================
 def _tg_enabled() -> bool:
     try:
-        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
+        return str(st.secrets.get("TELEGRAM_ENABLED", "1")) == "1"
     except Exception:
         return False
 
 def _tg_conf():
     token = st.secrets.get("TELEGRAM_TOKEN", "")
-    # usa LOJINHA primeiro (como no 00_vendas.py); fallback para TELEGRAM_CHAT_ID
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
-    return token, chat_id
+    return (token or "").strip(), (chat_id or "").strip()
 
-def _tg_send(msg: str):
-    if not _tg_enabled(): return
+def tg_send_html(texto: str) -> bool:
+    if not _tg_enabled(): return False
     token, chat_id = _tg_conf()
-    if not token or not chat_id: return
+    if not token or not chat_id: return False
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        requests.post(url, json=payload, timeout=6)
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": texto, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15
+        )
+        return bool(r.ok and r.json().get("ok"))
     except Exception:
-        pass
+        return False
+
+NOTIFY_SHEET = "Notificacoes"
+NOTIFY_COLS  = ["RefID","Tipo","Mensagem","DataHora","Extra"]
+
+def _hash_ref(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+@st.cache_data(ttl=30)
+def _notify_df_cached() -> pd.DataFrame:
+    try:
+        ws = _ensure_ws(NOTIFY_SHEET, NOTIFY_COLS)
+        df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+        df.columns = [c.strip() for c in df.columns]
+        for c in NOTIFY_COLS:
+            if c not in df.columns: df[c] = ""
+        return df
+    except Exception:
+        return pd.DataFrame(columns=NOTIFY_COLS)
+
+def _notify_already_sent(refid: str) -> bool:
+    df = _notify_df_cached()
+    if df.empty: return False
+    return refid in set(df["RefID"].astype(str))
+
+def _notify_mark_sent(refid: str, tipo: str, mensagem: str, extra: str=""):
+    ws = _ensure_ws(NOTIFY_SHEET, NOTIFY_COLS)
+    _append_row(ws, {
+        "RefID": refid,
+        "Tipo": tipo,
+        "Mensagem": mensagem,
+        "DataHora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "Extra": extra
+    })
+    try: st.cache_data.clear()
+    except: pass
+
+def tg_send_once(tipo: str, mensagem: str, ref_fields: dict) -> bool:
+    """
+    Envia no Telegram apenas 1x por RefID (persistido na planilha Notificacoes).
+    ref_fields: campos que definem a unicidade do evento (serão 'hasheados').
+    """
+    flat = "|".join(f"{k}={str(v).strip()}" for k, v in sorted(ref_fields.items()))
+    refid = _hash_ref(f"{tipo}|{flat}")
+    if _notify_already_sent(refid):
+        return False
+    ok = tg_send_html(mensagem)
+    if ok:
+        _notify_mark_sent(refid, tipo, mensagem, extra=flat)
+    return ok
 
 # =============================================================================
 # Mapeamentos flexíveis
@@ -256,8 +307,8 @@ def _stock_balance(prod_id: str|None, nome: str):
             base = base[ base[MOV["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
         if not base.empty:
             has_any = True
-            ent = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["entrada","compra","ajuste+","entrada manual","in"]) ][MOV["qtd"]].apply(_to_float).sum()
-            sai = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out"]) ][MOV["qtd"]].apply(_to_float).sum()
+            ent = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["entrada","compra","ajuste+","entrada manual","in","b entrada"]) ][MOV["qtd"]].apply(_to_float).sum()
+            sai = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out","b saída"]) ][MOV["qtd"]].apply(_to_float).sum()
             saldo = (ent or 0) - (sai or 0)
     if not has_any and (not vendas_df.empty) and VEN:
         base = vendas_df.copy()
@@ -402,10 +453,11 @@ if modo == "Editar existente":
         qtd_f = _to_float(qtd_compra_e)
         cst_f = _to_float(custo_unit_e)
         fazer_compra_e = (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0))
+        prod_id = sel.get(COL["id"], sel.get("ID", ""))
+
         if fazer_compra_e:
             ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
             total = round(float(qtd_f) * float(cst_f), 2)
-            prod_id = sel.get(COL["id"], sel.get("ID", ""))
             _append_row(ws_compras, {
                 "Data": data_compra_e.strftime("%d/%m/%Y"),
                 "Produto": nome.strip(),
@@ -428,18 +480,6 @@ if modo == "Editar existente":
             })
             if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
             if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
-
-            # >>> Telegram (compra/entrada na edição) — igual 00_vendas.py
-            msg = (
-                "🧾 <b>Compra/Entrada registrada</b>\n"
-                f"<b>Produto:</b> {nome}\n"
-                f"<b>Qtd:</b> {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
-                f"<b>Custo unit.:</b> {_fmt_money(cst_f)}\n"
-                f"<b>Total:</b> {_fmt_money(total)}\n"
-                f"<b>Fornecedor:</b> {(forn_compra_e or '').strip() or '—'}\n"
-                f"<b>Data:</b> {data_compra_e.strftime('%d/%m/%Y')}"
-            )
-            _tg_send(msg)
 
         # Recalc automáticos (estoque min, lead etc.)
         if recalc_auto or fazer_compra_e:
@@ -479,6 +519,27 @@ if modo == "Editar existente":
         ws.clear()
         set_with_dataframe(ws, df_old.fillna(""), include_index=False, include_column_header=True, resize=True)
         _msg_ok("Produto atualizado com sucesso! 👍")
+
+        # 🔔 Telegram (compra/entrada) — com anti-duplicação por RefID persistido
+        if fazer_compra_e:
+            msg = (
+                "🧾 <b>Compra/Entrada registrada</b>\n"
+                f"<b>Produto:</b> {nome}\n"
+                f"<b>Qtd:</b> {int(qtd_f) if float(qtd_f).is_integer() else str(qtd_f).replace('.',',')}\n"
+                f"<b>Custo unit.:</b> {_fmt_money(cst_f)}\n"
+                f"<b>Total:</b> {_fmt_money(total)}\n"
+                f"<b>Fornecedor:</b> {(forn_compra_e or '').strip() or '—'}\n"
+                f"<b>Data:</b> {data_compra_e.strftime('%d/%m/%Y')}"
+            )
+            ref_fields = {
+                "tipo": "compra_produto",
+                "id": prod_id,
+                "nome": nome.strip().lower(),
+                "data": data_compra_e.strftime("%Y-%m-%d"),
+                "qtd": str(qtd_f),
+                "custo": f"{float(cst_f):.2f}"
+            }
+            tg_send_once("compra_produto", msg, ref_fields)
 
 # =============================================================================
 # CADASTRAR NOVO
@@ -572,28 +633,45 @@ else:
         df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
         set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-        # >>> Telegram (cadastro de novo produto) — igual 00_vendas.py
-        msg = (
-            "➕ <b>Novo produto cadastrado</b>\n"
-            f"<b>Nome:</b> {nome.strip()}\n"
-            f"<b>Categoria:</b> {categoria.strip() or '—'}\n"
-            f"<b>Fornecedor:</b> {fornecedor.strip() or '—'}\n"
-            f"<b>Preço venda:</b> {_fmt_money(pf)}\n"
-            f"<b>ID:</b> {new_row.get(COL['id'], novo_id)}"
-        )
-        if fazer_compra:
-            msg += (
-                "\n<b>Estoque inicial:</b>\n"
-                f"• Qtd: {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
-                f"• Custo unit.: {_fmt_money(cst_f)}\n"
-                f"• Total: {_fmt_money(float(qtd_f)*float(cst_f))}\n"
-                f"• Data: {data_compra.strftime('%d/%m/%Y')}"
-            )
-        _tg_send(msg)
-
         _msg_ok("Produto cadastrado com sucesso! ✅")
         st.toast("Cadastro concluído", icon="✅")
         st.balloons()
+
+        # 🔔 Telegram (cadastro) — com anti-duplicação por RefID persistido
+        msg_cad = (
+            "➕ <b>Novo produto cadastrado</b>\n"
+            f"<b>Nome:</b> {nome}\n"
+            f"<b>Categoria:</b> {categoria or '—'}\n"
+            f"<b>Fornecedor:</b> {fornecedor or '—'}\n"
+            f"<b>Preço venda:</b> {_fmt_money(pf)}"
+        )
+        ref_fields_cad = {
+            "tipo": "cadastro_produto",
+            "id": new_row.get(COL["id"], novo_id),
+            "nome": nome.strip().lower(),
+            "preco": f"{float(pf):.2f}"
+        }
+        tg_send_once("cadastro_produto", msg_cad, ref_fields_cad)
+
+        if fazer_compra:
+            msg_ini = (
+                "📦 <b>Estoque inicial lançado</b>\n"
+                f"<b>Produto:</b> {nome}\n"
+                f"<b>Qtd:</b> {int(qtd_f) if float(qtd_f).is_integer() else str(qtd_f).replace('.',',')}\n"
+                f"<b>Custo unit.:</b> {_fmt_money(cst_f)}\n"
+                f"<b>Total:</b> {_fmt_money(total)}\n"
+                f"<b>Fornecedor:</b> {(forn_compra or fornecedor or '—')}\n"
+                f"<b>Data:</b> {data_compra.strftime('%d/%m/%Y')}"
+            )
+            ref_fields_ini = {
+                "tipo": "estoque_inicial",
+                "id": new_row.get(COL["id"], novo_id),
+                "nome": nome.strip().lower(),
+                "data": data_compra.strftime("%Y-%m-%d"),
+                "qtd": str(qtd_f),
+                "custo": f"{float(cst_f):.2f}"
+            }
+            tg_send_once("estoque_inicial", msg_ini, ref_fields_ini)
 
 st.divider()
 st.page_link("pages/01_produtos.py", label="↩️ Ir para Catálogo de Produtos", icon="📦")
