@@ -80,36 +80,62 @@ def _msg_ok(msg):
     try: st.cache_data.clear()
     except: pass
 
-def _ensure_ws(name: str, headers: list[str]):
-    sh = _sheet()
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            df_head = pd.DataFrame(columns=cols)
-            ws.clear()
-            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-    except Exception:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
+# =============================================================================
+# Helpers de planilha (não-destrutivos)
+# =============================================================================
+def _ensure_headers_preserving(ws, required_headers: list[str]):
+    """
+    Garante que as colunas existam, preservando os dados.
+    Se faltar coluna, regrava o DF atual acrescido das colunas faltantes (vazias).
+    """
+    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
+    cur.columns = [c.strip() for c in cur.columns]
+    missing = [h for h in required_headers if h not in cur.columns]
+    if not missing:
+        return
 
-def _append_row(ws, row: dict):
-    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+    # acrescenta colunas faltantes vazias e reordena: [existentes] + [faltantes]
+    for h in missing:
+        cur[h] = ""
+    cols_out = list(cur.columns)  # já contém existentes + faltantes no final
+    ws.clear()
+    set_with_dataframe(ws, cur.reindex(columns=cols_out).fillna(""),
+                       include_index=False, include_column_header=True, resize=True)
+
+def _append_row_fullrewrite(ws, row: dict):
+    """
+    Lê tudo, concatena a nova linha e regrava a planilha inteira (manter consistência).
+    """
+    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
+    cur.columns = [c.strip() for c in cur.columns]
+    # garante que todas as colunas atuais estejam no row
     for col in cur.columns:
         row.setdefault(col, "")
     out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
+def _ensure_ws(name: str, headers: list[str]):
+    """
+    Cria worksheet se não existir. Se existir, só garante colunas (sem perder dados).
+    """
+    sh = _sheet()
+    try:
+        ws = sh.worksheet(name)
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+
+    _ensure_headers_preserving(ws, headers)
+    return ws
+
 # =============================================================================
-# Anti-duplicidade (RefID de compra)
+# Anti-duplicidade (RefID de compra) + guarda de sessão
 # =============================================================================
 def _norm_val_str(x) -> str:
-    """Normaliza números/moedas para string padronizada p/ hash."""
+    """Normaliza números/moedas p/ string padronizada p/ hash."""
     if x is None: return ""
     s = str(x).strip()
     s = s.replace("R$", "").replace(".", "").replace(",", ".")
@@ -121,8 +147,7 @@ def _norm_val_str(x) -> str:
 
 def _make_refid_compra(data_str: str, produto: str, fornecedor: str, qtd: str, custo_unit: str) -> str:
     """
-    Gera um RefID estável baseado nos campos-chave da compra.
-    data_str deve estar em 'dd/mm/aaaa'
+    Gera RefID estável baseado em Data|Produto|Fornecedor|Qtd|CustoUnit (data em 'dd/mm/aaaa').
     """
     base = "|".join([
         (data_str or "").strip(),
@@ -133,17 +158,39 @@ def _make_refid_compra(data_str: str, produto: str, fornecedor: str, qtd: str, c
     ])
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
-def _compra_ja_existe(ws_compras, refid: str) -> bool:
-    try:
-        dfc = get_as_dataframe(ws_compras, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    except Exception:
+def _seen_refid_in_session(refid: str) -> bool:
+    bag = st.session_state.setdefault("_seen_compra_refids", set())
+    if refid in bag:
+        return True
+    bag.add(refid)
+    return False
+
+def _compra_ja_existe_df(df: pd.DataFrame, refid: str) -> bool:
+    if df.empty: return False
+    cols = [c.strip() for c in df.columns]
+    if "RefID" not in cols: return False
+    return refid in df["RefID"].astype(str).tolist()
+
+def _upsert_compra(ws_compras, row_with_refid: dict) -> bool:
+    """
+    Retorna True se inseriu, False se já existia (pelo RefID).
+    Opera como 'upsert' p/ reduzir janela de corrida.
+    """
+    _ensure_headers_preserving(ws_compras, COMPRAS_HEADERS)
+    cur = get_as_dataframe(ws_compras, evaluate_formulas=True, dtype=str, header=0)
+    cur.columns = [c.strip() for c in cur.columns]
+
+    refid = str(row_with_refid.get("RefID", "")).strip()
+    if refid and _compra_ja_existe_df(cur, refid):
         return False
-    if dfc.empty:
-        return False
-    cols = [c.strip() for c in dfc.columns]
-    if "RefID" not in cols:
-        return False
-    return refid in dfc["RefID"].astype(str).tolist()
+
+    # append e regrava
+    for col in cur.columns:
+        row_with_refid.setdefault(col, "")
+    out = pd.concat([cur, pd.DataFrame([row_with_refid])], ignore_index=True)
+    ws_compras.clear()
+    set_with_dataframe(ws_compras, out.fillna(""), include_index=False, include_column_header=True, resize=True)
+    return True
 
 # =============================================================================
 # Mapeamentos flexíveis
@@ -423,10 +470,11 @@ if modo == "Editar existente":
                 f"{float(cst_f):.2f}".replace(".", ","),
             )
 
-            if _compra_ja_existe(ws_compras, refid):
-                st.warning("⚠️ Esta compra parece duplicada (mesma data/produto/fornecedor/quantidade/custo). Nada foi gravado.")
+            # trava de sessão (evita duplo submit/refresh)
+            if _seen_refid_in_session(refid):
+                st.warning("⚠️ Detected submit repetido desta compra nesta sessão. Nada foi gravado novamente.")
             else:
-                _append_row(ws_compras, {
+                ok = _upsert_compra(ws_compras, {
                     "Data": data_compra_e.strftime("%d/%m/%Y"),
                     "Produto": nome.strip(),
                     "Unidade": (unid_compra_e or "").strip(),
@@ -438,17 +486,20 @@ if modo == "Editar existente":
                     "Obs": obs_compra_e or "",
                     "RefID": refid
                 })
-                ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-                _append_row(ws_mov, {
-                    "Data": data_compra_e.strftime("%d/%m/%Y"),
-                    "IDProduto": prod_id,
-                    "Produto": nome.strip(),
-                    "Tipo": "entrada",
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Obs": f"Compra — {obs_compra_e or ''}".strip()
-                })
-                if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-                if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
+                if not ok:
+                    st.warning("⚠️ Esta compra já existe (RefID duplicado). Lançamento ignorado.")
+                else:
+                    ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+                    _append_row_fullrewrite(ws_mov, {
+                        "Data": data_compra_e.strftime("%d/%m/%Y"),
+                        "IDProduto": prod_id,
+                        "Produto": nome.strip(),
+                        "Tipo": "entrada",
+                        "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                        "Obs": f"Compra — {obs_compra_e or ''}".strip()
+                    })
+                    if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+                    if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
 
         # Recalc automáticos (estoque min, lead etc.)
         if recalc_auto or fazer_compra_e:
@@ -558,10 +609,10 @@ else:
                 f"{float(cst_f):.2f}".replace(".", ","),
             )
 
-            if _compra_ja_existe(ws_compras, refid):
-                st.warning("⚠️ Estoque inicial não lançado: compra idêntica já existe (RefID duplicado).")
+            if _seen_refid_in_session(refid):
+                st.warning("⚠️ Submit repetido desta compra nesta sessão. Ignorado.")
             else:
-                _append_row(ws_compras, {
+                ok = _upsert_compra(ws_compras, {
                     "Data": data_compra.strftime("%d/%m/%Y"),
                     "Produto": nome.strip(),
                     "Unidade": (unid_compra or "").strip(),
@@ -573,17 +624,20 @@ else:
                     "Obs": obs_compra or "",
                     "RefID": refid
                 })
-                ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-                _append_row(ws_mov, {
-                    "Data": data_compra.strftime("%d/%m/%Y"),
-                    "IDProduto": new_row.get(COL["id"], novo_id),
-                    "Produto": nome.strip(),
-                    "Tipo": "entrada",
-                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                    "Obs": f"Compra inicial — {obs_compra or ''}".strip()
-                })
-                if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-                if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
+                if not ok:
+                    st.warning("⚠️ Estoque inicial não lançado: compra idêntica já existe (RefID duplicado).")
+                else:
+                    ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+                    _append_row_fullrewrite(ws_mov, {
+                        "Data": data_compra.strftime("%d/%m/%Y"),
+                        "IDProduto": new_row.get(COL["id"], novo_id),
+                        "Produto": nome.strip(),
+                        "Tipo": "entrada",
+                        "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                        "Obs": f"Compra inicial — {obs_compra or ''}".strip()
+                    })
+                    if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+                    if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
 
         # grava na aba Produtos
         ws = _sheet().worksheet(ABA)
