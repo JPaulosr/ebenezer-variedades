@@ -1,4 +1,4 @@
-# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar)
+# pages/00_vendas.py — Vendas (carrinho + histórico/estorno/duplicar) com switch Telegram
 # -*- coding: utf-8 -*-
 import json, unicodedata
 from datetime import datetime, date
@@ -9,7 +9,7 @@ from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 import requests  # Telegram
 
-st.set_page_config(page_title="Vendas", page_icon="🧾")
+st.set_page_config(page_title="Vendas", page_icon="🧾", layout="wide")
 st.title("🧾 Vendas (carrinho)")
 
 # =========================================================
@@ -23,6 +23,12 @@ def _rerun():
             st.experimental_rerun()  # fallback
         except Exception:
             pass
+
+def _toast(msg: str, icon: str | None = None):
+    try:
+        st.toast(msg, icon=icon)
+    except Exception:
+        st.info(msg)
 
 # ================= Helpers =================
 def _normalize_private_key(key: str) -> str:
@@ -110,9 +116,44 @@ def _tg_token() -> str | None:
 def _tg_chat() -> str | None:
     return _get_secret("TELEGRAM_CHAT_ID_LOJINHA", "TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID_JP") or None
 
-def _tg_enabled() -> bool:
-    # set TELEGRAM_ENABLED="0" para desativar envios (ex.: desenvolvimento)
+def _tg_enabled_default() -> bool:
+    # valor padrão vindo dos secrets (se ausente, considera "1")
     return (_get_secret("TELEGRAM_ENABLED", default="1") != "0")
+
+@st.cache_data(ttl=30)
+def _config_get(key: str, default: str | None = None) -> str | None:
+    """
+    Lê a aba 'Config' (colunas: Chave, Valor) e retorna o valor da chave.
+    Se não existir, retorna default. Cache leve de 30s.
+    """
+    try:
+        ws = conectar_sheets().worksheet("Config")
+    except Exception:
+        return default
+    df = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
+    if df.empty:
+        return default
+    df.columns = [c.strip() for c in df.columns]
+    if not {"Chave","Valor"}.issubset(df.columns):
+        return default
+    row = df[df["Chave"].astype(str).str.strip() == key]
+    if row.empty:
+        return default
+    return str(row["Valor"].iloc[0]).strip()
+
+def _tg_enabled() -> bool:
+    """
+    Ordem de precedência:
+    1) st.session_state["TG_SEND_OVERRIDE"]  (switch da sessão)
+    2) aba Config -> TELEGRAM_ENABLED        (persistido na planilha)
+    3) secrets -> TELEGRAM_ENABLED           (padrão)
+    """
+    if "TG_SEND_OVERRIDE" in st.session_state:
+        return bool(st.session_state["TG_SEND_OVERRIDE"])
+    cfg = _config_get("TELEGRAM_ENABLED", None)
+    if cfg is not None:
+        return cfg != "0"
+    return _tg_enabled_default()
 
 def _tg_ready() -> bool:
     return bool(_tg_enabled() and (_tg_token() or "").strip() and (_tg_chat() or "").strip())
@@ -120,7 +161,7 @@ def _tg_ready() -> bool:
 def tg_send_loja(text: str) -> tuple[bool, str]:
     """Envia texto para o canal da lojinha. Retorna (ok, erro_str)."""
     if not _tg_enabled():
-        return (False, "Envio desativado por TELEGRAM_ENABLED=0.")
+        return (False, "Envio desativado na UI/Config (TELEGRAM_ENABLED=0).")
     token, chat_id = _tg_token(), _tg_chat()
     if not token or not chat_id:
         return (False, "🛑 TELEGRAM_TOKEN/TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID(_LOJINHA/_JP) ausente nos secrets.")
@@ -131,7 +172,8 @@ def tg_send_loja(text: str) -> tuple[bool, str]:
         js = {}
         try: js = r.json()
         except Exception: pass
-        if r.ok and js.get("ok"): return (True, "")
+        if r.ok and js.get("ok"):
+            return (True, "")
         return (False, f"Telegram erro: HTTP {r.status_code} • {js}")
     except Exception as e:
         return (False, f"Exceção Telegram: {e}")
@@ -216,10 +258,52 @@ def make_resumo_do_dia_vendas(df_vend: pd.DataFrame, data_str: str) -> str:
     ]
     return "\n".join(linhas)
 
-# Aviso não-bloqueante se Telegram não configurado
-if not _tg_ready():
-    st.info("ℹ️ Telegram não configurado (defina TELEGRAM_TOKEN/TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID_LOJINHA/TELEGRAM_CHAT_ID). O app continua funcionando normalmente.")
+# ======= Switch de Envio ao Telegram (sessão + opção de persistir) =======
+with st.container():
+    colA, colB, colC = st.columns([2,1,1])
+    with colA:
+        on_ui = st.toggle("📲 Enviar mensagens ao Telegram (sessão)", value=_tg_enabled(),
+                          help="Muda apenas nesta sessão. Use 'Salvar como padrão' para persistir.")
+    with colB:
+        save_default = st.checkbox("Salvar como padrão", value=False,
+                                   help="Salva o estado atual na aba 'Config' da planilha (chave TELEGRAM_ENABLED).")
+    with colC:
+        if st.button("Aplicar", use_container_width=True):
+            st.session_state["TG_SEND_OVERRIDE"] = bool(on_ui)
+            _toast("Preferência de Telegram (sessão) atualizada.")
+            if save_default:
+                # grava na aba Config
+                sh = conectar_sheets()
+                try:
+                    ws = sh.worksheet("Config")
+                except Exception:
+                    ws = sh.add_worksheet(title="Config", rows=50, cols=2)
+                    ws.update("A1:B1", [["Chave","Valor"]])
+                df_cfg = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
+                if df_cfg.empty:
+                    df_cfg = pd.DataFrame(columns=["Chave","Valor"])
+                df_cfg.columns = [c.strip() for c in df_cfg.columns]
+                df_cfg = df_cfg[["Chave","Valor"]] if {"Chave","Valor"}.issubset(df_cfg.columns) else pd.DataFrame(columns=["Chave","Valor"])
 
+                key = "TELEGRAM_ENABLED"
+                val = "1" if on_ui else "0"
+                exists = df_cfg["Chave"].astype(str).str.strip().eq(key)
+                if exists.any():
+                    df_cfg.loc[exists, "Valor"] = val
+                else:
+                    df_cfg = pd.concat([df_cfg, pd.DataFrame([{"Chave": key, "Valor": val}])], ignore_index=True)
+
+                ws.clear()
+                set_with_dataframe(ws, df_cfg)
+                st.cache_data.clear()
+                _toast("Padrão salvo em Config (TELEGRAM_ENABLED).")
+            _rerun()
+
+# Badge de status (discreto)
+st.markdown("✅ **Telegram ON** — mensagens serão enviadas." if _tg_ready()
+            else "📵 **Telegram OFF** — mensagens não serão enviadas.", unsafe_allow_html=True)
+
+# ===== Debug Telegram =====
 with st.expander("🔧 Debug Telegram (lojinha) — remova depois"):
     def _mask(s, keep=6):
         if not s: return "—"
@@ -227,14 +311,15 @@ with st.expander("🔧 Debug Telegram (lojinha) — remova depois"):
     tok, cid = _tg_token(), _tg_chat()
     st.write("TOKEN presente?", bool(tok), _mask(tok or ""))
     st.write("CHAT_ID (lojinha/jp) presente?", bool(cid), _mask(cid or ""))
-    st.write("TELEGRAM_ENABLED:", _get_secret("TELEGRAM_ENABLED", default="1"))
     try:
-        st.write("Chaves carregadas:", list(st.secrets.keys()))
+        st.write("TELEGRAM_ENABLED (secrets):", _get_secret("TELEGRAM_ENABLED", default="1"))
     except Exception:
-        st.write("Não foi possível listar secrets.keys().")
+        pass
     if st.button("📨 Testar Telegram (lojinha)"):
         ok, err = tg_send_loja("✅ Teste lojinha (Streamlit).")
         st.success("Mensagem enviada!") if ok else st.error(err or "Falhou")
+
+st.divider()
 
 # ================= Catálogo =================
 try:
@@ -416,6 +501,7 @@ else:
             st.session_state["_force_refresh"] = True
 
             # ========= Envio Telegram (card + resumo do dia) =========
+            msg_mostrada = False
             try:
                 if _tg_ready():
                     # Card da venda
@@ -448,14 +534,18 @@ else:
                         st.warning(f"Venda registrada ({venda_id}), mas o Telegram falhou.")
                         if err1: st.caption(f"Card: {err1}")
                         if err2: st.caption(f"Resumo: {err2}")
+                    msg_mostrada = True
                 else:
-                    st.info(f"Venda registrada ({venda_id}). Telegram não configurado ou desativado (TELEGRAM_ENABLED=0).")
+                    st.info(f"Venda registrada ({venda_id}). Telegram não configurado ou desativado.")
+                    msg_mostrada = True
             except Exception as e:
                 st.warning(f"Venda registrada ({venda_id}), mas não consegui enviar ao Telegram: {e}")
+                msg_mostrada = True
 
-            # por último, limpa carrinho e avisa
+            # por último, limpa carrinho e avisa (sem duplicar sucesso)
             st.session_state["cart"] = []
-            st.success(f"Venda registrado(a) ({venda_id})!")
+            if not msg_mostrada:
+                st.success(f"Venda registrada ({venda_id})!")
 
     if colB.button("🧹 Limpar carrinho", use_container_width=True):
         st.session_state["cart"] = []
