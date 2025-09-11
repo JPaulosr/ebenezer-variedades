@@ -179,7 +179,7 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
         if nome and c_nom:
             ent += _sum(comp, c_qtd, (comp[c_nom].astype(str).str.strip()==nome) & (False if not c_pid else comp[c_pid].astype(str).str.strip().eq("").fillna(True)))
 
-    # Vendas (qtd já considera estorno negativo)
+    # Vendas
     v_pid = _pick_col(vend, ["IDProduto","ProdutoID","ID"])
     v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
     sai = 0.0
@@ -187,7 +187,6 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
         if pid and v_pid:
             sai += _sum(vend, v_qtd, vend[v_pid].astype(str).str.strip()==pid)
         if nome and _pick_col(vend, ["Produto","Nome"]):
-            # normalmente não tem nome em Vendas; deixo só por segurança
             vn = _pick_col(vend, ["Produto","Nome"])
             sai += _sum(vend, v_qtd, vend[vn].astype(str).str.strip()==nome)
 
@@ -199,7 +198,6 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
         if pid:
             aj += _sum(ajus, a_qtd, ajus[a_pid].astype(str).str.strip()==pid)
         elif nome:
-            # se não tem ID no ajuste, tente por nome (se houver)
             an = _pick_col(ajus, ["Produto","Nome"])
             if an:
                 aj += _sum(ajus, a_qtd, ajus[an].astype(str).str.strip()==nome)
@@ -207,6 +205,12 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
     return float(ent - sai + aj)
 
 # ========= formulário =========
+UNIDADES_PADRAO = ["un","L","kg","g","ml","cx","pct","Outro"]
+
+def _opt_index(val: str, options: list[str]) -> int:
+    v = (val or "").strip()
+    return options.index(v) if v in options else 0
+
 st.subheader("Nova compra / entrada")
 with st.form("form_compra"):
     usar_lista = st.checkbox("Selecionar produto da lista", value=True)
@@ -236,7 +240,13 @@ with st.form("form_compra"):
     with c1: data_c = st.date_input("Data da compra", value=date.today())
     with c2: qtd    = st.text_input("Qtd", placeholder="Ex.: 10")
     with c3: custo  = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50")
-    with c4: unid   = st.text_input("Unidade", value=unid_sug or "un")
+    with c4:
+        idx_unid = _opt_index(unid_sug or "un", UNIDADES_PADRAO)
+        unid_sel = st.selectbox("Unidade", options=UNIDADES_PADRAO, index=idx_unid, help="Selecione a medida; escolha 'Outro' para digitar.")
+    unid_outro = ""
+    if unid_sel == "Outro":
+        unid_outro = st.text_input("Se 'Outro'… qual medida?", placeholder="ex.: rolo, m, par")
+    unid = (unid_outro.strip() if unid_sel == "Outro" else unid_sel)
 
     fornecedor = st.text_input("Fornecedor", value=forn_sug)
     obs        = st.text_input("Observações (opcional)")
@@ -245,6 +255,9 @@ with st.form("form_compra"):
 if salvar:
     if not prod_nome.strip():
         st.error("Selecione ou digite um produto."); st.stop()
+    if (unid_sel == "Outro") and not unid.strip():
+        st.error("Informe a unidade em 'Outro'."); st.stop()
+
     qtd_f = _to_float(qtd); cst_f = _to_float(custo)
     if qtd_f in ("", None) or cst_f in ("", None):
         st.error("Preencha **Qtd** e **Custo unitário**."); st.stop()
