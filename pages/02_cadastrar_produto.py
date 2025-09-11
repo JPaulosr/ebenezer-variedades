@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos (com Telegram igual ao 00_vendas.py)
-import json, unicodedata, math
+# pages/02_cadastrar_produto.py — Cadastro/edição + estoque inicial/compra juntos
+import json, unicodedata, math, re
+from datetime import datetime, timedelta, date
+
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta, date
 import requests  # Telegram
 
 st.set_page_config(page_title="Cadastrar/Editar Produto", page_icon="➕", layout="wide")
@@ -106,14 +107,8 @@ def _append_row(ws, row: dict):
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-def _fmt_money(v) -> str:
-    try:
-        return f"R$ {float(v):.2f}".replace(".", ",")
-    except:
-        return str(v)
-
 # =============================================================================
-# Telegram — MESMO PADRÃO DO 00_vendas.py
+# Telegram (mesmo padrão do 00_vendas.py)
 # =============================================================================
 def _tg_enabled() -> bool:
     try:
@@ -123,7 +118,6 @@ def _tg_enabled() -> bool:
 
 def _tg_conf():
     token = st.secrets.get("TELEGRAM_TOKEN", "")
-    # usa LOJINHA primeiro (como no 00_vendas.py); fallback para TELEGRAM_CHAT_ID
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
     return token, chat_id
 
@@ -143,18 +137,22 @@ def _tg_send(msg: str):
 # =============================================================================
 def _pick_col(df, candidates):
     for c in candidates:
-        if c in df.columns:
+        if c in df.columns:  # exato
             return c
+    # tolera variação de maiúsculas
+    low = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in low: return low[c.lower()]
     return None
 
 def _map_cols_produtos(df):
     return {
-        "id":        _pick_col(df, ["ID","Id","id"]),
+        "id":        _pick_col(df, ["ID","Id","id","Codigo","Código"]),
         "nome":      _pick_col(df, ["Nome","Produto","Descrição","Descricao"]),
         "categoria": _pick_col(df, ["Categoria","Grupo"]),
         "unidade":   _pick_col(df, ["Unidade","Unid"]),
         "forn":      _pick_col(df, ["Fornecedor","FornecedorNome","Fornecedor ID","FornecedorID"]),
-        "custo":     _pick_col(df, ["CustoAtual","Custo","Custo Atual"]),
+        "custo":     _pick_col(df, ["CustoAtual","Custo","Custo Atual","CustoMedio","Custo Médio","CustoMed"]),
         "preco":     _pick_col(df, ["PreçoVenda","PrecoVenda","Preço Venda","Preco Venda","Preço","Valor"]),
         "markup":    _pick_col(df, ["Markup %","Markup%","Markup"]),
         "margem":    _pick_col(df, ["Margem %","Margem%","Margem"]),
@@ -174,7 +172,7 @@ def _map_cols_compras(df):
         "unid": _pick_col(df, ["Unidade","Unid"]),
         "forn": _pick_col(df, ["Fornecedor","FornecedorNome"]),
         "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Custo Unit","PrecoUnitario","Preço Unitário"]),
+        "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Custo Unit","PrecoUnitario","Preço Unitário","CustoUnitario"]),
         "total": _pick_col(df, ["Total","ValorTotal"]),
         "id": _pick_col(df, ["IDProduto","ID"])
     }
@@ -256,8 +254,8 @@ def _stock_balance(prod_id: str|None, nome: str):
             base = base[ base[MOV["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
         if not base.empty:
             has_any = True
-            ent = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["entrada","compra","ajuste+","entrada manual","in"]) ][MOV["qtd"]].apply(_to_float).sum()
-            sai = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out"]) ][MOV["qtd"]].apply(_to_float).sum()
+            ent = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["entrada","compra","ajuste+","entrada manual","in","b entrada"]) ][MOV["qtd"]].apply(_to_float).sum()
+            sai = base[ base[MOV["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out","b saída","b saida"]) ][MOV["qtd"]].apply(_to_float).sum()
             saldo = (ent or 0) - (sai or 0)
     if not has_any and (not vendas_df.empty) and VEN:
         base = vendas_df.copy()
@@ -267,7 +265,10 @@ def _stock_balance(prod_id: str|None, nome: str):
             base = base[ base[VEN["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
         if not base.empty:
             return 0
-    return int(round(saldo, 0))
+    try:
+        return int(round(saldo, 0))
+    except:
+        return 0
 
 def _avg_daily_sales_30d(prod_id: str|None, nome: str):
     if vendas_df.empty or not VEN or VEN.get("data") is None:
@@ -301,6 +302,35 @@ def _calc_est_min(avg_daily: float, lead_time_days: int|None):
     safety = 1.2
     estmin = math.ceil(avg_daily * lt * safety)
     return estmin if estmin > 0 else 5
+
+# =============================================================================
+# Utils — chave de duplicidade
+# =============================================================================
+def _norm(s: str) -> str:
+    if s is None: return ""
+    s = str(s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _key_nome_forn(nome: str, fornecedor: str) -> str:
+    def _strip_acc(text):
+        return "".join(ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn")
+    n = _strip_acc(_norm(nome)).lower()
+    f = _strip_acc(_norm(fornecedor)).lower()
+    return f"{n}|{f}"
+
+def _buscar_existente(dfprod: pd.DataFrame, nome: str, fornecedor: str):
+    """Retorna índice da linha existente (ou None) e o dicionário da linha"""
+    if dfprod is None or dfprod.empty: return None, None
+    col_nome = COL["nome"]; col_forn = COL["forn"]
+    if not col_nome: return None, None
+    dfc = dfprod.copy()
+    dfc["_k"] = dfc.apply(lambda r: _key_nome_forn(str(r.get(col_nome,"")), str(r.get(col_forn,"") if col_forn else "")), axis=1)
+    k = _key_nome_forn(nome, fornecedor if col_forn else "")
+    if k in set(dfc["_k"].tolist()):
+        pos = dfc.index[dfc["_k"]==k].tolist()[0]
+        return int(pos), dfprod.iloc[int(pos)].to_dict()
+    return None, None
 
 # =============================================================================
 # UI — ação
@@ -402,10 +432,10 @@ if modo == "Editar existente":
         qtd_f = _to_float(qtd_compra_e)
         cst_f = _to_float(custo_unit_e)
         fazer_compra_e = (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0))
+        prod_id = sel.get(COL["id"], sel.get("ID", ""))
         if fazer_compra_e:
             ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
             total = round(float(qtd_f) * float(cst_f), 2)
-            prod_id = sel.get(COL["id"], sel.get("ID", ""))
             _append_row(ws_compras, {
                 "Data": data_compra_e.strftime("%d/%m/%Y"),
                 "Produto": nome.strip(),
@@ -428,18 +458,6 @@ if modo == "Editar existente":
             })
             if COL["custo"]:   updates[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
             if COL["estoque"]: updates[COL["estoque"]] = str(int((_stock_balance(prod_id, nome) or 0)))
-
-            # >>> Telegram (compra/entrada na edição) — igual 00_vendas.py
-            msg = (
-                "🧾 <b>Compra/Entrada registrada</b>\n"
-                f"<b>Produto:</b> {nome}\n"
-                f"<b>Qtd:</b> {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
-                f"<b>Custo unit.:</b> {_fmt_money(cst_f)}\n"
-                f"<b>Total:</b> {_fmt_money(total)}\n"
-                f"<b>Fornecedor:</b> {(forn_compra_e or '').strip() or '—'}\n"
-                f"<b>Data:</b> {data_compra_e.strftime('%d/%m/%Y')}"
-            )
-            _tg_send(msg)
 
         # Recalc automáticos (estoque min, lead etc.)
         if recalc_auto or fazer_compra_e:
@@ -480,6 +498,17 @@ if modo == "Editar existente":
         set_with_dataframe(ws, df_old.fillna(""), include_index=False, include_column_header=True, resize=True)
         _msg_ok("Produto atualizado com sucesso! 👍")
 
+        # Telegram
+        try:
+            msg = (
+                f"✏️ <b>Produto atualizado</b>\n"
+                f"• <b>{updates.get(COL['nome'], nome)}</b>\n"
+                f"Fornecedor: <i>{fornecedor or '-'}</i>\n"
+                f"Preço: <b>R$ {updates.get(COL['preco'], sel.get(COL['preco'],'-'))}</b>"
+            )
+            _tg_send(msg)
+        except: pass
+
 # =============================================================================
 # CADASTRAR NOVO
 # =============================================================================
@@ -490,18 +519,29 @@ else:
         with c1: nome = st.text_input("Nome")
         with c2: categoria = st.text_input("Categoria", placeholder="Ex.: limpeza, higiene…")
         with c3: fornecedor = st.text_input("Fornecedor")
-        c4, c5 = st.columns([1,1])
+        c4, c5a, c5b = st.columns([1,1,1])
         with c4: preco = st.text_input("Preço venda (R$)", placeholder="19,90")
-        with c5: ativo = st.checkbox("Ativo", value=True)
+        # Unidade (select + livre)
+        unidades = ["un","L","kg","g","ml","cx","pct","Outro…"]
+        with c5a:
+            un_sel = st.selectbox("Unidade", unidades, index=0)
+        with c5b:
+            un_outro = st.text_input("Se 'Outro…', qual?", placeholder="ex.: rolo, m, par")
+        unidade_final = (un_outro.strip() if un_sel=="Outro…" else un_sel)
+        c6, = st.columns(1)
+        with c6: ativo = st.checkbox("Ativo", value=True)
 
         st.markdown("#### 📦 Estoque inicial (opcional, recomendado)")
-        c6, c7, c8, c9 = st.columns([1,1,1,1])
-        with c6: qtd_compra = st.text_input("Qtd comprada", placeholder="Ex.: 10")
-        with c7: custo_unit = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50")
-        with c8: unid_compra = st.text_input("Unidade", placeholder="Ex.: un, cx, pct")
-        with c9: data_compra = st.date_input("Data da compra", value=date.today())
+        c7, c8, c9, c10 = st.columns([1,1,1,1])
+        with c7: qtd_compra = st.text_input("Qtd comprada", placeholder="Ex.: 10")
+        with c8: custo_unit = st.text_input("Custo unitário (R$)", placeholder="Ex.: 12,50")
+        with c9: unid_compra = st.text_input("Unidade (compra)", value=unidade_final or "un")
+        with c10: data_compra = st.date_input("Data da compra", value=date.today())
         forn_compra = st.text_input("Fornecedor (compra)", value=fornecedor)
         obs_compra  = st.text_input("Observações (opcional)")
+
+        # anti-duplicação
+        dedup_update = st.checkbox("Se já existir, atualizar ao invés de duplicar", value=True)
 
         salvar = st.form_submit_button("➕ Cadastrar produto")
 
@@ -512,7 +552,9 @@ else:
         if pf == "":
             st.error("Preço inválido. Use números (ex: 19,90)."); st.stop()
 
-        novo_id = _gen_id()
+        # procura existente por (Nome + Fornecedor) normalizados
+        idx_exist, row_exist = _buscar_existente(df, nome, fornecedor)
+
         # calculados básicos
         custo_hist, unid_hist = _last_cost_and_unit(nome, fornecedor)
         lead = _lead_time_fornecedor(fornecedor)
@@ -520,80 +562,141 @@ else:
         avg30 = _avg_daily_sales_30d(None, nome)
         estmin = _calc_est_min(avg30, lead)
 
-        new_row = {}
-        if COL["id"]:        new_row[COL["id"]] = novo_id
-        if COL["nome"]:      new_row[COL["nome"]] = nome.strip()
-        if COL["categoria"]: new_row[COL["categoria"]] = categoria.strip()
-        if COL["forn"]:      new_row[COL["forn"]] = fornecedor.strip()
-        if COL["preco"]:     new_row[COL["preco"]] = f"{pf:.2f}".replace(".", ",")
-        if (custo_hist is not None) and COL["custo"]: new_row[COL["custo"]] = f"{custo_hist:.2f}".replace(".", ",")
-        if COL["estoque"]:   new_row[COL["estoque"]] = str(saldo if saldo is not None else 0)
-        if COL["est_min"]:   new_row[COL["est_min"]] = str(estmin)
-        if (lead is not None) and COL["lead"]: new_row[COL["lead"]] = str(lead)
-        if unid_hist and COL["unidade"]: new_row[COL["unidade"]] = unid_hist
-        if COL["ativo"]:     new_row[COL["ativo"]] = "sim" if ativo else "não"
-        if COL["atualizado"]: new_row[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-        # se tiver estoque inicial informado, grava Compra + Movimento e ajusta custo/estoque
-        qtd_f = _to_float(qtd_compra)
-        cst_f = _to_float(custo_unit)
-        fazer_compra = (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0))
-        if fazer_compra:
-            ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
-            total = round(float(qtd_f) * float(cst_f), 2)
-            _append_row(ws_compras, {
-                "Data": data_compra.strftime("%d/%m/%Y"),
-                "Produto": nome.strip(),
-                "Unidade": (unid_compra or "").strip(),
-                "Fornecedor": (forn_compra or fornecedor or "").strip(),
-                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
-                "Total": f"{total:.2f}".replace(".", ","),
-                "IDProduto": new_row.get(COL["id"], novo_id),
-                "Obs": obs_compra or ""
-            })
-            ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-            _append_row(ws_mov, {
-                "Data": data_compra.strftime("%d/%m/%Y"),
-                "IDProduto": new_row.get(COL["id"], novo_id),
-                "Produto": nome.strip(),
-                "Tipo": "entrada",
-                "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
-                "Obs": f"Compra inicial — {obs_compra or ''}".strip()
-            })
-            if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
-            if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
-
-        # grava na aba Produtos
         ws = _sheet().worksheet(ABA)
         df_atual = _load_df(ABA)
-        for col in df_atual.columns:
-            new_row.setdefault(col, "")
-        df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
-        set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-        # >>> Telegram (cadastro de novo produto) — igual 00_vendas.py
-        msg = (
-            "➕ <b>Novo produto cadastrado</b>\n"
-            f"<b>Nome:</b> {nome.strip()}\n"
-            f"<b>Categoria:</b> {categoria.strip() or '—'}\n"
-            f"<b>Fornecedor:</b> {fornecedor.strip() or '—'}\n"
-            f"<b>Preço venda:</b> {_fmt_money(pf)}\n"
-            f"<b>ID:</b> {new_row.get(COL['id'], novo_id)}"
-        )
-        if fazer_compra:
-            msg += (
-                "\n<b>Estoque inicial:</b>\n"
-                f"• Qtd: {int(qtd_f) if float(qtd_f).is_integer() else qtd_f}\n"
-                f"• Custo unit.: {_fmt_money(cst_f)}\n"
-                f"• Total: {_fmt_money(float(qtd_f)*float(cst_f))}\n"
-                f"• Data: {data_compra.strftime('%d/%m/%Y')}"
-            )
-        _tg_send(msg)
+        if dedup_update and idx_exist is not None:
+            # ===== Atualiza linha existente (mantém ID) =====
+            novo_id = str(row_exist.get(COL["id"] or "ID"))
+            updates = {}
+            if COL["nome"]:      updates[COL["nome"]] = _norm(nome)
+            if COL["categoria"]: updates[COL["categoria"]] = _norm(categoria)
+            if COL["forn"]:      updates[COL["forn"]] = _norm(fornecedor)
+            if COL["preco"]:     updates[COL["preco"]] = f"{float(pf):.2f}".replace(".", ",")
+            if COL["unidade"]:   updates[COL["unidade"]] = unidade_final or (unid_hist or "")
+            if (custo_hist is not None) and COL["custo"]: updates.setdefault(COL["custo"], f"{custo_hist:.2f}".replace(".", ","))
+            if COL["estoque"]:   updates.setdefault(COL["estoque"], str(saldo if saldo is not None else 0))
+            if COL["est_min"]:   updates[COL["est_min"]] = str(estmin)
+            if (lead is not None) and COL["lead"]: updates.setdefault(COL["lead"], str(lead))
+            if COL["ativo"]:     updates[COL["ativo"]] = "sim" if ativo else "não"
+            if COL["atualizado"]: updates[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
-        _msg_ok("Produto cadastrado com sucesso! ✅")
-        st.toast("Cadastro concluído", icon="✅")
-        st.balloons()
+            for col, val in updates.items():
+                if col in df_atual.columns:
+                    df_atual.loc[idx_exist, col] = val
+
+            # estoque inicial opcional vira compra + movimento
+            qtd_f = _to_float(qtd_compra)
+            cst_f = _to_float(custo_unit)
+            if (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0)):
+                ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
+                total = round(float(qtd_f) * float(cst_f), 2)
+                _append_row(ws_compras, {
+                    "Data": data_compra.strftime("%d/%m/%Y"),
+                    "Produto": nome.strip(),
+                    "Unidade": (unid_compra or unidade_final or "un").strip(),
+                    "Fornecedor": (forn_compra or fornecedor or "").strip(),
+                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                    "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+                    "Total": f"{total:.2f}".replace(".", ","),
+                    "IDProduto": novo_id,
+                    "Obs": (obs_compra or "Compra inicial (dedup/update)").strip()
+                })
+                ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+                _append_row(ws_mov, {
+                    "Data": data_compra.strftime("%d/%m/%Y"),
+                    "IDProduto": novo_id,
+                    "Produto": nome.strip(),
+                    "Tipo": "entrada",
+                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                    "Obs": "Compra inicial (update)",
+                })
+                if COL["custo"]:   df_atual.loc[idx_exist, COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+                if COL["estoque"]: df_atual.loc[idx_exist, COL["estoque"]] = str(int((_stock_balance(novo_id, nome) or 0)))
+
+            # grava
+            ws.clear()
+            set_with_dataframe(ws, df_atual.fillna(""), include_index=False, include_column_header=True, resize=True)
+            _msg_ok("Produto já existia — dados ATUALIZADOS (sem duplicar). ✅")
+
+            # Telegram
+            try:
+                msg = (
+                    f"🆙 <b>Produto atualizado (sem duplicar)</b>\n"
+                    f"• <b>{nome.strip()}</b>\n"
+                    f"Fornecedor: <i>{fornecedor or '-'}</i>\n"
+                    f"Preço: <b>R$ {float(pf):.2f}</b>".replace(".", ",")
+                )
+                _tg_send(msg)
+            except: pass
+
+        else:
+            # ===== Cadastrar NOVO (se não existir ou se escolheu permitir duplicar) =====
+            novo_id = _gen_id()
+            new_row = {}
+            if COL["id"]:        new_row[COL["id"]] = novo_id
+            if COL["nome"]:      new_row[COL["nome"]] = _norm(nome)
+            if COL["categoria"]: new_row[COL["categoria"]] = _norm(categoria)
+            if COL["forn"]:      new_row[COL["forn"]] = _norm(fornecedor)
+            if COL["preco"]:     new_row[COL["preco"]] = f"{float(pf):.2f}".replace(".", ",")
+            if (custo_hist is not None) and COL["custo"]: new_row[COL["custo"]] = f"{custo_hist:.2f}".replace(".", ",")
+            if COL["estoque"]:   new_row[COL["estoque"]] = str(saldo if saldo is not None else 0)
+            if COL["est_min"]:   new_row[COL["est_min"]] = str(estmin)
+            if (lead is not None) and COL["lead"]: new_row[COL["lead"]] = str(lead)
+            if COL["unidade"]:   new_row[COL["unidade"]] = unidade_final or (unid_hist or "")
+            if COL["ativo"]:     new_row[COL["ativo"]] = "sim" if ativo else "não"
+            if COL["atualizado"]: new_row[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+            # estoque inicial informado => grava Compra + Movimento e ajusta custo/estoque
+            qtd_f = _to_float(qtd_compra)
+            cst_f = _to_float(custo_unit)
+            if (qtd_f not in ("", None, 0)) and (cst_f not in ("", None, 0)):
+                ws_compras = _ensure_ws("Compras", COMPRAS_HEADERS)
+                total = round(float(qtd_f) * float(cst_f), 2)
+                _append_row(ws_compras, {
+                    "Data": data_compra.strftime("%d/%m/%Y"),
+                    "Produto": nome.strip(),
+                    "Unidade": (unid_compra or unidade_final or "un").strip(),
+                    "Fornecedor": (forn_compra or fornecedor or "").strip(),
+                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                    "Custo Unitário": f"{float(cst_f):.2f}".replace(".", ","),
+                    "Total": f"{total:.2f}".replace(".", ","),
+                    "IDProduto": new_row.get(COL["id"], novo_id),
+                    "Obs": obs_compra or ""
+                })
+                ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+                _append_row(ws_mov, {
+                    "Data": data_compra.strftime("%d/%m/%Y"),
+                    "IDProduto": new_row.get(COL["id"], novo_id),
+                    "Produto": nome.strip(),
+                    "Tipo": "entrada",
+                    "Qtd": str(int(qtd_f)) if float(qtd_f).is_integer() else str(qtd_f).replace(".", ","),
+                    "Obs": f"Compra inicial — {obs_compra or ''}".strip()
+                })
+                if COL["custo"]:   new_row[COL["custo"]] = f"{float(cst_f):.2f}".replace(".", ",")
+                if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
+
+            # grava
+            for col in df_atual.columns:
+                new_row.setdefault(col, "")
+            df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
+            set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+            _msg_ok("Produto cadastrado com sucesso! ✅")
+            st.toast("Cadastro concluído", icon="✅")
+            st.balloons()
+
+            # Telegram
+            try:
+                msg = (
+                    f"➕ <b>Novo produto cadastrado</b>\n"
+                    f"• <b>{nome.strip()}</b>\n"
+                    f"Unidade: <i>{unidade_final or '-'}</i>\n"
+                    f"Fornecedor: <i>{fornecedor or '-'}</i>\n"
+                    f"Preço: <b>R$ {float(pf):.2f}</b>".replace(".", ",")
+                )
+                _tg_send(msg)
+            except: pass
 
 st.divider()
 st.page_link("pages/01_produtos.py", label="↩️ Ir para Catálogo de Produtos", icon="📦")
