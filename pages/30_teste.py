@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pages/03_compras_entradas.py — Registrar compras/entradas de estoque + Telegram + Fracionamento
-import json, unicodedata, re
+import json, unicodedata, re, time
 import streamlit as st
 import pandas as pd
 import gspread
@@ -11,12 +11,26 @@ from datetime import date
 st.set_page_config(page_title="Compras / Entradas", page_icon="🧾", layout="wide")
 st.title("🧾 Compras / Entradas de Estoque")
 
+# ---------------- Utils de refresh/cache ----------------
+def _refresh_now():
+    st.session_state["_refresh_ts"] = time.time()
+    st.cache_data.clear()
+    try: st.rerun()
+    except Exception: st.experimental_rerun()
+
+BUMP = st.session_state.get("_refresh_ts", 0)  # usado para invalidar cache
+
+def _fmt_brl(v: float) -> str:
+    return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
+
+def _fmt_num(v: float, casas=3) -> str:
+    return f"{float(v):.{casas}f}".replace(".", ",")
+
 # ========= credenciais =========
 def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str):
-        return key
+    if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
+    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
     return key
 
 def _load_sa():
@@ -41,8 +55,8 @@ def _sheet():
         st.error("🛑 PLANILHA_URL ausente."); st.stop()
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data
-def _load_df(aba: str) -> pd.DataFrame:
+@st.cache_data(ttl=120)
+def _load_df(aba: str, _bump: float | None = None) -> pd.DataFrame:
     ws = _sheet().worksheet(aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
@@ -67,15 +81,13 @@ def _ensure_ws(name: str, headers: list[str]):
 
 def _append_row(ws, row: dict):
     cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-    for col in cur.columns:
-        row.setdefault(col, "")
+    for col in cur.columns: row.setdefault(col, "")
     out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
 def _to_float(x):
-    if x is None or str(x).strip()=="":
-        return ""
+    if x is None or str(x).strip()=="": return ""
     s = str(x).strip().replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
     try: return float(s)
     except: return ""
@@ -89,15 +101,10 @@ def _nz(x):
     s = str(x).strip()
     return "" if s.lower() in ("nan", "none") else s
 
-def _fmt_brl(v: float) -> str:
-    return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-
 # ========= Telegram =========
 def _tg_enabled() -> bool:
-    try:
-        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
-    except Exception:
-        return False
+    try: return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
+    except Exception: return False
 
 def _tg_conf():
     token = st.secrets.get("TELEGRAM_TOKEN", "")
@@ -126,13 +133,18 @@ MOVS_ABA     = "MovimentosEstoque"
 COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
 MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"]
 
+# ---------- Botão Atualizar ----------
+c_at, _ = st.columns([1, 6])
+with c_at:
+    if st.button("🔄 Atualizar dados", use_container_width=True):
+        _refresh_now()
+
 # ========= dados base =========
 try:
-    prod_df = _load_df(PRODUTOS_ABA)
+    prod_df = _load_df(PRODUTOS_ABA, BUMP)
 except Exception as e:
     st.error("Erro ao abrir a aba Produtos.")
-    with st.expander("Detalhes"):
-        st.code(str(e))
+    with st.expander("Detalhes"): st.code(str(e))
     st.stop()
 
 def _pick_col(df, cands):
@@ -147,25 +159,27 @@ COL = {
     "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
 }
 
-# ------- cálculo de estoque (Compras - Vendas + Ajustes) -------
+# ------- estoque atual (Compras - Vendas + Ajustes) -------
 def _estoque_atual(pid: str="", nome: str="") -> float:
-    pid = (pid or "").strip()
-    nome = (nome or "").strip()
+    pid = (pid or "").strip(); nome = (nome or "").strip()
 
     def _sum(df, col_q, filtro):
         if df.empty or not col_q: return 0.0
         try:
             sub = df[filtro].copy()
             if sub.empty: return 0.0
-            return pd.to_numeric(sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False), errors="coerce").fillna(0).sum()
+            return pd.to_numeric(
+                sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+                errors="coerce"
+            ).fillna(0).sum()
         except Exception:
             return 0.0
 
-    try: comp = _load_df(COMPRAS_ABA)
+    try: comp = _load_df(COMPRAS_ABA, BUMP)
     except Exception: comp = pd.DataFrame()
-    try: vend = _load_df(VENDAS_ABA)
+    try: vend = _load_df(VENDAS_ABA,  BUMP)
     except Exception: vend = pd.DataFrame()
-    try: ajus = _load_df(AJUSTES_ABA)
+    try: ajus = _load_df(AJUSTES_ABA,  BUMP)
     except Exception: ajus = pd.DataFrame()
 
     # Compras
@@ -174,12 +188,11 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
     c_nom = _pick_col(comp, ["Produto","Nome"])
     ent = 0.0
     if c_qtd:
-        if pid and c_pid:
-            ent += _sum(comp, c_qtd, comp[c_pid].astype(str).str.strip()==pid)
+        if pid and c_pid: ent += _sum(comp, c_qtd, comp[c_pid].astype(str).str.strip()==pid)
         if nome and c_nom:
             ent += _sum(comp, c_qtd, (comp[c_nom].astype(str).str.strip()==nome) & (False if not c_pid else comp[c_pid].astype(str).str.strip().eq("").fillna(True)))
 
-    # Vendas (normalmente não tem nome)
+    # Vendas
     v_pid = _pick_col(vend, ["IDProduto","ProdutoID","ID"])
     v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
     sai = 0.0
@@ -190,13 +203,11 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
     a_pid = _pick_col(ajus, ["ID","IDProduto","ProdutoID"])
     a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
     aj = 0.0
-    if a_qtd and a_pid:
-        if pid:
-            aj += _sum(ajus, a_qtd, ajus[a_pid].astype(str).str.strip()==pid)
+    if a_qtd:
+        if pid and a_pid: aj += _sum(ajus, a_qtd, ajus[a_pid].astype(str).str.strip()==pid)
         elif nome:
             an = _pick_col(ajus, ["Produto","Nome"])
-            if an:
-                aj += _sum(ajus, a_qtd, ajus[an].astype(str).str.strip()==nome)
+            if an: aj += _sum(ajus, a_qtd, ajus[an].astype(str).str.strip()==nome)
 
     return float(ent - sai + aj)
 
@@ -289,7 +300,7 @@ if salvar:
         "ID": "",
         "Documento/NF": "",
         "Origem": "Compras / Entradas",
-        "SaldoApós": str(int(estoque_depois)) if float(estoque_depois).is_integer() else str(estoque_depois).replace(".", ",")
+        "SaldoApós": str(int(estoque_depois)) if float(estoque_depois).is_integer() else str(estoque_depois).replace(",", ".")
     })
 
     msg = (
@@ -307,6 +318,7 @@ if salvar:
 
     st.success("Entrada registrada com sucesso! ✅")
     st.toast("Compra lançada", icon="✅")
+    _refresh_now()
 
 st.divider()
 st.page_link("pages/02_cadastrar_produto.py", label="↩️ Voltar ao Cadastro/Editar", icon="➕")
@@ -320,12 +332,9 @@ st.subheader("🧪 Fracionar — converter GRANEL (L) em fracionados")
 
 # helper: última compra do granel (info rápida)
 def _ultima_compra(pid: str, nome: str):
-    try:
-        comp = _load_df(COMPRAS_ABA)
-    except Exception:
-        return None
-    if comp.empty: 
-        return None
+    try: comp = _load_df(COMPRAS_ABA, BUMP)
+    except Exception: return None
+    if comp.empty: return None
 
     col_id = None
     for c in ["IDProduto","ProdutoID","ID"]:
@@ -340,15 +349,12 @@ def _ultima_compra(pid: str, nome: str):
     elif col_nome:
         df = df[df[col_nome].astype(str).str.strip() == str(nome).strip()]
 
-    if df.empty:
-        return None
-
+    if df.empty: return None
     if col_data and col_data in df.columns:
         try:
             df["_d"] = pd.to_datetime(df[col_data], format="%d/%m/%Y", errors="coerce")
             df = df.sort_values("_d", ascending=False)
-        except Exception:
-            pass
+        except Exception: pass
 
     row = df.iloc[0].to_dict()
     return {
@@ -359,9 +365,9 @@ def _ultima_compra(pid: str, nome: str):
         "total": row.get("Total","")
     }
 
-# carregar produtos novamente com garantias de colunas
+# carregar produtos
 try:
-    produtos = _load_df(PRODUTOS_ABA)
+    produtos = _load_df(PRODUTOS_ABA, BUMP)
 except Exception:
     produtos = pd.DataFrame(columns=["ID","Nome","Unidade"])
 
@@ -383,11 +389,8 @@ else:
         def _fmt_opt(r):
             return f"{_nz(r.get(COL_NOME,''))}  ·  {_nz(r.get(COL_ID,''))}".strip()
 
-        idx_g = st.selectbox(
-            "Matéria-prima (granel em L)", 
-            options=range(len(df_granel)),
-            format_func=lambda i: _fmt_opt(df_granel.iloc[i])
-        )
+        idx_g = st.selectbox("Matéria-prima (granel em L)", options=range(len(df_granel)),
+                             format_func=lambda i: _fmt_opt(df_granel.iloc[i]))
         row_g = df_granel.iloc[idx_g]
         gid   = _nz(row_g.get(COL_ID,""))
         gnome = _nz(row_g.get(COL_NOME,""))
@@ -397,33 +400,22 @@ else:
 
         info = _ultima_compra(gid, gnome)
         if info:
-            st.caption(
-                f"🧾 Última compra: {info['data']} · "
-                f"Qtd {info['qtd']} {info['unid']} · "
-                f"Custo unit {info['custo_unit']} · Total {info['total']}"
-            )
+            st.caption(f"🧾 Última compra: {info['data']} · Qtd {info['qtd']} {info['unid']} · Custo unit {info['custo_unit']} · Total {info['total']}")
 
         c1, c2 = st.columns(2)
         with c1:
-            idx_1 = st.selectbox(
-                "SKU fracionado A (ex.: 1 L)", 
-                options=range(len(df_un)),
-                format_func=lambda i: _fmt_opt(df_un.iloc[i])
-            )
+            idx_1 = st.selectbox("SKU fracionado A (ex.: 1 L)", options=range(len(df_un)),
+                                 format_func=lambda i: _fmt_opt(df_un.iloc[i]))
             qtd_1 = st.number_input("Qtd frascos A", min_value=0, step=1, value=0)
             vol_1_l = st.number_input("Volume por frasco A (em L) — ex.: 1.0", min_value=0.0, step=0.1, value=1.0, format="%.3f")
         with c2:
-            idx_2 = st.selectbox(
-                "SKU fracionado B (ex.: 500 ml)", 
-                options=range(len(df_un)),
-                format_func=lambda i: _fmt_opt(df_un.iloc[i]),
-                index=0
-            )
+            idx_2 = st.selectbox("SKU fracionado B (ex.: 500 ml)", options=range(len(df_un)),
+                                 format_func=lambda i: _fmt_opt(df_un.iloc[i]), index=0)
             qtd_2 = st.number_input("Qtd frascos B", min_value=0, step=1, value=0)
             vol_2_l = st.number_input("Volume por frasco B (em L) — ex.: 0.5", min_value=0.0, step=0.1, value=0.5, format="%.3f")
 
         total_litros = (qtd_1 * vol_1_l) + (qtd_2 * vol_2_l)
-        st.write(f"🔁 Litros a baixar do granel: **{total_litros:.3f} L**")
+        st.write(f"🔁 Litros a baixar do granel: **{_fmt_num(total_litros)} L**")
 
         confirmar = st.button("Registrar fracionamento", use_container_width=True)
 
@@ -450,6 +442,7 @@ else:
                 "SaldoApós": ""
             })
 
+            linhas = []
             # entrada fracionado A (unidades)
             if qtd_1 > 0:
                 r1 = df_un.iloc[idx_1]
@@ -459,12 +452,13 @@ else:
                     "Produto": _nz(r1.get(COL_NOME,"")),
                     "Tipo": "C fracionamento +",
                     "Qtd": str(qtd_1),
-                    "Obs": f"Fracionamento: {vol_1_l:.3f} L/frasco",
+                    "Obs": f"Fracionamento: {_fmt_num(vol_1_l)} L/frasco",
                     "ID": "",
                     "Documento/NF": "",
                     "Origem": "Fracionamento",
                     "SaldoApós": ""
                 })
+                linhas.append(f"• {_nz(r1.get(COL_NOME,''))}: <b>{qtd_1}</b> un ({_fmt_num(vol_1_l)} L/frasco)")
 
             # entrada fracionado B (unidades)
             if qtd_2 > 0:
@@ -475,12 +469,25 @@ else:
                     "Produto": _nz(r2.get(COL_NOME,"")),
                     "Tipo": "C fracionamento +",
                     "Qtd": str(qtd_2),
-                    "Obs": f"Fracionamento: {vol_2_l:.3f} L/frasco",
+                    "Obs": f"Fracionamento: {_fmt_num(vol_2_l)} L/frasco",
                     "ID": "",
                     "Documento/NF": "",
                     "Origem": "Fracionamento",
                     "SaldoApós": ""
                 })
+                linhas.append(f"• {_nz(r2.get(COL_NOME,''))}: <b>{qtd_2}</b> un ({_fmt_num(vol_2_l)} L/frasco)")
+
+            # ---- Telegram do fracionamento ----
+            saldo_depois = (estoque_g - total_litros) if isinstance(estoque_g, (int,float)) else None
+            msg = (
+                "🧪 <b>Fracionamento registrado</b>\n"
+                f"{data_str}\n"
+                f"Granel: <b>{gnome}</b>  ↓ <b>{_fmt_num(total_litros)} L</b>\n"
+                + ("\n".join(linhas) + "\n" if linhas else "")
+                + (f"📦 Granel: {_fmt_num(estoque_g)} → <b>{_fmt_num(saldo_depois)}</b> L" if saldo_depois is not None else "")
+            )
+            _tg_send(msg)
 
             st.success("Fracionamento registrado com sucesso! ✅")
             st.toast("Movimentos de fracionamento lançados", icon="✅")
+            _refresh_now()
