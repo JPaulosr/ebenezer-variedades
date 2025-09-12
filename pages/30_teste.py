@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pages/04_estoque.py — Estoque (Compras + Vendas + Movimentos/Ajustes) com auto-refresh
+# pages/04_estoque.py — Estoque (MovimentosEstoque como fonte única) + busca + auto-refresh
 
 import json, unicodedata as _ud, re
 from datetime import date
@@ -177,33 +177,28 @@ def _prod_key_from(prod_id, prod_nome):
 # Abas & Headers
 # =========================
 ABA_PRODUTOS = "Produtos"
-ABA_COMPRAS = "Compras"
-ABA_MOV = "MovimentosEstoque"
-ABA_VENDAS = "Vendas"
+ABA_COMPRAS  = "Compras"            # só para custo médio
+ABA_MOV      = "MovimentosEstoque"  # FONTE ÚNICA de quantidades
+ABA_VENDAS   = "Vendas"             # não usamos para quantidade (evita duplicar)
 
 COMPRAS_HEADERS = ["Data", "Produto", "Unidade", "Fornecedor", "Qtd", "Custo Unitário", "Total", "IDProduto", "Obs"]
-MOV_HEADERS = ["Data", "IDProduto", "Produto", "Tipo", "Qtd", "Obs", "ID", "Documento/NF", "Origem", "SaldoApós"]
+MOV_HEADERS     = ["Data", "IDProduto", "Produto", "Tipo", "Qtd", "Obs", "ID", "Documento/NF", "Origem", "SaldoApós"]
 
 # =========================
 # Carregar bases
 # =========================
 titles = _sheet_titles()
 
-prod_df = _load_df(ABA_PRODUTOS)
-
+prod_df   = _load_df(ABA_PRODUTOS)
 compras_df = _load_df(ABA_COMPRAS) if ABA_COMPRAS in titles else pd.DataFrame(columns=COMPRAS_HEADERS)
-mov_df = _load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEADERS)
-
-# vendas (nome de colunas baseado no seu print)
-vendas_cols_default = ["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]
-vendas_df = _load_df(ABA_VENDAS) if ABA_VENDAS in titles else pd.DataFrame(columns=vendas_cols_default)
+mov_df    = _load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEADERS)
 
 # =========================
 # Normalizações
 # =========================
 # Produtos
 COLP = {
-    "id": next((c for c in ["ID", "Id", "id", "Codigo", "Código", "SKU"] if c in prod_df.columns), None),
+    "id":   next((c for c in ["ID", "Id", "id", "Codigo", "Código", "SKU"] if c in prod_df.columns), None),
     "nome": next((c for c in ["Nome", "Produto", "Descrição", "Descricao"] if c in prod_df.columns), None),
 }
 if COLP["nome"] is None:
@@ -211,31 +206,30 @@ if COLP["nome"] is None:
     st.stop()
 
 base = prod_df.copy()
-base["__key"] = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
-base["Produto"] = base[COLP["nome"]]
+base["__key"]    = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
+base["Produto"]  = base[COLP["nome"]]
 base["IDProduto"] = base[COLP["id"]] if COLP["id"] else ""
 
-# Compras → custo atual (último) + quantidades
+# Custo médio/atual (última compra)
 for c in COMPRAS_HEADERS:
     if c not in compras_df.columns:
         compras_df[c] = ""
 if not compras_df.empty:
-    compras_df["__key"] = compras_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
-    compras_df["Qtd_num"] = compras_df["Qtd"].apply(_to_float_or_zero)
+    compras_df["__key"]     = compras_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
     compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_float_or_zero)
     last_cost = compras_df.groupby("__key", as_index=False).tail(1)
     custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 else:
     custo_atual_map = {}
 
-# Movimentos manuais
+# Movimentos — FONTE ÚNICA DE QUANTIDADES
 for c in MOV_HEADERS:
     if c not in mov_df.columns:
         mov_df[c] = ""
 if not mov_df.empty:
     mov_df["Tipo_norm"] = mov_df["Tipo"].apply(_norm_tipo)
-    mov_df["Qtd_num"] = mov_df["Qtd"].apply(_to_float_or_zero)
-    mov_df["__key"] = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
+    mov_df["Qtd_num"]   = mov_df["Qtd"].apply(_to_float_or_zero)
+    mov_df["__key"]     = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
 
     def _sum_mov(tipo):
         m = mov_df[mov_df["Tipo_norm"] == tipo]
@@ -244,58 +238,64 @@ if not mov_df.empty:
         return m.groupby("__key")["Qtd_num"].sum().to_dict()
 
     entradas_mov = _sum_mov("entrada")
-    saidas_mov = _sum_mov("saida")
-    ajustes_mov = _sum_mov("ajuste")
+    saidas_mov   = _sum_mov("saida")
+    ajustes_mov  = _sum_mov("ajuste")
 else:
     entradas_mov, saidas_mov, ajustes_mov = {}, {}, {}
 
-# Vendas → saídas por produto (somente CupomStatus OK)
-if not vendas_df.empty:
-    vendas_df["Qtd_num"] = vendas_df["Qtd"].apply(_to_float_or_zero)
-    vendas_df["__key"] = vendas_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
-    cupom_status = vendas_df.get("CupomStatus", "OK").astype(str).str.upper().str.strip()
-    vendas_ok = vendas_df[(vendas_df["__key"] != "") & (cupom_status == "OK")]
-    saidas_vendas = vendas_ok.groupby("__key")["Qtd_num"].sum().to_dict()
-else:
-    saidas_vendas = {}
-
 # =========================
-# Consolidação Estoque
+# Consolidação Estoque (somente MOVIMENTOS)
 # =========================
 df = base[["__key", "Produto", "IDProduto"]].copy()
 
 def _get(mapper, key):
     return float(mapper.get(key, 0.0))
 
-# Entradas: Compras + movimentos de entrada
-df["Entradas"] = df["__key"].apply(lambda k: compras_df.loc[compras_df.get("__key", "") == k, "Qtd_num"].sum() + _get(entradas_mov, k))
-# Saídas: Vendas (OK) + movimentos de saída
-df["Saidas"] = df["__key"].apply(lambda k: _get(saidas_vendas, k) + _get(saidas_mov, k))
-# Ajustes: somente movimentos de ajuste
-df["Ajustes"] = df["__key"].apply(lambda k: _get(ajustes_mov, k))
+df["Entradas"] = df["__key"].apply(lambda k: _get(entradas_mov, k))
+df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov, k))
+df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov, k))
 
 df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
-df["CustoAtual"] = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
-df["ValorTotal"] = (df["EstoqueAtual"].astype(float) * df["CustoAtual"].astype(float)).round(2)
+df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
+df["ValorTotal"]   = (df["EstoqueAtual"].astype(float) * df["CustoAtual"].astype(float)).round(2)
+
+# =========================
+# Busca / Filtros
+# =========================
+st.subheader("Tabela de Estoque")
+cBusca, cLow = st.columns([3, 1])
+with cBusca:
+    termo = st.text_input("🔎 Buscar", placeholder="Nome ou ID do produto...")
+with cLow:
+    only_low = st.checkbox("Somente baixo estoque (≤ 0)", value=False)
+
+mask = pd.Series([True] * len(df))
+if termo.strip():
+    t = _strip_accents_low(termo)
+    by_nome = df["Produto"].astype(str).apply(_strip_accents_low).str.contains(t)
+    by_id   = df["IDProduto"].astype(str).str.contains(termo.strip(), case=False, na=False)
+    mask &= (by_nome | by_id)
+if only_low:
+    mask &= (df["EstoqueAtual"] <= 0)
+
+df_view = df[mask].copy()
 
 # =========================
 # Cards + Tabela
 # =========================
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.metric("🧮 Itens com estoque > 0", int((df["EstoqueAtual"] > 0).sum()))
+    st.metric("🧮 Itens com estoque > 0", int((df_view["EstoqueAtual"] > 0).sum()))
 with c2:
-    st.metric("📦 Quantidade total em estoque", f"{df['EstoqueAtual'].sum():.0f}")
+    st.metric("📦 Quantidade total em estoque", f"{df_view['EstoqueAtual'].sum():.0f}")
 with c3:
-    st.metric("💰 Valor total (R$)", f"R$ {df['ValorTotal'].sum():.2f}")
-
-st.subheader("Tabela de Estoque (Compras + Vendas + Ajustes)")
+    st.metric("💰 Valor total (R$)", f"R$ {df_view['ValorTotal'].sum():.2f}")
 
 cols_show = ["IDProduto", "Produto", "Entradas", "Saidas", "Ajustes", "EstoqueAtual", "CustoAtual", "ValorTotal"]
 for c in cols_show:
-    if c not in df.columns:
-        df[c] = 0 if c not in ("IDProduto", "Produto") else ""
-st.dataframe(df[cols_show].sort_values("Produto"), use_container_width=True, hide_index=True)
+    if c not in df_view.columns:
+        df_view[c] = 0 if c not in ("IDProduto", "Produto") else ""
+st.dataframe(df_view[cols_show].sort_values("Produto"), use_container_width=True, hide_index=True)
 
 with st.expander("🧾 Últimos movimentos (debug)"):
     if mov_df.empty:
@@ -312,22 +312,23 @@ st.divider()
 st.subheader("➖ Registrar Saída / Baixa de Estoque")
 with st.form("form_saida"):
     usar_lista_s = st.checkbox("Selecionar produto da lista", value=True, key="saida_lista")
+    df_select = df_view if usar_lista_s and not df_view.empty else df  # usa filtro da busca
     if usar_lista_s:
-        if df.empty:
+        if df_select.empty:
             st.warning("Sem produtos para saída.")
             st.stop()
 
         def _fmt_saida(i):
-            r = df.iloc[i]
+            r = df_select.iloc[i]
             return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
 
-        idx = st.selectbox("Produto", options=range(len(df)), format_func=_fmt_saida)
-        row = df.iloc[idx]
+        idx = st.selectbox("Produto", options=range(len(df_select)), format_func=_fmt_saida)
+        row = df_select.iloc[idx]
         prod_nome_s = _nz(row["Produto"])
-        prod_id_s = _nz(row["IDProduto"])
+        prod_id_s   = _nz(row["IDProduto"])
     else:
         prod_nome_s = st.text_input("Produto (nome exato)", key="saida_nome")
-        prod_id_s = st.text_input("ID (opcional)", key="saida_id")
+        prod_id_s   = st.text_input("ID (opcional)", key="saida_id")
 
     csa, csb = st.columns(2)
     with csa:
@@ -366,22 +367,23 @@ st.divider()
 st.subheader("🛠️ Registrar Ajuste de Estoque")
 with st.form("form_ajuste"):
     usar_lista_a = st.checkbox("Selecionar produto da lista", value=True, key="ajuste_lista")
+    df_select = df_view if usar_lista_a and not df_view.empty else df
     if usar_lista_a:
-        if df.empty:
+        if df_select.empty:
             st.warning("Sem produtos para ajuste.")
             st.stop()
 
         def _fmt_aj(i):
-            r = df.iloc[i]
+            r = df_select.iloc[i]
             return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
 
-        idxa = st.selectbox("Produto", options=range(len(df)), format_func=_fmt_aj, key="ajuste_idx")
-        rowa = df.iloc[idxa]
+        idxa = st.selectbox("Produto", options=range(len(df_select)), format_func=_fmt_aj, key="ajuste_idx")
+        rowa = df_select.iloc[idxa]
         prod_nome_a = _nz(rowa["Produto"])
-        prod_id_a = _nz(rowa["IDProduto"])
+        prod_id_a   = _nz(rowa["IDProduto"])
     else:
         prod_nome_a = st.text_input("Produto (nome exato)", key="ajuste_nome")
-        prod_id_a = st.text_input("ID (opcional)", key="ajuste_id")
+        prod_id_a   = st.text_input("ID (opcional)", key="ajuste_id")
 
     ca1, ca2 = st.columns(2)
     with ca1:
