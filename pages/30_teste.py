@@ -1,4 +1,4 @@
-# app.py — Dashboard Ebenezér Variedades (compact + Fiado estilo salão)
+# app.py — Dashboard Ebenezér Variedades (compact + Fiado estilo salão 2.0)
 # -*- coding: utf-8 -*-
 import json, unicodedata, re
 from collections.abc import Mapping
@@ -22,36 +22,41 @@ if st.session_state.pop("_force_refresh", False):
     st.rerun()
 
 # =========================
-# Estilo (cards compactos)
+# Estilo (cards compactos 2.0)
 # =========================
 st.markdown("""
 <style>
 :root{
   --card-bg: linear-gradient(180deg,#0b1220, #0a0f1a);
-  --card-br: 14px;
-  --card-bd: 1px solid #1c2742;
+  --card-br: 12px;
+  --card-bd: 1px solid #1b2239;
 }
-.block-container {padding-top: .8rem;}
-/* grid responsiva com cartões menores */
+.block-container {padding-top: .6rem;}
+
+/* grid responsiva com cartões MENORES */
 .kpi-grid{
   display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(175px,1fr));
-  gap:10px; margin:.1rem 0 .8rem;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:8px; margin:.1rem 0 .6rem;
 }
 .kpi-card{
   border-radius:var(--card-br);
-  padding:10px 12px;
+  padding:8px 10px;
   background:var(--card-bg);
   border:var(--card-bd);
 }
-.kpi-card h3{font-size:.78rem; font-weight:600; margin:0 0 4px; opacity:.85}
-.kpi-card .v{font-size:1.18rem; font-weight:800; line-height:1}
-.kpi-card .sub{font-size:.72rem; opacity:.7; margin-top:4px}
+.kpi-card h3{font-size:.7rem; font-weight:600; margin:0 0 3px; opacity:.85}
+.kpi-card .v{font-size:1.02rem; font-weight:800; line-height:1}
+.kpi-card .sub{font-size:.68rem; opacity:.7; margin-top:4px}
 
-/* versão ainda menor (usada no Fiado) */
-.kpi-compact .kpi-card{padding:8px 10px}
-.kpi-compact .kpi-card .v{font-size:1.05rem}
-.kpi-compact .kpi-card h3{font-size:.74rem}
+/* versão ultra compacta (aplicar onde quiser) */
+.kpi-compact .kpi-card{padding:7px 8px}
+.kpi-compact .kpi-card .v{font-size:.98rem}
+.kpi-compact .kpi-card h3{font-size:.68rem}
+
+/* métricas streamlit */
+[data-testid="stMetricValue"] {font-size: 1.0rem;}
+[data-testid="stMetricDelta"] span {font-size: .75rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -426,7 +431,7 @@ caixa_periodo = faturamento - compras_total
 # =========================
 # KPIs (cards principais) — compactos
 # =========================
-_kpi_div_open()
+_kpi_div_open("kpi-compact")
 kpi("💵 Faturamento (período)", _fmt_brl(faturamento))
 kpi("🧾 Cupons", f"{num_cupons}", sub=f"Ticket {_fmt_brl(ticket_medio)}")
 kpi("📦 Itens vendidos", f"{itens_vendidos:.0f}")
@@ -494,14 +499,13 @@ if not vendas.empty:
         figt.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=420)
         st.plotly_chart(figt, use_container_width=True)
     with c2:
-        st.dataframe(g[["Produto","TotalNum"]].rename(columns={"TotalNum":"Total (R$)"}),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(g[["Produto","TotalNum"]].rename(columns={"TotalNum":"Total (R$)"}), use_container_width=True, hide_index=True)
 else:
     st.info("Sem vendas no período.")
 st.divider()
 
 # =========================
-# 📒 FIADO — painel (estilo salão)
+# 📒 FIADO — painel (estilo salão • enriquecido)
 # =========================
 def _normalize_fiado_lanc(f: pd.DataFrame) -> pd.DataFrame:
     if f.empty: return pd.DataFrame(columns=["Cliente","Data_d","Venc_d","ValorNum"])
@@ -543,13 +547,13 @@ def _normalize_fiado_pg(p: pd.DataFrame) -> pd.DataFrame:
 fiado = _normalize_fiado_lanc(fiado_raw)
 fiado_pg = _normalize_fiado_pg(fiado_pag_raw)
 
-st.subheader("📒 Fiados — Resumo e Detalhes")
+st.subheader("📒 Fiados — Resumo, Aging e Extrato")
 if fiado.empty and fiado_pg.empty:
     st.info("Sem dados de Fiado para exibir.")
 else:
     hoje_d = date.today()
 
-    # saldos por cliente (lançamentos - pagamentos)
+    # Saldos por cliente (lançamentos - pagamentos)
     lanc_cli = fiado.groupby("Cliente")["ValorNum"].sum() if not fiado.empty else pd.Series(dtype=float)
     pag_cli  = fiado_pg.groupby("Cliente")["ValorNum"].sum() if not fiado_pg.empty else pd.Series(dtype=float)
     saldo_cli = (lanc_cli - pag_cli).fillna(0.0)
@@ -558,73 +562,134 @@ else:
     qtd_clientes_aberto = int((saldo_cli>0).sum())
     registros_fiado = int((fiado.shape[0] if not fiado.empty else 0))
 
-    # novos lançamentos e recebidos no período
+    # Movimento do PERÍODO (usa dt_ini/dt_fim)
     novos_lanc = float(fiado[(fiado["Data_d"]>=dt_ini) & (fiado["Data_d"]<=dt_fim)]["ValorNum"].sum()) if not fiado.empty else 0.0
     recebidos  = float(fiado_pg[(fiado_pg["Data_d"]>=dt_ini) & (fiado_pg["Data_d"]<=dt_fim)]["ValorNum"].sum()) if not fiado_pg.empty else 0.0
+    cobertura  = (recebidos/novos_lanc*100) if novos_lanc>0 else 0.0
 
-    # em atraso (aproximação)
+    # Aging
+    def _aging_bucket(venc: date|None) -> str:
+        if not venc: return "Sem vencimento"
+        delta = (venc - hoje_d).days
+        if delta >= 8:  return "A vencer (8+ dias)"
+        if 0 <= delta <= 7: return "A vencer (0–7 d)"
+        atraso = -delta
+        if atraso <= 7:   return "Atraso (1–7 d)"
+        if atraso <= 30:  return "Atraso (8–30 d)"
+        if atraso <= 60:  return "Atraso (31–60 d)"
+        return "Atraso (60+ d)"
+
     if ("Venc_d" in fiado.columns) and (fiado["Venc_d"].notna().any()):
-        vencidos = fiado[fiado["Venc_d"].notna() & (fiado["Venc_d"] < hoje_d)]
-        venc_cli = vencidos.groupby("Cliente")["ValorNum"].sum() if not vencidos.empty else pd.Series(dtype=float)
-        atraso_cli = (venc_cli - pag_cli).clip(lower=0) if not pag_cli.empty else venc_cli
-        em_atraso_total = float(atraso_cli[atraso_cli>0].sum())
+        base_aging = fiado.copy()
+        base_aging["Bucket"] = base_aging["Venc_d"].apply(_aging_bucket)
+        lanc_por_cli_bucket = base_aging.groupby(["Cliente","Bucket"])["ValorNum"].sum()
+        lanc_por_cli_total  = base_aging.groupby(["Cliente"])["ValorNum"].sum()
+        partes = []
+        for (cli, bucket), val in lanc_por_cli_bucket.items():
+            tot_cli = float(lanc_por_cli_total.get(cli, 0.0) or 0.0)
+            share = (val / tot_cli) if tot_cli>0 else 0
+            saldo_c = float(saldo_cli.get(cli, 0.0) or 0.0)
+            partes.append({"Bucket": bucket, "Valor": max(saldo_c*share, 0.0)})
+        df_aging = pd.DataFrame(partes).groupby("Bucket")["Valor"].sum().reset_index()
+        order = [
+            "A vencer (8+ dias)","A vencer (0–7 d)",
+            "Atraso (1–7 d)","Atraso (8–30 d)","Atraso (31–60 d)","Atraso (60+ d)",
+            "Sem vencimento"
+        ]
+        df_aging["ord"] = df_aging["Bucket"].apply(lambda b: order.index(b) if b in order else 999)
+        df_aging = df_aging.sort_values("ord").drop(columns=["ord"])
+        em_atraso_total = float(df_aging.loc[df_aging["Bucket"].str.contains("Atraso"), "Valor"].sum())
+        a_vencer_7 = float(df_aging.loc[df_aging["Bucket"].eq("A vencer (0–7 d)"), "Valor"].sum())
     else:
+        df_aging = pd.DataFrame(columns=["Bucket","Valor"])
         em_atraso_total = 0.0
+        a_vencer_7 = 0.0
 
-    # KPIs compactos (como no salão)
+    # KPIs compactos do FIADO
     _kpi_div_open("kpi-compact")
-    kpi("🪙 Total em fiado (aberto)", _fmt_brl(em_aberto_total))
-    kpi("👥 Clientes com fiado", f"{qtd_clientes_aberto}")
-    kpi("🧾 Registros de fiado", f"{registros_fiado}")
-    kpi("⏰ Em atraso (aprox.)", _fmt_brl(em_atraso_total))
-    kpi("✅ Recebido no período", _fmt_brl(recebidos))
+    kpi("🪙 Em aberto (total)", _fmt_brl(em_aberto_total))
+    kpi("👥 Clientes com saldo", f"{qtd_clientes_aberto}")
+    kpi("⏳ Em atraso", _fmt_brl(em_atraso_total))
+    kpi("🗓️ A vencer (0–7d)", _fmt_brl(a_vencer_7))
+    kpi("➕ Lançado no período", _fmt_brl(novos_lanc))
+    kpi("✅ Recebido no período", _fmt_brl(recebidos), sub=f"Cobertura {cobertura:.0f}%")
     _kpi_div_close()
+
+    # Barras do AGING
+    st.markdown("**Aging de Fiados (distribuição do saldo em aberto por faixa)**")
+    if not df_aging.empty and df_aging["Valor"].sum()>0:
+        fig_age = px.bar(df_aging, x="Bucket", y="Valor", text="Valor")
+        fig_age.update_traces(texttemplate="R$ %{text:.2f}", textposition="outside", cliponaxis=False)
+        fig_age.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=340)
+        st.plotly_chart(fig_age, use_container_width=True)
+    else:
+        st.info("Sem dados de vencimento suficientes para montar o aging.")
 
     # Top 10 devedores
     top_cli = saldo_cli[saldo_cli>0].sort_values(ascending=False).head(10).reset_index()
     top_cli.columns = ["Cliente","Saldo"]
-    st.markdown("**Top 10 clientes em fiado (valor em aberto)**")
+    st.markdown("**🏆 Top 10 clientes em fiado (saldo em aberto)**")
     if not top_cli.empty:
         c1, c2 = st.columns([1.2,1])
         with c1:
             fig = px.bar(top_cli, x="Cliente", y="Saldo", text="Saldo")
             fig.update_traces(texttemplate="R$ %{text:.2f}", textposition="outside", cliponaxis=False)
-            fig.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=420, xaxis_tickangle=-30)
+            fig.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=360, xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             st.dataframe(top_cli.rename(columns={"Saldo":"Saldo (R$)"}),
-                         use_container_width=True, hide_index=True, height=420)
+                         use_container_width=True, hide_index=True, height=360)
     else:
         st.info("Nenhum cliente com saldo em aberto.")
 
-    st.markdown("**Detalhamento (fiados em aberto por cliente)**")
+    # Detalhamento resumido (saldo por cliente)
+    st.markdown("**📋 Saldos por cliente**")
     det = saldo_cli.reset_index()
     det.columns = ["Cliente","Saldo"]
     det = det.sort_values("Saldo", ascending=False)
     st.dataframe(det, use_container_width=True, hide_index=True)
 
-    # Timeline de movimentos recentes (últimos 14 dias)
-    st.markdown("**🗓️ Movimentos recentes (14 dias)**")
-    ult_ini = hoje_d - timedelta(days=13)
-    mov = []
-    if not fiado.empty:
-        x = fiado[(fiado["Data_d"]>=ult_ini) & (fiado["Data_d"]<=hoje_d)].copy()
-        x["Tipo"] = "Lançamento"
-        x["ValorSinal"] = x["ValorNum"]
-        mov.append(x[["Data_d","Cliente","Tipo","ValorSinal"]])
-    if not fiado_pg.empty:
-        y = fiado_pg[(fiado_pg["Data_d"]>=ult_ini) & (fiado_pg["Data_d"]<=hoje_d)].copy()
-        y["Tipo"] = "Pagamento"
-        y["ValorSinal"] = -y["ValorNum"]
-        mov.append(y[["Data_d","Cliente","Tipo","ValorSinal"]])
-    if mov:
-        mdf = pd.concat(mov, ignore_index=True).sort_values("Data_d")
-        g = mdf.groupby(["Data_d","Tipo"])["ValorSinal"].sum().reset_index().rename(columns={"Data_d":"Data","ValorSinal":"Valor"})
-        figm = px.bar(g, x="Data", y="Valor", color="Tipo", barmode="group")
-        figm.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=420)
-        st.plotly_chart(figm, use_container_width=True)
-    else:
-        st.info("Sem movimentos nos últimos 14 dias.")
+    # Extrato por cliente
+    st.markdown("**🔎 Extrato por cliente**")
+    cli_opts = sorted(det.loc[det["Saldo"]>0,"Cliente"].tolist() + list(set(fiado.get("Cliente",[]).astype(str))))
+    cli_sel = st.selectbox("Selecione um cliente", options=cli_opts, index=0 if cli_opts else None, placeholder="Digite um nome...")
+    if cli_sel:
+        logs = []
+        if not fiado.empty:
+            a = fiado[fiado["Cliente"].astype(str)==cli_sel].copy()
+            a["Tipo"] = "Lançamento"; a["Sinal"] = a["ValorNum"].astype(float)
+            a["DataBase"] = a["Data_d"]
+            logs.append(a[["DataBase","Tipo","ValorNum","Sinal","Venc_d"]])
+        if not fiado_pg.empty:
+            b = fiado_pg[fiado_pg["Cliente"].astype(str)==cli_sel].copy()
+            b["Tipo"] = "Pagamento"; b["Sinal"] = -b["ValorNum"].astype(float)
+            b["DataBase"] = b["Data_d"]
+            b["Venc_d"] = None
+            logs.append(b[["DataBase","Tipo","ValorNum","Sinal","Venc_d"]])
+
+        if logs:
+            mov = pd.concat(logs, ignore_index=True).sort_values("DataBase")
+            mov["Acumulado"] = mov["Sinal"].cumsum()
+            mov["Data"] = mov["DataBase"].astype(str)
+            c1, c2 = st.columns([1.2,1])
+            with c1:
+                figm = px.bar(mov, x="DataBase", y="Sinal", color="Tipo")
+                figm.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=300, showlegend=True)
+                st.plotly_chart(figm, use_container_width=True)
+            with c2:
+                st.metric("Saldo atual do cliente", _fmt_brl(float(saldo_cli.get(cli_sel,0.0) or 0.0)))
+                prox = None
+                if ("Venc_d" in fiado.columns):
+                    prox_v = fiado[(fiado["Cliente"].astype(str)==cli_sel) & (fiado["Venc_d"].notna())].sort_values("Venc_d")
+                    if not prox_v.empty:
+                        prox = prox_v.iloc[0]["Venc_d"]
+                st.caption(f"Próximo vencimento: {prox.strftime('%d/%m/%Y') if prox else '—'}")
+            tbl = mov[["Data","Tipo","ValorNum","Venc_d","Acumulado"]].rename(columns={
+                "ValorNum":"Valor (R$)","Venc_d":"Vencimento","Acumulado":"Saldo Acum."
+            })
+            st.dataframe(tbl, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem movimentações registradas para este cliente.")
 st.divider()
 
 # =========================
@@ -664,7 +729,8 @@ else:
 
     st.markdown("**⚠️ Itens abaixo do mínimo / sugestão de compra**")
     if estq_min_col:
-        alert = dfv[(dfv[etq_min_col].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv[estq_min_col].fillna(0))].copy() if (etq_min_col := estq_min_col) else pd.DataFrame()
+        etq_min_col = estq_min_col  # só para clareza
+        alert = dfv[(dfv[etq_min_col].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv[etq_min_col].fillna(0))].copy()
         if not alert.empty:
             alert["SugestaoCompra"] = (alert[etq_min_col].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
             cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc",etq_min_col,"SugestaoCompra","LeadTimeDias"] if c in alert.columns]
@@ -704,3 +770,5 @@ else:
         }) if cols_show else dfv,
         use_container_width=True, hide_index=True
     )
+
+# ——— FIM ———
