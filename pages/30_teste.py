@@ -1,4 +1,4 @@
-# app.py — Dashboard Ebenezér Variedades
+# app.py — Dashboard Ebenezér Variedades (compact + Fiado estilo salão)
 # -*- coding: utf-8 -*-
 import json, unicodedata, re
 from collections.abc import Mapping
@@ -22,25 +22,51 @@ if st.session_state.pop("_force_refresh", False):
     st.rerun()
 
 # =========================
-# Estilo rápido (cards modernos)
+# Estilo (cards compactos)
 # =========================
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem;}
-.kpi-card{
-  border-radius:16px; padding:16px 18px; background:linear-gradient(180deg,#101827, #0b1220);
-  color:#e5eefc; border:1px solid #1f2a44; box-shadow:0 4px 18px rgba(0,0,0,.25);
+:root{
+  --card-bg: linear-gradient(180deg,#0b1220, #0a0f1a);
+  --card-br: 14px;
+  --card-bd: 1px solid #1c2742;
 }
-.kpi-card h3{font-size:0.9rem; font-weight:600; margin:0; opacity:.9}
-.kpi-card .v{font-size:1.6rem; font-weight:800; margin:.25rem 0 0}
-.kpi-grid{display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:.4rem 0 1rem}
-@media (max-width:1000px){ .kpi-grid{grid-template-columns:repeat(2,1fr);} }
+.block-container {padding-top: .8rem;}
+/* grid responsiva com cartões menores */
+.kpi-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(175px,1fr));
+  gap:10px; margin:.1rem 0 .8rem;
+}
+.kpi-card{
+  border-radius:var(--card-br);
+  padding:10px 12px;
+  background:var(--card-bg);
+  border:var(--card-bd);
+}
+.kpi-card h3{font-size:.78rem; font-weight:600; margin:0 0 4px; opacity:.85}
+.kpi-card .v{font-size:1.18rem; font-weight:800; line-height:1}
+.kpi-card .sub{font-size:.72rem; opacity:.7; margin-top:4px}
+
+/* versão ainda menor (usada no Fiado) */
+.kpi-compact .kpi-card{padding:8px 10px}
+.kpi-compact .kpi-card .v{font-size:1.05rem}
+.kpi-compact .kpi-card h3{font-size:.74rem}
 </style>
 """, unsafe_allow_html=True)
 
+def _kpi_div_open(extra_cls: str = ""):
+    st.markdown(f"<div class='kpi-grid {extra_cls}'>", unsafe_allow_html=True)
+
+def _kpi_div_close():
+    st.markdown("</div>", unsafe_allow_html=True)
+
 def kpi(title, value, sub=None):
-    sub = f"<div style='opacity:.85;font-size:.8rem;margin-top:2px'>{sub}</div>" if sub else ""
-    st.markdown(f"<div class='kpi-card'><h3>{title}</h3><div class='v'>{value}</div>{sub}</div>", unsafe_allow_html=True)
+    sub_html = f"<div class='sub'>{sub}</div>" if sub else ""
+    st.markdown(
+        f"<div class='kpi-card'><h3>{title}</h3><div class='v'>{value}</div>{sub_html}</div>",
+        unsafe_allow_html=True
+    )
 
 # =========================
 # Auth & Conexão
@@ -121,9 +147,7 @@ def _fmt_brl(v):
         return ("R$ " + f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
     except: return "R$ 0,00"
 
-def _lower(s): return str(s or "").strip().lower()
-
-# 🔑 ID canônico (resolve P-xxxxx vs p_xxxxx)
+# 🔑 ID canônico (resolve P-xxxxx vs p_xxxxx): apenas dígitos
 def _canon_id(x):
     s = re.sub(r"[^0-9]", "", str(x or ""))
     return s
@@ -147,7 +171,7 @@ try:    fiado_pag_raw = carregar_aba("Fiado_Pagamentos")
 except: fiado_pag_raw = pd.DataFrame()
 
 # =========================
-# Normalização de PRODUTOS (base estática)
+# Normalização de PRODUTOS
 # =========================
 if prod.empty:
     st.warning("Aba Produtos está vazia.")
@@ -274,7 +298,7 @@ def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
 compras = _normalize_compras_period(comp_raw)
 
 # =========================
-# >>> Estoque & Custo Médio (HISTÓRICO) usando ID canônico
+# Estoque & Custo Médio (histórico)
 # =========================
 def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
     if v.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
@@ -343,12 +367,11 @@ calc["CustoMedio"] = custo_medio
 calc = calc.reset_index().rename(columns={"index":"KeyID"})
 
 # =========================
-# Merge com PRODUTOS por KeyID (prioriza valores CALCULADOS)
+# Merge com PRODUTOS por KeyID (prioriza calculado)
 # =========================
 prod_calc = prod.copy() if not prod.empty else pd.DataFrame()
 if not prod_calc.empty and "KeyID" in prod_calc.columns:
     prod_calc = prod_calc.merge(calc, how="left", on="KeyID", suffixes=("_orig", ""))
-    # limpa colunas antigas duplicadas
     for col in ["EstoqueCalc", "CustoMedio", "Entradas", "Saidas", "Ajustes"]:
         col_old = f"{col}_orig"
         if col_old in prod_calc.columns:
@@ -401,15 +424,15 @@ compras_total = compras["TotalNum"].sum() if not compras.empty else 0.0
 caixa_periodo = faturamento - compras_total
 
 # =========================
-# KPIs (cards principais)
+# KPIs (cards principais) — compactos
 # =========================
-st.markdown("<div class='kpi-grid'>", unsafe_allow_html=True)
+_kpi_div_open()
 kpi("💵 Faturamento (período)", _fmt_brl(faturamento))
 kpi("🧾 Cupons", f"{num_cupons}", sub=f"Ticket {_fmt_brl(ticket_medio)}")
 kpi("📦 Itens vendidos", f"{itens_vendidos:.0f}")
 kpi("📈 Lucro bruto (aprox.)", _fmt_brl(lucro_bruto), sub=f"{margem_bruta:.1f}% margem")
 kpi("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
-st.markdown("</div>", unsafe_allow_html=True)
+_kpi_div_close()
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
 
 # =========================
@@ -478,7 +501,7 @@ else:
 st.divider()
 
 # =========================
-# 📒 FIADO — painel
+# 📒 FIADO — painel (estilo salão)
 # =========================
 def _normalize_fiado_lanc(f: pd.DataFrame) -> pd.DataFrame:
     if f.empty: return pd.DataFrame(columns=["Cliente","Data_d","Venc_d","ValorNum"])
@@ -520,7 +543,7 @@ def _normalize_fiado_pg(p: pd.DataFrame) -> pd.DataFrame:
 fiado = _normalize_fiado_lanc(fiado_raw)
 fiado_pg = _normalize_fiado_pg(fiado_pag_raw)
 
-st.subheader("📒 Fiado (caderneta)")
+st.subheader("📒 Fiados — Resumo e Detalhes")
 if fiado.empty and fiado_pg.empty:
     st.info("Sem dados de Fiado para exibir.")
 else:
@@ -532,6 +555,8 @@ else:
     saldo_cli = (lanc_cli - pag_cli).fillna(0.0)
 
     em_aberto_total = float(saldo_cli[saldo_cli>0].sum())
+    qtd_clientes_aberto = int((saldo_cli>0).sum())
+    registros_fiado = int((fiado.shape[0] if not fiado.empty else 0))
 
     # novos lançamentos e recebidos no período
     novos_lanc = float(fiado[(fiado["Data_d"]>=dt_ini) & (fiado["Data_d"]<=dt_fim)]["ValorNum"].sum()) if not fiado.empty else 0.0
@@ -546,23 +571,25 @@ else:
     else:
         em_atraso_total = 0.0
 
-    # KPI cards
-    st.markdown("<div class='kpi-grid'>", unsafe_allow_html=True)
-    kpi("💸 Em aberto (fiado)", _fmt_brl(em_aberto_total))
+    # KPIs compactos (como no salão)
+    _kpi_div_open("kpi-compact")
+    kpi("🪙 Total em fiado (aberto)", _fmt_brl(em_aberto_total))
+    kpi("👥 Clientes com fiado", f"{qtd_clientes_aberto}")
+    kpi("🧾 Registros de fiado", f"{registros_fiado}")
     kpi("⏰ Em atraso (aprox.)", _fmt_brl(em_atraso_total))
-    kpi("➕ Lançado no período", _fmt_brl(novos_lanc))
     kpi("✅ Recebido no período", _fmt_brl(recebidos))
-    kpi("👥 Clientes em aberto", f"{int((saldo_cli>0).sum())}")
-    st.markdown("</div>", unsafe_allow_html=True)
+    _kpi_div_close()
 
-    # Top devedores
+    # Top 10 devedores
     top_cli = saldo_cli[saldo_cli>0].sort_values(ascending=False).head(10).reset_index()
     top_cli.columns = ["Cliente","Saldo"]
+    st.markdown("**Top 10 clientes em fiado (valor em aberto)**")
     if not top_cli.empty:
         c1, c2 = st.columns([1.2,1])
         with c1:
-            fig = px.bar(top_cli, x="Cliente", y="Saldo")
-            fig.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=420)
+            fig = px.bar(top_cli, x="Cliente", y="Saldo", text="Saldo")
+            fig.update_traces(texttemplate="R$ %{text:.2f}", textposition="outside", cliponaxis=False)
+            fig.update_layout(yaxis_title="R$", xaxis_title="", template="plotly_white", height=420, xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
         with c2:
             st.dataframe(top_cli.rename(columns={"Saldo":"Saldo (R$)"}),
@@ -570,7 +597,7 @@ else:
     else:
         st.info("Nenhum cliente com saldo em aberto.")
 
-    st.markdown("**📋 Detalhe — saldos por cliente**")
+    st.markdown("**Detalhamento (fiados em aberto por cliente)**")
     det = saldo_cli.reset_index()
     det.columns = ["Cliente","Saldo"]
     det = det.sort_values("Saldo", ascending=False)
@@ -610,9 +637,9 @@ else:
     m = pd.Series(True, index=prod_calc.index)
     if cat_sel and "Categoria" in prod_calc.columns:  m &= prod_calc["Categoria"].astype(str).isin(cat_sel)
     if forn_sel and "Fornecedor" in prod_calc.columns: m &= prod_calc["Fornecedor"].astype(str).isin(forn_sel)
-    if apenas_ativos and "Ativo" in prod_calc.columns:
+    if "Ativo" in prod_calc.columns:
         prod_calc["Ativo"] = prod_calc["Ativo"].astype(str).str.lower()
-        m &= (prod_calc["Ativo"]=="sim")
+        if apenas_ativos: m &= (prod_calc["Ativo"]=="sim")
     if busca:
         s = busca.lower()
         m &= prod_calc.apply(lambda r: s in " ".join([str(x).lower() for x in r.values]), axis=1)
@@ -637,11 +664,11 @@ else:
 
     st.markdown("**⚠️ Itens abaixo do mínimo / sugestão de compra**")
     if estq_min_col:
-        alert = dfv[(dfv[estq_min_col].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv[estq_min_col].fillna(0))].copy()
+        alert = dfv[(dfv[etq_min_col].fillna(0) > 0) & (dfv["EstoqueCalc"].fillna(0) <= dfv[estq_min_col].fillna(0))].copy() if (etq_min_col := estq_min_col) else pd.DataFrame()
         if not alert.empty:
-            alert["SugestaoCompra"] = (alert[estq_min_col].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
-            cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc",estq_min_col,"SugestaoCompra","LeadTimeDias"] if c in alert.columns]
-            st.dataframe(alert[cols_alerta].rename(columns={"EstoqueCalc":"EstoqueAtual", estq_min_col:"EstoqueMin"}),
+            alert["SugestaoCompra"] = (alert[etq_min_col].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
+            cols_alerta = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc",etq_min_col,"SugestaoCompra","LeadTimeDias"] if c in alert.columns]
+            st.dataframe(alert[cols_alerta].rename(columns={"EstoqueCalc":"EstoqueAtual", etq_min_col:"EstoqueMin"}),
                          use_container_width=True, hide_index=True)
         else:
             st.info("Nenhum item abaixo do mínimo.")
