@@ -1,23 +1,20 @@
-# pages/01_produtos.py — Catálogo de Produtos (estoque via MovimentosEstoque)
+# pages/Contagem_Estoque.py — Definir nível de estoque (com delta automático)
 # -*- coding: utf-8 -*-
-import json, unicodedata as _ud, re
+
+import json, re, unicodedata as _ud
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 import gspread
-from gspread_dataframe import get_as_dataframe
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Produtos — Ebenezér Variedades", page_icon="📦", layout="wide")
-st.title("📦 Produtos — Catálogo & Busca")
+st.set_page_config(page_title="Contagem de estoque (definir nível)", page_icon="📋", layout="wide")
+st.title("📋 Contagem de estoque (definir nível)")
 
-# Auto-refresh sinalizado por outras páginas
-if st.session_state.pop("_force_refresh", False):
-    st.cache_data.clear()
-    st.rerun()
-
-# =========================
-# Utils
-# =========================
+# ======================================================
+# Helpers de acesso (mesmo padrão do 01_produtos.py)
+# ======================================================
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
@@ -57,44 +54,47 @@ def _first_col(df: pd.DataFrame, cands: list[str]) -> str | None:
         if c.lower() in lower: return lower[c.lower()]
     return None
 
-def _to_num(x) -> float:
-    if x is None: return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("R$","").replace(" ","").replace(",", ".")
-    s = re.sub(r"[^0-9.\-]", "", s)
-    if s.count(".") > 1:
-        p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
-    try: return float(s)
-    except: return 0.0
-
+# ======================================================
+# Helpers de normalização (idênticos ao 01_produtos.py)
+# ======================================================
 def _strip_accents_low(s: str) -> str:
     s = _ud.normalize("NFKD", str(s or ""))
     s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
     return s.lower().strip()
 
+def _to_num(x) -> float:
+    if x is None: return 0.0
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"): return 0.0
+    s = s.replace("R$","").replace(" ","")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.]", "", s)
+    if s.count(".") > 1:
+        p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
+    try: return float(s)
+    except: return 0.0
+
 def _norm_tipo(t: str) -> str:
     """
-    'entrada'  (compra, estorno, fracionamento +)
-    'saida'    (venda, baixa, fracionamento -)
-    'ajuste'   (ajuste, contagem / inventário / abertura)
+    Normaliza tipos de movimento:
+      - 'entrada' (compra, estorno, fracionamento +)
+      - 'saida'   (venda, baixa, fracionamento -)
+      - 'ajuste'  (ajuste, contagem/inventário)
     """
     raw = str(t or "")
     low = _strip_accents_low(raw)
-
-    # Fracionamento (+/-) identificado pelo sinal
     if "fracion" in low:
         if "+" in raw: return "entrada"
         if "-" in raw: return "saida"
         return "outro"
-
     lowc = re.sub(r"[^a-z]", "", low)
-    if any(k in lowc for k in ("entrada","compra","estorno","devolucao")):
+    if "contagem" in lowc or "inventario" in lowc:  # 👈 trata contagem como ajuste
+        return "ajuste"
+    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc:
         return "entrada"
-    if any(k in lowc for k in ("saida","venda","baixa")):
+    if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc:
         return "saida"
-    # inclui contagem / inventário como AJUSTE (snapshot)
-    if any(k in lowc for k in ("ajuste","contagem","inventario","abertura","saldoinicial","inventarioinicial")):
+    if "ajuste"  in lowc:
         return "ajuste"
     return "outro"
 
@@ -111,215 +111,151 @@ def _prod_key_from(prod_id, prod_nome):
     if pid: return pid
     return f"nm:{_strip_accents_low(_nz(prod_nome))}"
 
-# =========================
-# Abas
-# =========================
+# ======================================================
+# Constantes de abas
+# ======================================================
 ABA_PRODUTOS = "Produtos"
-ABA_MOV      = "MovimentosEstoque"   # fonte única de quantidades
-ABA_COMPRAS  = "Compras"             # custo
+ABA_MOV      = "MovimentosEstoque"
 
-# =========================
-# Carregamento
-# =========================
+# ======================================================
+# Carregamento bases
+# ======================================================
 try:
     df_prod = carregar_aba(ABA_PRODUTOS)
 except Exception as e:
     st.error("Erro ao abrir a aba Produtos."); st.code(str(e)); st.stop()
 
 try:
-    df_mov  = carregar_aba(ABA_MOV)
+    df_mov = carregar_aba(ABA_MOV)
 except Exception:
-    df_mov  = pd.DataFrame(columns=["Data","IDProduto","Produto","Tipo","Qtd","Obs"])
+    df_mov = pd.DataFrame(columns=["Data","IDProduto","Produto","Tipo","Qtd","Obs"])
 
-try:
-    df_comp = carregar_aba(ABA_COMPRAS)
-except Exception:
-    df_comp = pd.DataFrame(columns=["IDProduto","Qtd","Custo Unitário"])
-
-# =========================
-# Colunas importantes
-# =========================
+# Colunas de interesse
 col_id   = _first_col(df_prod, ["ID","Id","Codigo","Código","SKU"])
 col_nome = _first_col(df_prod, ["Nome","Produto","Descrição","Descricao"])
-col_cat  = _first_col(df_prod, ["Categoria"])
-col_forn = _first_col(df_prod, ["Fornecedor"])
-col_estq_min = _first_col(df_prod, ["EstoqueMin","Estoque Mínimo","EstqMin"])
-col_preco = _first_col(df_prod, ["PreçoVenda","PrecoVenda","Preço","Preco"])
 
-if not col_nome:
-    st.error("Aba **Produtos** precisa ter uma coluna de nome (ex.: Nome/Produto)."); st.stop()
-
-# =========================
-# Base Produtos
-# =========================
-base = df_prod.copy()
-base["__key"] = base.apply(lambda r: _prod_key_from(r.get(col_id,""), r.get(col_nome,"")), axis=1)
-base["IDProduto"] = base[col_id] if col_id else ""
-base["Produto"]   = base[col_nome]
-
-# =========================
-# Movimentos (fonte única)
-# =========================
-for c in ["Tipo","Qtd","IDProduto","Produto","Obs","Data"]:
+# Pré-processamento dos movimentos
+for c in ["Tipo","Qtd","IDProduto","Produto"]:
     if c not in df_mov.columns: df_mov[c] = ""
 
 if not df_mov.empty:
     df_mov["Tipo_norm"] = df_mov["Tipo"].apply(_norm_tipo)
-    # aceita colunas alternativas de quantidade
-    qcol = _first_col(df_mov, ["Qtd","Qtde","Quantidade"]) or "Qtd"
-    df_mov["Qtd_num"]   = df_mov[qcol].map(_to_num)
+    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)
     df_mov["__key"]     = df_mov.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
-    df_mov["Data_dt"]   = pd.to_datetime(df_mov["Data"], dayfirst=True, errors="coerce")
 else:
-    df_mov["Data_dt"] = pd.NaT
+    df_mov["Tipo_norm"] = []
+    df_mov["Qtd_num"]   = []
+    df_mov["__key"]     = []
 
-def _estoque_atual_com_snapshot(mov: pd.DataFrame, key: str) -> tuple[float, bool]:
-    """
-    Calcula Entr−Sai±Aj, mas se houver 'Contagem' (snapshot),
-    usa a ÚLTIMA contagem como base e soma apenas o que veio depois.
-    Retorna (estoque, usou_snapshot?)
-    """
-    m = mov[mov["__key"] == key].copy()
-    if m.empty:
-        return 0.0, False
+def estoque_atual_chave(ch) -> float:
+    if df_mov.empty: return 0.0
+    g = df_mov[df_mov["__key"] == ch].groupby("Tipo_norm")["Qtd_num"].sum()
+    return float(g.get("entrada",0.0) - g.get("saida",0.0) + g.get("ajuste",0.0))
 
-    # baseline
-    ent = m.loc[m["Tipo_norm"]=="entrada","Qtd_num"].sum()
-    sai = m.loc[m["Tipo_norm"]=="saida","Qtd_num"].sum()
-    adj = m.loc[m["Tipo_norm"]=="ajuste","Qtd_num"].sum()
-    baseline = float(ent - sai + adj)
+# ======================================================
+# UI — seleção de produto
+# ======================================================
+st.markdown("Selecione um produto e **defina o nível** desejado; o sistema grava **1 ajuste** com o delta necessário.")
 
-    # procura contagem/inventário
-    is_snapshot = (
-        m["Tipo"].astype(str).str.contains("cont", case=False, na=False) |
-        m["Obs"].astype(str).str.contains("cont", case=False, na=False) |
-        m["Tipo"].astype(str).str.contains("invent", case=False, na=False) |
-        m["Obs"].astype(str).str.contains("invent", case=False, na=False)
-    )
-    m_snap = m[is_snapshot & m["Data_dt"].notna()].sort_values("Data_dt")
-    if m_snap.empty:
-        return baseline, False
-
-    snap = m_snap.tail(1)  # última
-    snap_dt = snap["Data_dt"].iloc[0]
-    # tenta descobrir o alvo a partir do texto "Contagem para X"
-    alvo = None
-    obs_txt = str(snap["Obs"].iloc[0])
-    mobs = re.search(r"contagem\s*para\s*([-+]?\d+)", obs_txt, flags=re.I)
-    if mobs:
-        alvo = float(mobs.group(1))
-    # fallback: se não achar, assume que a contagem antiga foi lançada como valor final na própria Qtd
-    if alvo is None:
-        alvo = abs(float(snap["Qtd_num"].iloc[0]))
-
-    # movimentos após a contagem
-    after = m[m["Data_dt"] > snap_dt].copy()
-    ent2 = after.loc[after["Tipo_norm"]=="entrada","Qtd_num"].sum()
-    sai2 = after.loc[after["Tipo_norm"]=="saida","Qtd_num"].sum()
-    adj2 = after.loc[after["Tipo_norm"]=="ajuste","Qtd_num"].sum()
-
-    return float(alvo + ent2 - sai2 + adj2), True
-
-# =========================
-# Compras → custo atual (última compra)
-# =========================
-col_comp_id = _first_col(df_comp, ["IDProduto","ProdutoID","ID"])
-col_comp_cu = _first_col(df_comp, ["Custo Unitário","CustoUnitário","Custo Unit","Custo"])
-if not df_comp.empty and col_comp_id and col_comp_cu:
-    df_comp["__key"] = df_comp.apply(lambda r: _prod_key_from(r.get(col_comp_id,""), r.get("Produto","")), axis=1)
-    df_comp["Custo_num"] = df_comp[col_comp_cu].map(_to_num)
-    last_cost = df_comp.groupby("__key", as_index=False).tail(1)
-    custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
-else:
-    custo_atual_map = {}
-
-# =========================
-# Consolidação
-# =========================
-df = base[["__key","IDProduto","Produto"]].copy()
-def _get(m, k): return float(m.get(k, 0.0))
-
-# somatórios “crus”
-if not df_mov.empty:
-    ent_map = df_mov[df_mov["Tipo_norm"]=="entrada"].groupby("__key")["Qtd_num"].sum().to_dict()
-    sai_map = df_mov[df_mov["Tipo_norm"]=="saida"  ].groupby("__key")["Qtd_num"].sum().to_dict()
-    adj_map = df_mov[df_mov["Tipo_norm"]=="ajuste" ].groupby("__key")["Qtd_num"].sum().to_dict()
-else:
-    ent_map, sai_map, adj_map = {}, {}, {}
-
-df["Entradas"] = df["__key"].apply(lambda k: _get(ent_map, k))
-df["Saidas"]   = df["__key"].apply(lambda k: _get(sai_map, k))
-df["Ajustes"]  = df["__key"].apply(lambda k: _get(adj_map, k))
-df["__EstoqueBaseline"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
-
-# estoque “inteligente” com snapshot de contagem
-df[["EstoqueAtual","__usouSnap"]] = df["__key"].apply(
-    lambda k: pd.Series(_estoque_atual_com_snapshot(df_mov, k))
+# Opções de produto (mostrar "ID — Nome" quando existir ID)
+df_prod["_id"]   = df_prod[col_id]   if col_id else ""
+df_prod["_nome"] = df_prod[col_nome] if col_nome else ""
+df_prod["__key"] = df_prod.apply(lambda r: _prod_key_from(r.get(col_id,""), r.get(col_nome,"")), axis=1)
+df_prod["__label"] = df_prod.apply(
+    lambda r: f"{r['_id']} — {r['_nome']}" if r["_id"] else str(r["_nome"]),
+    axis=1
 )
 
-df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
-df["ValorTotal"]   = (df["EstoqueAtual"] * df["CustoAtual"]).round(2)
+opt = st.selectbox(
+    "Produto",
+    options=df_prod["__key"],
+    format_func=lambda k: df_prod.loc[df_prod["__key"]==k, "__label"].iloc[0] if (df_prod["__key"]==k).any() else k,
+    index=0 if not df_prod.empty else None
+)
 
-# =========================
-# Filtros
-# =========================
-top, mid = st.columns([2.5, 1.5])
-with top:
-    termo = st.text_input("🔎 Buscar", placeholder="ID, nome, fornecedor, categoria...").strip()
-with mid:
-    only_low = st.checkbox("⚠️ Somente baixo estoque", value=False,
-                           help="Itens com EstoqueAtual ≤ EstoqueMin (se existir a coluna).")
+row = df_prod[df_prod["__key"]==opt].iloc[0] if not df_prod.empty else None
+prod_id   = row.get("_id","")
+prod_nome = row.get("_nome","")
 
-c1, c2 = st.columns(2)
+# Estoque atual real (Entradas − Saídas ± Ajustes)
+estoque_atual = estoque_atual_chave(opt)
+
+st.info(f"**Estoque atual (calculado): {int(estoque_atual) if float(estoque_atual).is_integer() else estoque_atual}**", icon="ℹ️")
+
+c1, c2 = st.columns([1,1])
 with c1:
-    if col_cat and col_cat in df_prod.columns:
-        cats = ["(todas)"] + sorted(pd.Series(df_prod[col_cat].dropna().astype(str).unique()).tolist())
-        cat = st.selectbox("Categoria", cats)
-    else:
-        cat = "(todas)"
+    alvo = st.number_input("Definir estoque para", min_value=0.0, step=1.0, value=float(estoque_atual))
 with c2:
-    if col_forn and col_forn in df_prod.columns:
-        forns = ["(todos)"] + sorted(pd.Series(df_prod[col_forn].dropna().astype(str).unique()).tolist())
-        forn = st.selectbox("Fornecedor", forns)
-    else:
-        forn = "(todos)"
+    motivo = st.text_input("Motivo", value="Contagem")
 
-# junta info de categoria/fornecedor para filtro
-df = df.merge(df_prod[[col_id, col_nome, col_cat, col_forn]] if col_id else df_prod[[col_nome, col_cat, col_forn]],
-              left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left")
+responsavel = st.text_input("Responsável", value="")
+obs = st.text_area("Observações (opcional)", value="")
 
-mask = pd.Series(True, index=df.index)
-if termo:
-    t = termo.lower()
-    mask &= df.apply(lambda r: t in " ".join([str(x).lower() for x in [r.get("IDProduto",""), r.get("Produto",""), r.get(col_cat,""), r.get(col_forn,"")]]), axis=1)
-if col_cat and cat != "(todas)" and col_cat in df.columns:
-    mask &= (df[col_cat].astype(str) == cat)
-if col_forn and forn != "(todos)" and col_forn in df.columns:
-    mask &= (df[col_forn].astype(str) == forn)
+delta = alvo - estoque_atual
 
-if only_low and col_estq_min and col_estq_min in df_prod.columns:
-    df = df.merge(df_prod[[col_id, col_estq_min]] if col_id else df_prod[[col_nome, col_estq_min]],
-                  left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left", suffixes=("","_x"))
-    estq_min = df[col_estq_min].map(_to_num).fillna(0)
-    mask &= (df["EstoqueAtual"] <= estq_min)
+st.caption(f"Δ (delta) que será registrado como **Ajuste**: **{delta:.0f}**" if delta.is_integer() else f"Δ (delta): **{delta}**")
 
-dfv = df[mask].copy()
+# ======================================================
+# Persistência no MovimentosEstoque
+# ======================================================
+def _ws_mov():
+    return _sheet().worksheet(ABA_MOV)
 
-# =========================
-# Exibição
-# =========================
-cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
-if col_cat and col_cat in dfv.columns: cols_show.insert(2, col_cat)
-if col_forn and col_forn in dfv.columns: cols_show.insert(3, col_forn)
-if col_estq_min and col_estq_min in df_prod.columns and col_estq_min in dfv.columns:
-    if col_estq_min not in cols_show: cols_show.append(col_estq_min)
+def _ensure_headers(ws, headers: list[str]):
+    try:
+        cur = ws.row_values(1)
+    except Exception:
+        cur = []
+    if not cur:
+        ws.update("A1", [headers])
+        return headers
+    # se já existe, só garante mesma ordem ao montar a linha
+    return cur
 
-dfv = dfv.loc[:, [c for c in cols_show if c in dfv.columns]]
-st.dataframe(dfv.sort_values("Produto"), use_container_width=True, hide_index=True)
+def _append_movimento(data_str, id_prod, nome_prod, tipo, qtd_str, obs_str):
+    ws = _ws_mov()
+    headers = _ensure_headers(ws, ["Data","IDProduto","Produto","Tipo","Qtd","Obs"])
+    row_map = {
+        "Data": data_str,
+        "IDProduto": id_prod,
+        "Produto": nome_prod,
+        "Tipo": tipo,
+        "Qtd": qtd_str,
+        "Obs": obs_str,
+    }
+    # monta na ordem dos headers existentes
+    linha = [row_map.get(h, "") for h in headers]
+    ws.append_row(linha, value_input_option="USER_ENTERED")
 
-st.caption("""
-• **EstoqueAtual** usa Entradas − Saídas ± Ajustes, mas se houver **Contagem** recente (ex.: “Contagem para 10”),
-  ela passa a ser a base e somamos só os movimentos posteriores.
-• **CustoAtual** = último custo de compra.
-• Use **Compras** / **Fracionar** / **Ajustes** / **Contagem** para movimentar estoque.
-""")
+# ======================================================
+# Ação
+# ======================================================
+btn = st.button("💾 Salvar contagem", type="primary", use_container_width=True)
+
+if btn:
+    if row is None:
+        st.error("Selecione um produto válido.")
+        st.stop()
+
+    if delta == 0:
+        st.success("Nada a fazer: o estoque já está no valor desejado.")
+        st.stop()
+
+    # Formata data e quantidade (em string, com vírgula para manter padrão da planilha, se preferir)
+    data_str = datetime.now().strftime("%d/%m/%Y")
+    qtd_str  = str(delta).replace(".", ",")  # segue padrão usado no app
+
+    # Sempre grava como AJUSTE (motivo pode ser 'Contagem', mas a classificação é ajuste)
+    obs_final = f"{motivo or 'Contagem'} por {responsavel}".strip()
+    if obs:
+        obs_final = (obs_final + " — " + obs) if obs_final else obs
+
+    try:
+        _append_movimento(data_str, prod_id, prod_nome, "Ajuste", qtd_str, obs_final)
+        st.success(f"Ajuste gravado com sucesso! Δ = {delta:.0f} → estoque esperado = {alvo:.0f}" if delta.is_integer() else f"Ajuste gravado! Δ = {delta} → estoque esperado = {alvo}")
+        # força refresh em outras páginas
+        st.session_state["_force_refresh"] = True
+        st.cache_data.clear()
+    except Exception as e:
+        st.error("Falha ao gravar ajuste na aba MovimentosEstoque.")
+        st.code(str(e))
