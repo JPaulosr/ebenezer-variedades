@@ -61,9 +61,8 @@ def _to_num(x) -> float:
     if x is None: return 0.0
     s = str(x).strip()
     if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("R$","").replace(" ","")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.]", "", s)
+    s = s.replace("R$","").replace(" ","").replace(",", ".")
+    s = re.sub(r"[^0-9.\-]", "", s)
     if s.count(".") > 1:
         p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
     try: return float(s)
@@ -94,7 +93,7 @@ def _norm_tipo(t: str) -> str:
         return "entrada"
     if any(k in lowc for k in ("saida","venda","baixa")):
         return "saida"
-    # 🔧 inclui contagem / inventário como AJUSTE
+    # inclui contagem / inventário como AJUSTE (snapshot)
     if any(k in lowc for k in ("ajuste","contagem","inventario","abertura","saldoinicial","inventarioinicial")):
         return "ajuste"
     return "outro"
@@ -159,26 +158,67 @@ base["IDProduto"] = base[col_id] if col_id else ""
 base["Produto"]   = base[col_nome]
 
 # =========================
-# Movimentos → Entradas/Saídas/Ajustes (fonte única)
+# Movimentos (fonte única)
 # =========================
-for c in ["Tipo","Qtd","IDProduto","Produto"]:
+for c in ["Tipo","Qtd","IDProduto","Produto","Obs","Data"]:
     if c not in df_mov.columns: df_mov[c] = ""
 
 if not df_mov.empty:
     df_mov["Tipo_norm"] = df_mov["Tipo"].apply(_norm_tipo)
-    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)
+    # aceita colunas alternativas de quantidade
+    qcol = _first_col(df_mov, ["Qtd","Qtde","Quantidade"]) or "Qtd"
+    df_mov["Qtd_num"]   = df_mov[qcol].map(_to_num)
     df_mov["__key"]     = df_mov.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
-
-    def _sum_mov(tipo):
-        m = df_mov[df_mov["Tipo_norm"] == tipo]
-        if m.empty: return {}
-        return m.groupby("__key")["Qtd_num"].sum().to_dict()
-
-    entradas_mov = _sum_mov("entrada")
-    saidas_mov   = _sum_mov("saida")
-    ajustes_mov  = _sum_mov("ajuste")
+    df_mov["Data_dt"]   = pd.to_datetime(df_mov["Data"], dayfirst=True, errors="coerce")
 else:
-    entradas_mov, saidas_mov, ajustes_mov = {}, {}, {}
+    df_mov["Data_dt"] = pd.NaT
+
+def _estoque_atual_com_snapshot(mov: pd.DataFrame, key: str) -> tuple[float, bool]:
+    """
+    Calcula Entr−Sai±Aj, mas se houver 'Contagem' (snapshot),
+    usa a ÚLTIMA contagem como base e soma apenas o que veio depois.
+    Retorna (estoque, usou_snapshot?)
+    """
+    m = mov[mov["__key"] == key].copy()
+    if m.empty:
+        return 0.0, False
+
+    # baseline
+    ent = m.loc[m["Tipo_norm"]=="entrada","Qtd_num"].sum()
+    sai = m.loc[m["Tipo_norm"]=="saida","Qtd_num"].sum()
+    adj = m.loc[m["Tipo_norm"]=="ajuste","Qtd_num"].sum()
+    baseline = float(ent - sai + adj)
+
+    # procura contagem/inventário
+    is_snapshot = (
+        m["Tipo"].astype(str).str.contains("cont", case=False, na=False) |
+        m["Obs"].astype(str).str.contains("cont", case=False, na=False) |
+        m["Tipo"].astype(str).str.contains("invent", case=False, na=False) |
+        m["Obs"].astype(str).str.contains("invent", case=False, na=False)
+    )
+    m_snap = m[is_snapshot & m["Data_dt"].notna()].sort_values("Data_dt")
+    if m_snap.empty:
+        return baseline, False
+
+    snap = m_snap.tail(1)  # última
+    snap_dt = snap["Data_dt"].iloc[0]
+    # tenta descobrir o alvo a partir do texto "Contagem para X"
+    alvo = None
+    obs_txt = str(snap["Obs"].iloc[0])
+    mobs = re.search(r"contagem\s*para\s*([-+]?\d+)", obs_txt, flags=re.I)
+    if mobs:
+        alvo = float(mobs.group(1))
+    # fallback: se não achar, assume que a contagem antiga foi lançada como valor final na própria Qtd
+    if alvo is None:
+        alvo = abs(float(snap["Qtd_num"].iloc[0]))
+
+    # movimentos após a contagem
+    after = m[m["Data_dt"] > snap_dt].copy()
+    ent2 = after.loc[after["Tipo_norm"]=="entrada","Qtd_num"].sum()
+    sai2 = after.loc[after["Tipo_norm"]=="saida","Qtd_num"].sum()
+    adj2 = after.loc[after["Tipo_norm"]=="ajuste","Qtd_num"].sum()
+
+    return float(alvo + ent2 - sai2 + adj2), True
 
 # =========================
 # Compras → custo atual (última compra)
@@ -199,10 +239,24 @@ else:
 df = base[["__key","IDProduto","Produto"]].copy()
 def _get(m, k): return float(m.get(k, 0.0))
 
-df["Entradas"] = df["__key"].apply(lambda k: _get(entradas_mov, k))
-df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov,   k))
-df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov,  k))
-df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
+# somatórios “crus”
+if not df_mov.empty:
+    ent_map = df_mov[df_mov["Tipo_norm"]=="entrada"].groupby("__key")["Qtd_num"].sum().to_dict()
+    sai_map = df_mov[df_mov["Tipo_norm"]=="saida"  ].groupby("__key")["Qtd_num"].sum().to_dict()
+    adj_map = df_mov[df_mov["Tipo_norm"]=="ajuste" ].groupby("__key")["Qtd_num"].sum().to_dict()
+else:
+    ent_map, sai_map, adj_map = {}, {}, {}
+
+df["Entradas"] = df["__key"].apply(lambda k: _get(ent_map, k))
+df["Saidas"]   = df["__key"].apply(lambda k: _get(sai_map, k))
+df["Ajustes"]  = df["__key"].apply(lambda k: _get(adj_map, k))
+df["__EstoqueBaseline"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
+
+# estoque “inteligente” com snapshot de contagem
+df[["EstoqueAtual","__usouSnap"]] = df["__key"].apply(
+    lambda k: pd.Series(_estoque_atual_com_snapshot(df_mov, k))
+)
+
 df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
 df["ValorTotal"]   = (df["EstoqueAtual"] * df["CustoAtual"]).round(2)
 
@@ -230,7 +284,7 @@ with c2:
     else:
         forn = "(todos)"
 
-# junta info de categoria/fornecedor para filtro (sem poluir a saída)
+# junta info de categoria/fornecedor para filtro
 df = df.merge(df_prod[[col_id, col_nome, col_cat, col_forn]] if col_id else df_prod[[col_nome, col_cat, col_forn]],
               left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left")
 
@@ -244,7 +298,6 @@ if col_forn and forn != "(todos)" and col_forn in df.columns:
     mask &= (df[col_forn].astype(str) == forn)
 
 if only_low and col_estq_min and col_estq_min in df_prod.columns:
-    # traz EstoqueMin para o df e filtra
     df = df.merge(df_prod[[col_id, col_estq_min]] if col_id else df_prod[[col_nome, col_estq_min]],
                   left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left", suffixes=("","_x"))
     estq_min = df[col_estq_min].map(_to_num).fillna(0)
@@ -265,7 +318,8 @@ dfv = dfv.loc[:, [c for c in cols_show if c in dfv.columns]]
 st.dataframe(dfv.sort_values("Produto"), use_container_width=True, hide_index=True)
 
 st.caption("""
-• **EstoqueAtual** = Entradas − Saídas ± Ajustes (a partir da aba **MovimentosEstoque**, incluindo Fracionamento e Contagem).
+• **EstoqueAtual** usa Entradas − Saídas ± Ajustes, mas se houver **Contagem** recente (ex.: “Contagem para 10”),
+  ela passa a ser a base e somamos só os movimentos posteriores.
 • **CustoAtual** = último custo de compra.
 • Use **Compras** / **Fracionar** / **Ajustes** / **Contagem** para movimentar estoque.
 """)
