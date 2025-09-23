@@ -63,16 +63,47 @@ def _strip_accents_low(s: str) -> str:
     return s.lower().strip()
 
 def _to_num(x) -> float:
-    if x is None: return 0.0
+    """Converte string/num para float preservando sinal negativo.
+       Suporta formatos: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
+    if x is None: 
+        return 0.0
     s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("R$","").replace(" ","")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.]", "", s)
+    if s == "" or s.lower() in ("nan","none"):
+        return 0.0
+
+    # Normaliza variações de menos e parênteses negativos
+    s = s.replace("−", "-")  # unicode minus -> ascii
+    neg_paren = False
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+        neg_paren = True
+
+    # Remove símbolos e espaços; trata separadores BR/US
+    s = s.replace("R$", "").replace(" ", "")
+    # Se tiver vírgula (padrão BR), remove pontos de milhar e troca vírgula por ponto
+    if "," in s:
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    # Mantém apenas dígitos, 1 ponto decimal e um '-' no início
+    # Remove sinais '-' que não estejam na posição inicial
+    s = re.sub(r"(?<!^)-", "", s)
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    # Garante apenas um '-'
+    if s.count("-") > 1:
+        s = "-" + s.replace("-", "")
+    # Conserta múltiplos pontos decimais (mantém o último como decimal)
     if s.count(".") > 1:
-        p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
-    try: return float(s)
-    except: return 0.0
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+
+    try:
+        v = float(s)
+    except:
+        v = 0.0
+
+    if neg_paren:
+        v = -abs(v)
+    return v
 
 def _norm_tipo(t: str) -> str:
     """
@@ -88,7 +119,7 @@ def _norm_tipo(t: str) -> str:
         if "-" in raw: return "saida"
         return "outro"
     lowc = re.sub(r"[^a-z]", "", low)
-    if "contagem" in lowc or "inventario" in lowc:  # 👈 trata contagem como ajuste
+    if "contagem" in lowc or "inventario" in lowc:  # 👈 contagem é ajuste
         return "ajuste"
     if "entrada" in lowc or "compra" in lowc or "estorno" in lowc:
         return "entrada"
@@ -102,7 +133,8 @@ def _nz(x):
     if x is None: return ""
     try:
         if pd.isna(x): return ""
-    except: pass
+    except: 
+        pass
     s = str(x).strip()
     return "" if s.lower() in ("nan","none") else s
 
@@ -140,7 +172,7 @@ for c in ["Tipo","Qtd","IDProduto","Produto"]:
 
 if not df_mov.empty:
     df_mov["Tipo_norm"] = df_mov["Tipo"].apply(_norm_tipo)
-    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)
+    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)   # 👈 agora preserva negativos
     df_mov["__key"]     = df_mov.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
 else:
     df_mov["Tipo_norm"] = []
@@ -193,7 +225,7 @@ obs = st.text_area("Observações (opcional)", value="")
 
 delta = alvo - estoque_atual
 
-st.caption(f"Δ (delta) que será registrado como **Ajuste**: **{delta:.0f}**" if delta.is_integer() else f"Δ (delta): **{delta}**")
+st.caption(f"Δ (delta) que será registrado como **Ajuste**: **{delta:.0f}**" if float(delta).is_integer() else f"Δ (delta): **{delta}**")
 
 # ======================================================
 # Persistência no MovimentosEstoque
@@ -209,7 +241,6 @@ def _ensure_headers(ws, headers: list[str]):
     if not cur:
         ws.update("A1", [headers])
         return headers
-    # se já existe, só garante mesma ordem ao montar a linha
     return cur
 
 def _append_movimento(data_str, id_prod, nome_prod, tipo, qtd_str, obs_str):
@@ -223,7 +254,6 @@ def _append_movimento(data_str, id_prod, nome_prod, tipo, qtd_str, obs_str):
         "Qtd": qtd_str,
         "Obs": obs_str,
     }
-    # monta na ordem dos headers existentes
     linha = [row_map.get(h, "") for h in headers]
     ws.append_row(linha, value_input_option="USER_ENTERED")
 
@@ -241,21 +271,24 @@ if btn:
         st.success("Nada a fazer: o estoque já está no valor desejado.")
         st.stop()
 
-    # Formata data e quantidade (em string, com vírgula para manter padrão da planilha, se preferir)
     data_str = datetime.now().strftime("%d/%m/%Y")
-    qtd_str  = str(delta).replace(".", ",")  # segue padrão usado no app
+    qtd_str  = str(delta).replace(".", ",")  # mantém padrão PT-BR
 
-    # Sempre grava como AJUSTE (motivo pode ser 'Contagem', mas a classificação é ajuste)
+    # Sempre grava como AJUSTE (classe correta para contagem/inventário)
     obs_final = f"{motivo or 'Contagem'} por {responsavel}".strip()
     if obs:
         obs_final = (obs_final + " — " + obs) if obs_final else obs
 
     try:
         _append_movimento(data_str, prod_id, prod_nome, "Ajuste", qtd_str, obs_final)
-        st.success(f"Ajuste gravado com sucesso! Δ = {delta:.0f} → estoque esperado = {alvo:.0f}" if delta.is_integer() else f"Ajuste gravado! Δ = {delta} → estoque esperado = {alvo}")
-        # força refresh em outras páginas
+        st.success(
+            f"Ajuste gravado com sucesso! Δ = {delta:.0f} → estoque esperado = {alvo:.0f}"
+            if float(delta).is_integer() else
+            f"Ajuste gravado! Δ = {delta} → estoque esperado = {alvo}"
+        )
         st.session_state["_force_refresh"] = True
         st.cache_data.clear()
+        # st.rerun()  # habilite se quiser recarregar imediatamente
     except Exception as e:
         st.error("Falha ao gravar ajuste na aba MovimentosEstoque.")
         st.code(str(e))
