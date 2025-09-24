@@ -698,31 +698,6 @@ else:
                 _tg_send(msg)
             except: pass
 
-# Catálogo de Produtos
-_render_page_link(
-    name_candidates=[
-        "produtos", "catálogo de produtos", "catalogo de produtos", "01 produtos", "01_produtos"
-    ],
-    path_candidates=[
-        "pages/01_Produtos.py",     # P maiúsculo
-        "pages/01_produtos.py",     # p minúsculo
-        "pages/01-Produtos.py",
-        "pages/01 Produtos.py",
-    ],
-    label="↩️ Ir para Catálogo de Produtos",
-    icon="📦",
-)
-
-# Compras / Entradas
-_render_page_link(
-    name_candidates=[
-        "compras/entradas", "compras e entradas", "compras", "entradas", "03 compras", "03_compras_entradas"
-    ],
-    path_candidates=[
-        "pages/03_Compras_Produtos_Entradas.py",  # nome mais comum
-        "pages/03_compras_entradas.py",
-        "pages/03-Compras-Entradas.py",
-    ],
-    label="🧾 Ir para Compras/Entradas",
-    icon="🧾",
-)
+st.divider()
+st.page_link("Catálogo de Produtos", label="↩️ Ir para Catálogo de Produtos", icon="📦")
+st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
