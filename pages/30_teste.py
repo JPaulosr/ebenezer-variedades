@@ -9,7 +9,6 @@ import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 import requests  # Telegram
-import os
 
 st.set_page_config(page_title="Cadastrar/Editar Produto", page_icon="➕", layout="wide")
 st.title("➕ Cadastrar / Editar Produto")
@@ -520,26 +519,17 @@ else:
         with c1: nome = st.text_input("Nome")
         with c2: categoria = st.text_input("Categoria", placeholder="Ex.: limpeza, higiene…")
         with c3: fornecedor = st.text_input("Fornecedor")
-        c4, = st.columns(1)
+        c4, c5a, c5b = st.columns([1,1,1])
         with c4: preco = st.text_input("Preço venda (R$)", placeholder="19,90")
-
-        # --- Unidade (checkboxes, 1 opção) ---
-        UN_OPTS = ["un", "L", "kg", "g", "ml", "cx", "pct", "Outro…"]
-        st.markdown("**Unidade**")
-        cols_un = st.columns(4)
-        # desenha os checkboxes (padrão "un" marcado)
-        for i, opt in enumerate(UN_OPTS):
-            with cols_un[i % 4]:
-                st.checkbox(opt, key=f"un_opt_{i}", value=(opt == "un"))
-        sel_opts = [opt for i, opt in enumerate(UN_OPTS) if st.session_state.get(f"un_opt_{i}", False)]
-
-        un_outro = ""
-        if "Outro…" in sel_opts:
+        # Unidade (select + livre)
+        unidades = ["un","L","kg","g","ml","cx","pct","Outro…"]
+        with c5a:
+            un_sel = st.selectbox("Unidade", unidades, index=0)
+        with c5b:
             un_outro = st.text_input("Se 'Outro…', qual?", placeholder="ex.: rolo, m, par")
-
-        # resolução da unidade final (validaremos no submit)
-        unidade_escolhida = sel_opts[0] if sel_opts else None
-        unidade_final = (un_outro.strip() if unidade_escolhida == "Outro…" else unidade_escolhida)
+        unidade_final = (un_outro.strip() if un_sel=="Outro…" else un_sel)
+        c6, = st.columns(1)
+        with c6: ativo = st.checkbox("Ativo", value=True)
 
         st.markdown("#### 📦 Estoque inicial (opcional, recomendado)")
         c7, c8, c9, c10 = st.columns([1,1,1,1])
@@ -556,17 +546,6 @@ else:
         salvar = st.form_submit_button("➕ Cadastrar produto")
 
     if salvar:
-        # validação Unidade
-        if len(sel_opts) == 0:
-            st.error("Selecione uma unidade.")
-            st.stop()
-        if len(sel_opts) > 1:
-            st.error("Selecione apenas **uma** unidade.")
-            st.stop()
-        if unidade_escolhida == "Outro…" and not (un_outro or "").strip():
-            st.error("Informe a unidade no campo 'Se Outro…'.")
-            st.stop()
-
         if not nome.strip():
             st.error("Informe o **Nome**."); st.stop()
         pf = _to_float(preco)
@@ -599,7 +578,7 @@ else:
             if COL["estoque"]:   updates.setdefault(COL["estoque"], str(saldo if saldo is not None else 0))
             if COL["est_min"]:   updates[COL["est_min"]] = str(estmin)
             if (lead is not None) and COL["lead"]: updates.setdefault(COL["lead"], str(lead))
-            if COL["ativo"]:     updates[COL["ativo"]] = "sim" if True else "não"  # novo produto: ativo checkbox acima
+            if COL["ativo"]:     updates[COL["ativo"]] = "sim" if ativo else "não"
             if COL["atualizado"]: updates[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
             for col, val in updates.items():
@@ -665,8 +644,7 @@ else:
             if COL["est_min"]:   new_row[COL["est_min"]] = str(estmin)
             if (lead is not None) and COL["lead"]: new_row[COL["lead"]] = str(lead)
             if COL["unidade"]:   new_row[COL["unidade"]] = unidade_final or (unid_hist or "")
-            # ativo: usa o checkbox padrão (true)
-            if COL["ativo"]:     new_row[COL["ativo"]] = "sim"
+            if COL["ativo"]:     new_row[COL["ativo"]] = "sim" if ativo else "não"
             if COL["atualizado"]: new_row[COL["atualizado"]] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
             # estoque inicial informado => grava Compra + Movimento e ajusta custo/estoque
@@ -699,11 +677,9 @@ else:
                 if COL["estoque"]: new_row[COL["estoque"]] = str(int((_stock_balance(None, nome) or 0)))
 
             # grava
-            df_atual = _load_df(ABA)
             for col in df_atual.columns:
                 new_row.setdefault(col, "")
             df_out = pd.concat([df_atual, pd.DataFrame([new_row])], ignore_index=True)
-            ws = _sheet().worksheet(ABA)
             set_with_dataframe(ws, df_out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
             _msg_ok("Produto cadastrado com sucesso! ✅")
@@ -722,83 +698,6 @@ else:
                 _tg_send(msg)
             except: pass
 
-st.divider()
-
-# =============================================================================
-# Navegação robusta (substitui st.page_link simples)
-# =============================================================================
-def _list_pages_safe():
-    """Retorna dict {nome_menu_lower: page_info} de experimental_get_pages (se disponível)."""
-    try:
-        pages = st.experimental_get_pages()
-        norm = {}
-        for _, v in pages.items():
-            name = (v.get("page_name") or v.get("title") or "").strip()
-            if name:
-                norm[name.lower()] = v
-        return norm
-    except Exception:
-        return {}
-
-def _render_page_link(name_candidates, path_candidates, label, icon):
-    """Tenta por nome de menu, depois por caminho; se falhar, mostra botão com switch_page."""
-    pages = _list_pages_safe()
-
-    # 1) Tentar por nome (exatamente como aparece no menu)
-    for name in name_candidates:
-        key = name.strip().lower()
-        if key in pages:
-            real_menu_name = pages[key].get("page_name") or pages[key].get("title") or name
-            try:
-                st.page_link(real_menu_name, label=label, icon=icon)
-                return
-            except Exception:
-                pass
-
-    # 2) Tentar por caminho de script (case-sensitive)
-    best_guess = None
-    for p in path_candidates:
-        exists_locally = os.path.exists(p)
-        try:
-            st.page_link(p, label=label, icon=icon)
-            return
-        except Exception:
-            if exists_locally and best_guess is None:
-                best_guess = p
-    if best_guess is None and path_candidates:
-        best_guess = path_candidates[0]
-
-    # 3) Fallback por botão com switch_page
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button(label, use_container_width=True):
-            # tenta por nomes primeiro
-            for name in name_candidates:
-                try:
-                    st.switch_page(name)
-                    return
-                except Exception:
-                    continue
-            # tenta por caminhos
-            for p in path_candidates:
-                try:
-                    st.switch_page(p)
-                    return
-                except Exception:
-                    continue
-            # último palpite
-            if best_guess:
-                try:
-                    st.switch_page(best_guess)
-                    return
-                except Exception:
-                    pass
-            st.warning("Não consegui navegar automaticamente. Verifique o nome do menu ou o caminho do arquivo em `pages/`.")
-    with col2:
-        st.caption("Se você usa `st.navigation(...)`, garanta que as páginas estejam registradas no nav; "
-                   "`st.page_link` só enxerga o que o Streamlit registrou.")
-
-# ---- Links robustos ----
 # Catálogo de Produtos
 _render_page_link(
     name_candidates=[
