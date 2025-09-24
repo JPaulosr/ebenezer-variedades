@@ -1,10 +1,50 @@
-# =========================
-# ✏️ Editar / 🗑️ Apagar registros
-# =========================
-st.divider()
-st.subheader("✏️ Editar / 🗑️ Apagar registros")
+# pages/03_Compras_Produtos_Entradas.py
+# 📦 Compras / Produtos / Entradas
 
-# Helpers locais (idempotentes)
+import streamlit as st
+import pandas as pd
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+import gspread
+from google.oauth2.service_account import Credentials
+
+# =========================
+# Configuração da página
+# =========================
+st.set_page_config(page_title="Compras & Produtos", page_icon="📦", layout="wide")
+st.title("📦 Compras, Produtos e Movimentos")
+
+# =========================
+# Conexão Google Sheets
+# =========================
+SHEET_ID = "SUA_SHEET_ID_AQUI"
+COMPRAS_ABA = "Compras"
+MOVS_ABA = "Movimentos"
+
+COMPRAS_HEADERS = ["Data", "Produto", "Unidade", "Fornecedor", "Qtd",
+                   "Custo Unitário", "Total", "IDProduto", "Obs"]
+
+MOV_HEADERS = ["Data", "IDProduto", "Produto", "Tipo", "Qtd", "Obs",
+               "ID", "Documento/NF", "Origem", "SaldoApós"]
+
+@st.cache_resource
+def _get_client():
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"],
+                                                  scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return gspread.authorize(creds)
+
+def _ensure_ws(aba: str, headers: list[str]):
+    gc = _get_client()
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet(aba)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=aba, rows="1000", cols=str(len(headers)))
+        ws.append_row(headers)
+    return ws
+
+# =========================
+# Helpers locais
+# =========================
 def _load_with_rownums(aba: str, headers: list[str]):
     ws = _ensure_ws(aba, headers)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
@@ -23,7 +63,15 @@ def _save_df_over(ws, df: pd.DataFrame):
     ws.clear()
     set_with_dataframe(ws, df2, include_index=False, include_column_header=True, resize=True)
 
-tab_edit_comp, tab_edit_mov = st.tabs(["🧾 Editar Compras", "📦 Editar Movimentos"], key="tabs_edit_apagar")
+# =========================
+# ✏️ Editar / 🗑️ Apagar registros
+# =========================
+st.divider()
+st.subheader("✏️ Editar / 🗑️ Apagar registros")
+
+tab_edit_comp, tab_edit_mov = st.tabs(
+    ["🧾 Editar Compras", "📦 Editar Movimentos"], key="tabs_edit_apagar"
+)
 
 # ---------- Editar / Apagar COMPRAS ----------
 with tab_edit_comp:
