@@ -1,6 +1,6 @@
-# pages/01_produtos.py — Catálogo de Produtos (cards com foto, sem ID)
+# pages/01_produtos.py — Catálogo de Produtos (estoque via MovimentosEstoque) — versão com Cards de Fotos
 # -*- coding: utf-8 -*-
-import json, unicodedata as _ud, re
+import json, unicodedata as _ud, re, math
 import streamlit as st
 import pandas as pd
 import gspread
@@ -8,7 +8,77 @@ from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Produtos — Ebenezér Variedades", page_icon="📦", layout="wide")
-st.title("📦 Produtos — Catálogo & Busca")
+st.markdown("<h1 style='margin:0 0 .4rem 0'>📦 Produtos — Catálogo & Busca</h1>", unsafe_allow_html=True)
+
+# =========================
+# Estilos (dark-friendly)
+# =========================
+st.markdown("""
+<style>
+:root{
+  --card-bg: rgba(255,255,255,.04);
+  --card-bd: rgba(255,255,255,.12);
+  --muted: rgba(255,255,255,.65);
+  --fg: rgba(255,255,255,.92);
+  --accent: #7c3aed;
+  --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --info:#06b6d4;
+}
+@media (prefers-color-scheme: light){
+  :root{
+    --card-bg: #ffffff;
+    --card-bd: #e5e7eb;
+    --muted: #6b7280;
+    --fg: #111827;
+  }
+}
+.card-grid{
+  display:grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+  margin-top:.25rem;
+}
+.card{
+  background: var(--card-bg);
+  border: 1px solid var(--card-bd);
+  border-radius: 16px;
+  overflow: hidden;
+  display:flex; flex-direction:column;
+  transition: transform .08s ease, box-shadow .08s ease, border-color .1s ease;
+}
+.card:hover{ transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.18); border-color: rgba(124,58,237,.45) }
+.card-img{
+  width:100%; aspect-ratio: 4 / 3; object-fit: cover; background:#111; display:block;
+}
+.card-body{ padding: 12px 14px; color: var(--fg); }
+.card-title{
+  font-weight: 700; font-size: 1rem; line-height: 1.3; margin: 0 0 4px 0;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.card-sub{ font-size:.85rem; color: var(--muted); margin-bottom: 8px; display:flex; gap:8px; flex-wrap:wrap }
+.badge{
+  display:inline-flex; align-items:center; gap:6px; font-size:.75rem; padding:.2rem .5rem; border-radius:999px;
+  border:1px solid var(--card-bd); color:var(--muted);
+}
+.badge.warn{ border-color: rgba(245,158,11,.4); color:#f59e0b; }
+.badge.info{ border-color: rgba(6,182,212,.4); color:#06b6d4; }
+.badge.ok{ border-color: rgba(34,197,94,.4); color:#22c55e; }
+.price-row{
+  display:flex; align-items:baseline; justify-content:space-between; margin-top: 6px;
+}
+.price{ font-size:1.05rem; font-weight:800 }
+.meta{ font-size:.8rem; color: var(--muted) }
+.kpis{
+  display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;
+}
+.kpi{
+  font-variant-numeric: tabular-nums; font-size:.78rem; padding:.25rem .5rem; border-radius:8px; border:1px dashed var(--card-bd); color:var(--muted)
+}
+.hr{ height:1px; background:var(--card-bd); margin:8px 0 }
+.toolbar{
+  display:flex; gap: 12px; align-items:end; flex-wrap: wrap;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # Auto-refresh sinalizado por outras páginas
 if st.session_state.pop("_force_refresh", False):
@@ -37,9 +107,9 @@ def _sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
     gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL") or st.secrets.get("PLANILHA_ID")
+    url_or_id = st.secrets.get("PLANILHA_URL")
     if not url_or_id:
-        st.error("🛑 PLANILHA_URL/PLANILHA_ID ausente."); st.stop()
+        st.error("🛑 PLANILHA_URL ausente."); st.stop()
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -58,22 +128,31 @@ def _first_col(df: pd.DataFrame, cands: list[str]) -> str | None:
     return None
 
 def _to_num(x) -> float:
-    """Converte string/num para float preservando negativos, vírgula e 'R$'."""
-    if x is None: return 0.0
+    """Converte string/num para float preservando sinal negativo.
+       Suporta: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
+    if x is None:
+        return 0.0
     s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("−", "-")
+    if s == "" or s.lower() in ("nan","none"):
+        return 0.0
+
+    s = s.replace("−", "-")  # unicode minus -> ascii
     neg_paren = False
     if s.startswith("(") and s.endswith(")"):
         s = s[1:-1]; neg_paren = True
+
     s = s.replace("R$", "").replace(" ", "")
     if "," in s:
-        s = s.replace(".", "").replace(",", ".")
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+
     s = re.sub(r"(?<!^)-", "", s)
     s = re.sub(r"[^0-9.\-]", "", s)
-    if s.count("-") > 1: s = "-" + s.replace("-", "")
+    if s.count("-") > 1:
+        s = "-" + s.replace("-", "")
     if s.count(".") > 1:
         p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
+
     try: v = float(s)
     except: v = 0.0
     if neg_paren: v = -abs(v)
@@ -85,6 +164,11 @@ def _strip_accents_low(s: str) -> str:
     return s.lower().strip()
 
 def _norm_tipo(t: str) -> str:
+    """
+    'entrada'  (compra, estorno, fracionamento +)
+    'saida'    (venda, baixa, fracionamento -)
+    'ajuste'   (ajuste; contagem/inventário)
+    """
     raw = str(t or "")
     low = _strip_accents_low(raw)
     if "fracion" in low:
@@ -110,13 +194,27 @@ def _prod_key_from(prod_id, prod_nome):
     if pid: return pid
     return f"nm:{_strip_accents_low(_nz(prod_nome))}"
 
-def _fmt_brl(v: float) -> str:
-    try: v = float(v)
-    except: v = 0.0
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def _fmt_money_br(v: float | int) -> str:
+    try:
+        f = float(v)
+    except:
+        f = 0.0
+    s = f"{abs(f):,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return ("-R$ " if f < 0 else "R$ ") + s
+
+def _fmt_num(v) -> str:
+    try:
+        f = float(v)
+        if abs(f - round(f)) < 1e-9:
+            return f"{int(round(f))}"
+        # até 2 casas para estoques quebrados
+        return f"{f:.2f}".rstrip("0").rstrip(".")
+    except:
+        return str(v)
 
 # =========================
-# Abas/nome das planilhas
+# Abas
 # =========================
 ABA_PRODUTOS = "Produtos"
 ABA_MOV      = "MovimentosEstoque"   # fonte única de quantidades
@@ -143,27 +241,31 @@ except Exception:
 # =========================
 # Colunas importantes
 # =========================
-col_id   = _first_col(df_prod, ["ID","Id","Codigo","Código","SKU"])
-col_nome = _first_col(df_prod, ["Nome","Produto","Descrição","Descricao"])
-col_cat  = _first_col(df_prod, ["Categoria"])
-col_forn = _first_col(df_prod, ["Fornecedor"])
-col_estq_min = _first_col(df_prod, ["EstoqueMin","Estoque Mínimo","EstqMin"])
-col_preco = _first_col(df_prod, ["PreçoVenda","PrecoVenda","Preço","Preco"])
-col_foto = _first_col(df_prod, ["Foto","FotoURL","Imagem","Image","Link","UrlFoto","URL_Foto"])
+col_id        = _first_col(df_prod, ["ID","Id","Codigo","Código","SKU"])
+col_nome      = _first_col(df_prod, ["Nome","Produto","Descrição","Descricao"])
+col_cat       = _first_col(df_prod, ["Categoria"])
+col_forn      = _first_col(df_prod, ["Fornecedor"])
+col_estq_min  = _first_col(df_prod, ["EstoqueMin","Estoque Mínimo","EstqMin","Estoque Mínimo (un)"])
+col_preco     = _first_col(df_prod, ["PreçoVenda","PrecoVenda","Preço","Preco","Preço Venda"])
+col_img       = _first_col(df_prod, ["Imagem","Foto","URLImagem","LinkImagem","ImagemURL","FotoURL"])  # 👈 imagem
 
 if not col_nome:
     st.error("Aba **Produtos** precisa ter uma coluna de nome (ex.: Nome/Produto)."); st.stop()
 
 # =========================
-# Base Produtos + chaves
+# Base Produtos
 # =========================
 base = df_prod.copy()
 base["__key"] = base.apply(lambda r: _prod_key_from(r.get(col_id,""), r.get(col_nome,"")), axis=1)
-base["Produto"] = base[col_nome]
-base["Foto"] = base[col_foto].astype(str) if col_foto and col_foto in base.columns else ""
+base["IDProduto"] = base[col_id] if col_id else ""
+base["Produto"]   = base[col_nome]
+if col_img and col_img in base.columns:
+    base["ImagemURL"] = base[col_img].astype(str).fillna("")
+else:
+    base["ImagemURL"] = ""
 
 # =========================
-# Movimentos → Entradas/Saídas/Ajustes
+# Movimentos → Entradas/Saídas/Ajustes (fonte única)
 # =========================
 for c in ["Tipo","Qtd","IDProduto","Produto"]:
     if c not in df_mov.columns: df_mov[c] = ""
@@ -172,10 +274,12 @@ if not df_mov.empty:
     df_mov["Tipo_norm"] = df_mov["Tipo"].apply(_norm_tipo)
     df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)
     df_mov["__key"]     = df_mov.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
+
     def _sum_mov(tipo):
         m = df_mov[df_mov["Tipo_norm"] == tipo]
         if m.empty: return {}
         return m.groupby("__key")["Qtd_num"].sum().to_dict()
+
     entradas_mov = _sum_mov("entrada")
     saidas_mov   = _sum_mov("saida")
     ajustes_mov  = _sum_mov("ajuste")
@@ -183,23 +287,25 @@ else:
     entradas_mov, saidas_mov, ajustes_mov = {}, {}, {}
 
 # =========================
-# Compras → custo atual
+# Compras → custo atual (última compra)
 # =========================
 col_comp_id = _first_col(df_comp, ["IDProduto","ProdutoID","ID"])
 col_comp_cu = _first_col(df_comp, ["Custo Unitário","CustoUnitário","Custo Unit","Custo"])
 if not df_comp.empty and col_comp_id and col_comp_cu:
     df_comp["__key"] = df_comp.apply(lambda r: _prod_key_from(r.get(col_comp_id,""), r.get("Produto","")), axis=1)
     df_comp["Custo_num"] = df_comp[col_comp_cu].map(_to_num)
+    # última compra por __key (mantendo ordem original da planilha)
     last_cost = df_comp.groupby("__key", as_index=False).tail(1)
     custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 else:
     custo_atual_map = {}
 
 # =========================
-# Consolidação (sem mostrar ID)
+# Consolidação
 # =========================
-df = base[["__key","Produto","Foto"]].copy()
+df = base[["__key","IDProduto","Produto","ImagemURL"]].copy()
 def _get(m, k): return float(m.get(k, 0.0))
+
 df["Entradas"] = df["__key"].apply(lambda k: _get(entradas_mov, k))
 df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov,   k))
 df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov,  k))
@@ -207,44 +313,43 @@ df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
 df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
 df["ValorTotal"]   = (df["EstoqueAtual"] * df["CustoAtual"]).round(2)
 
-# acopla categoria/fornecedor/estoque mínimo/preço (se existirem)
-if col_cat:      df[col_cat] = base[col_cat]
-if col_forn:     df[col_forn] = base[col_forn]
-if col_estq_min: df[col_estq_min] = base[col_estq_min]
-if col_preco:    df[col_preco] = base[col_preco]
+# Anexa campos de produto (cat/forn/preço/estoque mínimo)
+extra_cols = [c for c in [col_id, col_nome, col_cat, col_forn, col_preco, col_estq_min] if c]
+df = df.merge(df_prod[extra_cols], left_on="IDProduto",
+              right_on=col_id if col_id else col_nome, how="left")
 
 # =========================
 # Filtros
 # =========================
-top, mid = st.columns([2.5, 1.5])
-with top:
-    termo = st.text_input("🔎 Buscar", placeholder="nome, fornecedor, categoria...").strip()
-with mid:
-    only_low = st.checkbox("⚠️ Somente baixo estoque", value=False,
-                           help="Itens com EstoqueAtual ≤ EstoqueMin (se existir a coluna).")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    if col_cat and col_cat in df.columns:
-        cats = ["(todas)"] + sorted(pd.Series(df[col_cat].dropna().astype(str).unique()).tolist())
-        cat = st.selectbox("Categoria", cats, index=0)
-    else:
-        cat = "(todas)"
-with c2:
-    if col_forn and col_forn in df.columns:
-        forns = ["(todos)"] + sorted(pd.Series(df[col_forn].dropna().astype(str).unique()).tolist())
-        forn = st.selectbox("Fornecedor", forns, index=0)
-    else:
-        forn = "(todos)"
-with c3:
-    n_cols = st.slider("Colunas (cards)", 2, 5, 3)
-img_h = st.slider("Altura da imagem (px)", 140, 360, 220, 10)
+with st.container():
+    col_filtros = st.columns([2.2, 1.4, 1.3, 1.2, 1.1])
+    with col_filtros[0]:
+        termo = st.text_input("🔎 Buscar", placeholder="ID, nome, fornecedor, categoria...").strip()
+    with col_filtros[1]:
+        if col_cat and col_cat in df.columns:
+            cats = ["(todas)"] + sorted(pd.Series(df[col_cat].dropna().astype(str).unique()).tolist())
+            cat = st.selectbox("Categoria", cats)
+        else:
+            cat = "(todas)"
+    with col_filtros[2]:
+        if col_forn and col_forn in df.columns:
+            forns = ["(todos)"] + sorted(pd.Series(df[col_forn].dropna().astype(str).unique()).tolist())
+            forn = st.selectbox("Fornecedor", forns)
+        else:
+            forn = "(todos)"
+    with col_filtros[3]:
+        only_low = st.checkbox("⚠️ Baixo estoque", value=False,
+                               help="Itens com EstoqueAtual ≤ Estoque Mínimo (se existir).")
+    with col_filtros[4]:
+        view_cards = st.toggle("🖼️ Cards", value=True, help="Alterna entre cards e tabela")
 
 mask = pd.Series(True, index=df.index)
 if termo:
     t = termo.lower()
     mask &= df.apply(
-        lambda r: t in " ".join([str(x).lower() for x in [r.get("Produto",""), r.get(col_cat,""), r.get(col_forn,"")]]),
+        lambda r: t in " ".join([str(x).lower() for x in [
+            r.get("IDProduto",""), r.get("Produto",""), r.get(col_cat,""), r.get(col_forn,"")
+        ]]),
         axis=1
     )
 if col_cat and cat != "(todas)" and col_cat in df.columns:
@@ -252,119 +357,132 @@ if col_cat and cat != "(todas)" and col_cat in df.columns:
 if col_forn and forn != "(todos)" and col_forn in df.columns:
     mask &= (df[col_forn].astype(str) == forn)
 
+if only_low and col_estq_min and col_estq_min in df.columns:
+    estq_min = df[col_estq_min].map(_to_num).fillna(0)
+    mask &= (df["EstoqueAtual"] <= estq_min)
+
 dfv = df[mask].copy()
-if only_low and col_estq_min and col_estq_min in dfv.columns:
-    estq_min = dfv[col_estq_min].map(_to_num).fillna(0)
-    dfv = dfv[dfv["EstoqueAtual"] <= estq_min]
-
-dfv = dfv.sort_values("Produto").reset_index(drop=True)
 
 # =========================
-# CSS (sem f-string para não quebrar com chaves)
+# Exibição — Cards (com foto)
 # =========================
-css = """
-<style>
-:root {
-  --card-bg: rgba(255,255,255,0.03);
-  --card-bd: rgba(255,255,255,0.10);
-  --chip-bg: rgba(255,255,255,0.06);
-}
-.p-card {
-  border-radius: 16px; padding: 12px;
-  background: var(--card-bg); border: 1px solid var(--card-bd);
-  transition: border-color .15s ease, transform .15s ease;
-}
-.p-card:hover { border-color: rgba(255,255,255,.25); transform: translateY(-1px); }
-.p-imgwrap {
-  background:#0f0f0f; border-radius: 12px; overflow:hidden;
-  display:flex; align-items:center; justify-content:center;
-  HEIGHT_PLACEHOLDERpx;
-  margin-bottom: 10px;
-}
-.p-imgwrap img { width:100%; height:100%; object-fit:contain; }
-.p-title { margin: 2px 0 6px 0; font-weight: 600; }
-.p-chips { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px; }
-.p-chip {
-  display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px;
-  background: var(--chip-bg); border:1px solid var(--card-bd);
-}
-.p-chip.warn { background:#2a130f; color:#ffceb8; border-color:#5b2a1e; }
-.p-stats { display:flex; gap:8px; flex-wrap:wrap; }
-.p-stat  {
-  flex:1; min-width: 45%; background: rgba(255,255,255,.04);
-  border:1px solid var(--card-bd); border-radius:10px;
-  padding:6px 8px; font-size:13px;
-}
-.p-muted { opacity:.8; font-size:.9em; }
-</style>
-"""
-css = css.replace("HEIGHT_PLACEHOLDER", f"height:{int(img_h)}")
-st.markdown(css, unsafe_allow_html=True)
+PLACEHOLDER = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"  # fallback
+# ^ você pode trocar por uma imagem genérica da sua loja
+
+if view_cards:
+    total_itens = len(dfv)
+    st.caption(f"{total_itens} item(ns) encontrado(s).")
+
+    # Ordenação padrão por nome
+    try:
+        dfv = dfv.sort_values("Produto", na_position="last")
+    except:
+        pass
+
+    # Monta HTML dos cards (mais performático para muitas imagens)
+    cards_html_parts = ['<div class="card-grid">']
+    for _, r in dfv.iterrows():
+        nome   = _nz(r.get("Produto",""))
+        pid    = _nz(r.get("IDProduto",""))
+        cat_   = _nz(r.get(col_cat,"")) if col_cat else ""
+        forn_  = _nz(r.get(col_forn,"")) if col_forn else ""
+        preco  = r.get(col_preco, "")
+        preco_ = _fmt_money_br(_to_num(preco)) if str(preco) != "" else ""
+        img    = _nz(r.get("ImagemURL","")) or PLACEHOLDER
+
+        ent    = _fmt_num(r.get("Entradas",0))
+        sai    = _fmt_num(r.get("Saidas",0))
+        aj     = _fmt_num(r.get("Ajustes",0))
+        estq   = _to_num(r.get("EstoqueAtual",0))
+        estq_s = _fmt_num(estq)
+        custo  = _fmt_money_br(r.get("CustoAtual",0))
+        vtot   = _fmt_money_br(r.get("ValorTotal",0))
+
+        # badge baixo estoque
+        badge_low = ""
+        if col_estq_min and col_estq_min in dfv.columns:
+            try:
+                estq_min = _to_num(r.get(col_estq_min, 0))
+                if estq <= estq_min:
+                    badge_low = '<span class="badge warn">⚠️ Baixo estoque</span>'
+            except:
+                pass
+
+        # metadados categoria/fornecedor
+        subs = []
+        if cat_: subs.append(f"🏷️ {cat_}")
+        if forn_: subs.append(f"🚚 {forn_}")
+        subs_html = " • ".join(subs) if subs else ""
+
+        # KPIs de movimento
+        kpis = f'''
+          <div class="kpis">
+            <div class="kpi">⬆️ Entradas: <b>{ent}</b></div>
+            <div class="kpi">⬇️ Saídas: <b>{sai}</b></div>
+            <div class="kpi">♻️ Ajustes: <b>{aj}</b></div>
+          </div>
+        '''
+
+        price_row = ""
+        if preco_ or custo or vtot:
+            price_row = f'''
+            <div class="price-row">
+              <div>
+                <div class="price">{preco_ if preco_ else ""}</div>
+                <div class="meta">{custo} custo • {vtot} total</div>
+              </div>
+              <div class="badge {'ok' if _to_num(estq)>0 else 'err'}">📦 Estoque: <b>{estq_s}</b></div>
+            </div>
+            '''
+
+        cards_html_parts.append(f"""
+        <div class="card">
+          <img class="card-img" src="{img}" alt="{nome}">
+          <div class="card-body">
+            <div class="card-title">{nome}</div>
+            <div class="card-sub">
+              {'<span class="badge info">#'+pid+'</span>' if pid else ''}
+              {badge_low}
+            </div>
+            <div class="meta">{subs_html}</div>
+            <div class="hr"></div>
+            {kpis}
+            {price_row}
+          </div>
+        </div>
+        """)
+    cards_html_parts.append("</div>")
+    st.markdown("\n".join(cards_html_parts), unsafe_allow_html=True)
+
+else:
+    # =========================
+    # Exibição — Tabela (original)
+    # =========================
+    cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
+    if col_cat and col_cat in dfv.columns: cols_show.insert(2, col_cat)
+    if col_forn and col_forn in dfv.columns: cols_show.insert(3, col_forn)
+    if col_estq_min and col_estq_min in dfv.columns:
+        if col_estq_min not in cols_show: cols_show.append(col_estq_min)
+    if col_preco and col_preco in dfv.columns and col_preco not in cols_show:
+        cols_show.insert(2, col_preco)
+    if "ImagemURL" in dfv.columns and "ImagemURL" not in cols_show:
+        cols_show.append("ImagemURL")
+
+    df_show = dfv.loc[:, [c for c in cols_show if c in dfv.columns]].copy()
+
+    # formatações rápidas
+    if "CustoAtual" in df_show: df_show["CustoAtual"] = df_show["CustoAtual"].map(_fmt_money_br)
+    if "ValorTotal" in df_show: df_show["ValorTotal"] = df_show["ValorTotal"].map(_fmt_money_br)
+    if col_preco and col_preco in df_show: df_show[col_preco] = df_show[col_preco].map(lambda x: _fmt_money_br(_to_num(x)))
+
+    st.dataframe(df_show.sort_values("Produto"), use_container_width=True, hide_index=True)
 
 # =========================
-# Exibição
+# Rodapé / Ajuda
 # =========================
-tab_cards, tab_table = st.tabs(["🖼️ Cards", "📋 Tabela"])
-
-with tab_cards:
-    if dfv.empty:
-        st.info("Nada para mostrar com os filtros atuais.")
-    else:
-        cols = st.columns(n_cols, gap="small")
-        for i, r in dfv.iterrows():
-            foto = (str(r.get("Foto","")).strip()
-                    or "https://via.placeholder.com/600x400?text=Sem+foto")
-            prod = str(r.get("Produto","")).strip() or "(sem nome)"
-            catv = str(r.get(col_cat,"")).strip() if col_cat in dfv.columns else ""
-            fornv= str(r.get(col_forn,"")).strip() if col_forn in dfv.columns else ""
-            estq = float(r.get("EstoqueAtual", 0.0) or 0.0)
-            custo= float(r.get("CustoAtual",   0.0) or 0.0)
-            valtot= float(r.get("ValorTotal",  0.0) or 0.0)
-            estqmin = _to_num(r.get(col_estq_min, 0)) if col_estq_min in dfv.columns else None
-            preco = _to_num(r.get(col_preco, 0)) if col_preco in dfv.columns else None
-            warn = (estqmin is not None) and (estq <= float(estqmin))
-            chip_low = '<span class="p-chip warn">Baixo estoque</span>' if warn else ""
-            preco_html = (f'<div class="p-stat"><b>Preço</b><br>{_fmt_brl(preco)}</div>'
-                          if preco is not None and preco > 0 else "")
-
-            card_html = (
-                '<div class="p-card">'
-                f'  <div class="p-imgwrap"><img src="{foto}"></div>'
-                f'  <div class="p-title">{prod}</div>'
-                '  <div class="p-chips">'
-                f'    {("<span class=\\"p-chip\\">"+catv+"</span>") if catv else ""}'
-                f'    {("<span class=\\"p-chip\\">"+fornv+"</span>") if fornv else ""}'
-                f'    {chip_low}'
-                '  </div>'
-                '  <div class="p-stats">'
-                f'    <div class="p-stat"><b>Estoque</b><br>{estq:g}</div>'
-                f'    <div class="p-stat"><b>Custo</b><br>{_fmt_brl(custo)}</div>'
-                f'    <div class="p-stat"><b>Total</b><br>{_fmt_brl(valtot)}</div>'
-                f'    {preco_html}'
-                '  </div>'
-                f'  {("<div class=\\"p-muted\\" style=\\"margin-top:6px\\">Mín.: "+str(estqmin)+"</div>") if (estqmin is not None and estqmin!=0) else ""}'
-                '</div>'
-            )
-            with cols[i % n_cols]:
-                st.markdown(card_html, unsafe_allow_html=True)
-
-with tab_table:
-    df_show = dfv.copy()
-    cols_show = ["Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
-    if col_cat and col_cat in df_show.columns: cols_show.insert(1, col_cat)
-    if col_forn and col_forn in df_show.columns: cols_show.insert(2, col_forn)
-    if col_estq_min and col_estq_min in df_show.columns: cols_show.append(col_estq_min)
-    if col_preco and col_preco in df_show.columns: cols_show.append(col_preco)
-    if "Foto" in df_show.columns: cols_show.append("Foto")
-
-    df_show = df_show.loc[:, [c for c in cols_show if c in df_show.columns]].copy()
-    for c in ["CustoAtual","ValorTotal"]:
-        if c in df_show.columns:
-            df_show[c] = df_show[c].map(_fmt_brl)
-    st.dataframe(df_show, use_container_width=True, hide_index=True)
-
 st.caption("""
-• **EstoqueAtual** = Entradas − Saídas ± Ajustes (origem: **MovimentosEstoque**).
+• **EstoqueAtual** = Entradas − Saídas ± Ajustes (a partir da aba **MovimentosEstoque**, incluindo Fracionamento).
 • **CustoAtual** = último custo de compra (aba **Compras**).
-• A **foto** é lida da coluna Foto/Imagem/Link (URL). Ajuste a altura pelo controle acima.
+• Para fotos, adicione uma coluna **Imagem** (ou **Foto**, **URLImagem**, **LinkImagem**) na aba **Produtos**.
+• Use **Compras** / **Fracionar** / **Ajustes** para movimentar estoque.
 """)
