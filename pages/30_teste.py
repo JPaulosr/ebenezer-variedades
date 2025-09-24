@@ -71,28 +71,53 @@ def _client():
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
     return gspread.authorize(creds)
 
+# ---- PATCH: abrir planilha com mensagens claras (URL/Permissão) ----
 @st.cache_resource
 def _sheet():
     gc = _client()
     url_or_id = st.secrets.get("PLANILHA_URL")
     if not url_or_id:
-        st.error("🛑 Segredo PLANILHA_URL ausente.")
+        st.error("🛑 Segredo PLANILHA_URL ausente em st.secrets.")
         st.stop()
-    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
+    try:
+        sh = gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
+        return sh
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error("🛑 Planilha não encontrada. Verifique o ID/URL em PLANILHA_URL.")
+        st.stop()
+    except gspread.exceptions.APIError as e:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
+        st.error(f"🛑 Sem acesso à planilha (provável 403). Compartilhe a planilha com: **{client_email}** (Editor).")
+        st.caption(f"Detalhe técnico: {e}")
+        st.stop()
 
 @st.cache_resource
 def _sheet_titles() -> set[str]:
     try:
         return {ws.title for ws in _sheet().worksheets()}
-    except Exception:
+    except gspread.exceptions.APIError as e:
+        st.error("Falha ao listar abas da planilha. Verifique permissões.")
+        st.caption(f"Detalhe técnico: {e}")
         return set()
 
+# ---- PATCH: carregamento de aba à prova de erro ----
 @st.cache_data(ttl=1, show_spinner=False)
 def _load_df(aba: str) -> pd.DataFrame:
-    ws = _sheet().worksheet(aba)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df.fillna("")
+    """Carrega uma aba e devolve DataFrame; se não existir, devolve vazio sem quebrar o app."""
+    try:
+        ws = _sheet().worksheet(aba)
+        df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+        df.columns = [c.strip() for c in df.columns]
+        return df.fillna("")
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame().fillna("")
+    except gspread.exceptions.APIError as e:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
+        st.error(f"🛑 Erro de acesso ao Sheets. Compartilhe a planilha com **{client_email}** e confira PLANILHA_URL.")
+        st.caption(f"Aba pedida: {aba} • Detalhe técnico: {e}")
+        st.stop()
 
 def _ensure_ws(name: str, headers: list[str]):
     sh = _sheet()
@@ -211,7 +236,7 @@ if not compras_df.empty:
     compras_df["Custo_num"]=compras_df["Custo Unitário"].apply(_to_num)
     last_cost=compras_df.groupby("__key",as_index=False).tail(1)
     custo_atual_map=dict(zip(last_cost["__key"], last_cost["Custo_num"]))
-else: 
+else:
     custo_atual_map={}
 
 # movimentos
@@ -225,7 +250,7 @@ if not mov_df.empty:
         m=mov_df[mov_df["Tipo_norm"]==tipo]
         return {} if m.empty else m.groupby("__key")["Qtd_num"].sum().to_dict()
     entradas_mov=_sum_mov("entrada"); saidas_mov=_sum_mov("saida"); ajustes_mov=_sum_mov("ajuste")
-else: 
+else:
     entradas_mov,saidas_mov,ajustes_mov={},{},{}
 
 # =========================
@@ -255,6 +280,22 @@ with right:
 
 st.markdown("<div class='badge'>Consolidação por movimentos (Entradas - Saídas + Ajustes)</div>", unsafe_allow_html=True)
 st.markdown("<hr/>", unsafe_allow_html=True)
+
+# ------ Painel de diagnóstico (ajuda a resolver 403/URL) ------
+with st.expander("🧩 Diagnóstico de Conexão com Google Sheets"):
+    try:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email", ""))
+        st.write("**Service Account:**", client_email)
+        st.write("**PLANILHA_URL:**", st.secrets.get("PLANILHA_URL"))
+        try:
+            sh = _sheet()
+            st.write("**Título da planilha:**", getattr(sh, "title", "(desconhecido)"))
+            st.write("**Abas disponíveis:**", sorted(list(_sheet_titles())) or "(nenhuma)")
+        except Exception as e:
+            st.warning(f"Falha ao abrir planilha: {e}")
+    except Exception as e:
+        st.error(f"Não foi possível ler os segredos. Erro: {e}")
 
 # =========================
 # Busca / Filtros
