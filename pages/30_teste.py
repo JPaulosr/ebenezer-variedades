@@ -3,13 +3,13 @@
 
 import json, unicodedata as _ud, re
 from datetime import date, datetime
+from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from pathlib import Path
 
 # =========================
 # UI BASE / TEMA
@@ -23,7 +23,7 @@ st.markdown("""
   --bg2: rgba(255,255,255,.06);
   --borda: rgba(255,255,255,.12);
   --muted: rgba(255,255,255,.65);
-  --ok: #22c55e; --warn:#f59e0b; --err:#ef4444;
+  --ok: #22c55e; --warn:#f59e0b; --err:#ef4444; --info:#3b82f6;
 }
 .block-container { padding-top: 1.2rem; }
 .kpi{border:1px solid var(--borda); background:var(--bg); padding:1rem 1.1rem; border-radius:16px;}
@@ -34,6 +34,8 @@ st.markdown("""
 .card h3{margin:0 0 .6rem 0}
 .badge{display:inline-block; padding:.15rem .5rem; border-radius:999px; border:1px solid var(--borda); background:var(--bg2); font-size:.78rem; color:var(--muted)}
 .small{color:var(--muted); font-size:.86rem}
+.stDataFrame{border-radius:14px; overflow:hidden; border:1px solid var(--borda);}
+hr{border:0; border-top:1px solid var(--borda); margin:1rem 0}
 </style>
 """, unsafe_allow_html=True)
 
@@ -121,6 +123,7 @@ def _append_row(ws, row: dict):
 # Utilidades
 # =========================
 def _to_num(x) -> float:
+    """Converte para float preservando negativos; aceita vírgula, R$, (6) etc."""
     if x is None: return 0.0
     s = str(x).strip()
     if s == "" or s.lower() in ("nan","none"): return 0.0
@@ -169,8 +172,8 @@ def _prod_key_from(prod_id, prod_nome):
 # Abas & Headers
 # =========================
 ABA_PRODUTOS="Produtos"
-ABA_COMPRAS="Compras"
-ABA_MOV="MovimentosEstoque"
+ABA_COMPRAS="Compras"             # só para custo
+ABA_MOV="MovimentosEstoque"       # FONTE ÚNICA de quantidades
 ABA_VENDAS="Vendas"
 
 COMPRAS_HEADERS=["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
@@ -187,8 +190,10 @@ mov_df=_load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEAD
 # =========================
 # Normalizações
 # =========================
-COLP={"id":next((c for c in ["ID","Id","id","Codigo","Código","SKU"] if c in prod_df.columns),None),
-      "nome":next((c for c in ["Nome","Produto","Descrição","Descricao"] if c in prod_df.columns),None)}
+COLP={
+    "id":   next((c for c in ["ID","Id","id","Codigo","Código","SKU"] if c in prod_df.columns),None),
+    "nome": next((c for c in ["Nome","Produto","Descrição","Descricao"] if c in prod_df.columns),None),
+}
 if COLP["nome"] is None:
     st.error("Aba **Produtos** precisa ter coluna de nome.")
     st.stop()
@@ -198,6 +203,7 @@ base["__key"]=base.apply(lambda r:_prod_key_from(r.get(COLP["id"],""), r.get(COL
 base["Produto"]=base[COLP["nome"]]
 base["IDProduto"]=base[COLP["id"]] if COLP["id"] else ""
 
+# custo atual (última compra por chave)
 for c in COMPRAS_HEADERS:
     if c not in compras_df.columns: compras_df[c]=""
 if not compras_df.empty:
@@ -205,8 +211,10 @@ if not compras_df.empty:
     compras_df["Custo_num"]=compras_df["Custo Unitário"].apply(_to_num)
     last_cost=compras_df.groupby("__key",as_index=False).tail(1)
     custo_atual_map=dict(zip(last_cost["__key"], last_cost["Custo_num"]))
-else: custo_atual_map={}
+else: 
+    custo_atual_map={}
 
+# movimentos
 for c in MOV_HEADERS:
     if c not in mov_df.columns: mov_df[c]=""
 if not mov_df.empty:
@@ -217,7 +225,8 @@ if not mov_df.empty:
         m=mov_df[mov_df["Tipo_norm"]==tipo]
         return {} if m.empty else m.groupby("__key")["Qtd_num"].sum().to_dict()
     entradas_mov=_sum_mov("entrada"); saidas_mov=_sum_mov("saida"); ajustes_mov=_sum_mov("ajuste")
-else: entradas_mov,saidas_mov,ajustes_mov={},{},{}
+else: 
+    entradas_mov,saidas_mov,ajustes_mov={},{},{}
 
 # =========================
 # Consolidação
@@ -244,4 +253,184 @@ with right:
     if Path("pages/01_Produtos.py").exists():
         st.page_link("pages/01_Produtos.py", label="📦 Ir ao Catálogo", icon="📦")
 
-# resto igual (busca, cards, tabelas, forms)...
+st.markdown("<div class='badge'>Consolidação por movimentos (Entradas - Saídas + Ajustes)</div>", unsafe_allow_html=True)
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# =========================
+# Busca / Filtros
+# =========================
+cBusca, cLow, cThr, cExp = st.columns([3,1.1,1.1,1])
+with cBusca:
+    termo = st.text_input("🔎 Buscar", placeholder="Nome ou ID do produto...")
+with cLow:
+    only_low = st.checkbox("Somente baixo estoque", value=False)
+with cThr:
+    low_thr = st.number_input("Limiar (≤)", value=0, step=1)
+with cExp:
+    exportar = st.button("⬇️ Exportar CSV")
+
+mask = pd.Series([True]*len(df))
+if termo.strip():
+    t=_strip_accents_low(termo)
+    by_nome = df["Produto"].astype(str).apply(_strip_accents_low).str.contains(t)
+    by_id   = df["IDProduto"].astype(str).str.contains(termo.strip(), case=False, na=False)
+    mask &= (by_nome | by_id)
+if only_low:
+    mask &= (df["EstoqueAtual"] <= float(low_thr))
+
+df_view = df[mask].copy()
+
+# =========================
+# CARDS (KPIs)
+# =========================
+c1,c2,c3,c4 = st.columns(4)
+with c1:
+    st.markdown(f"<div class='kpi'><h3>Itens cadastrados</h3><div class='big'>{len(df):,}</div><div class='sub'>Total em Produtos</div></div>".replace(",", "."), unsafe_allow_html=True)
+with c2:
+    st.markdown(f"<div class='kpi'><h3>Com estoque &gt; 0</h3><div class='big'>{int((df_view['EstoqueAtual']>0).sum()):,}</div><div class='sub'>Filtrados</div></div>".replace(",", "."), unsafe_allow_html=True)
+with c3:
+    st.markdown(f"<div class='kpi'><h3>Qtd total</h3><div class='big'>{df_view['EstoqueAtual'].sum():.0f}</div><div class='sub'>Entradas - Saídas + Ajustes</div></div>", unsafe_allow_html=True)
+with c4:
+    vtotal=(df_view['EstoqueAtual']*df_view['CustoAtual']).sum()
+    st.markdown(f"<div class='kpi'><h3>Valor total (R$)</h3><div class='big'>R$ {vtotal:,.2f}</div><div class='sub'>Estoque x custo</div></div>".replace(",", "X").replace(".", ",").replace("X","."), unsafe_allow_html=True)
+
+# =========================
+# TABELA
+# =========================
+cols_show=["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
+for c in cols_show:
+    if c not in df_view.columns:
+        df_view[c]=0 if c not in ("IDProduto","Produto") else ""
+
+dfv=df_view[cols_show].copy()
+dfv["Entradas"]=dfv["Entradas"].astype(float).round(2)
+dfv["Saidas"]=dfv["Saidas"].astype(float).round(2)
+dfv["Ajustes"]=dfv["Ajustes"].astype(float).round(2)
+dfv["EstoqueAtual"]=dfv["EstoqueAtual"].astype(float).round(2)
+dfv["CustoAtual"]=dfv["CustoAtual"].astype(float).round(2)
+dfv["ValorTotal"]=(df_view["EstoqueAtual"].astype(float)*df_view["CustoAtual"].astype(float)).round(2)
+
+st.markdown("<div class='card'><h3>📊 Tabela de Estoque</h3>", unsafe_allow_html=True)
+st.dataframe(dfv.sort_values("Produto"), use_container_width=True, hide_index=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if exportar:
+    csv = dfv.sort_values("Produto").to_csv(index=False, sep=";").encode("utf-8-sig")
+    st.download_button("Baixar CSV (utf-8)", data=csv, file_name="estoque.csv", mime="text/csv")
+
+# =========================
+# Últimos movimentos (debug)
+# =========================
+with st.expander("🧾 Últimos movimentos (debug)"):
+    if mov_df.empty:
+        st.caption("Sem movimentos ainda.")
+    else:
+        dbg_cols=[c for c in ["Data","Produto","IDProduto","Tipo","Qtd","Tipo_norm"] if c in mov_df.columns]
+        st.dataframe(mov_df[dbg_cols].tail(30), use_container_width=True, hide_index=True)
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# =========================
+# FORM: Saída
+# =========================
+st.markdown("<div class='card'><h3>➖ Registrar Saída / Baixa de Estoque</h3>", unsafe_allow_html=True)
+with st.form("form_saida"):
+    usar_lista_s = st.checkbox("Selecionar produto da lista", value=True, key="saida_lista")
+    df_select = df_view if usar_lista_s and not df_view.empty else df
+    if usar_lista_s:
+        if df_select.empty:
+            st.warning("Sem produtos para saída.")
+            st.form_submit_button("Registrar saída", disabled=True)
+            st.stop()
+        def _fmt_saida(i):
+            r=df_select.iloc[i]
+            return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
+        idx = st.selectbox("Produto", options=range(len(df_select)), format_func=_fmt_saida)
+        row = df_select.iloc[idx]
+        prod_nome_s=_nz(row["Produto"]); prod_id_s=_nz(row["IDProduto"])
+    else:
+        prod_nome_s = st.text_input("Produto (nome exato)", key="saida_nome")
+        prod_id_s   = st.text_input("ID (opcional)", key="saida_id")
+    csa,csb=st.columns(2)
+    with csa: data_s = st.date_input("Data da saída", value=date.today(), key="saida_data")
+    with csb: qtd_s  = st.text_input("Qtd", placeholder="Ex.: 2", key="saida_qtd")
+    obs_s = st.text_input("Observações (opcional)", key="saida_obs")
+    salvar_s = st.form_submit_button("Registrar saída", use_container_width=True)
+
+if 'salvar_s' in locals() and salvar_s:
+    if not prod_nome_s.strip() and not prod_id_s.strip():
+        st.error("Selecione ou informe um produto.")
+        st.stop()
+    q=_to_num(qtd_s)
+    if q<=0:
+        st.error("Informe uma quantidade válida (> 0).")
+        st.stop()
+    ws_mov=_ensure_ws(ABA_MOV, MOV_HEADERS)
+    _append_row(ws_mov, {
+        "Data": data_s.strftime("%d/%m/%Y"),
+        "IDProduto": _nz(prod_id_s),
+        "Produto": prod_nome_s,
+        "Tipo": "saida",
+        "Qtd": (str(int(q)) if float(q).is_integer() else str(q)).replace(".", ","),
+        "Obs": _nz(obs_s)
+    })
+    st.success("Saída registrada com sucesso! ✅")
+    st.toast("Saída lançada", icon="➖")
+    st.cache_data.clear()
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# FORM: Ajuste
+# =========================
+st.markdown("<div class='card'><h3>🛠️ Registrar Ajuste de Estoque</h3>", unsafe_allow_html=True)
+with st.form("form_ajuste"):
+    usar_lista_a = st.checkbox("Selecionar produto da lista", value=True, key="ajuste_lista")
+    df_select = df_view if usar_lista_a and not df_view.empty else df
+    if usar_lista_a:
+        if df_select.empty:
+            st.warning("Sem produtos para ajuste.")
+            st.form_submit_button("Registrar ajuste", disabled=True)
+            st.stop()
+        def _fmt_aj(i):
+            r=df_select.iloc[i]
+            return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
+        idxa = st.selectbox("Produto", options=range(len(df_select)), format_func=_fmt_aj, key="ajuste_idx")
+        rowa = df_select.iloc[idxa]
+        prod_nome_a=_nz(rowa["Produto"]); prod_id_a=_nz(rowa["IDProduto"])
+    else:
+        prod_nome_a = st.text_input("Produto (nome exato)", key="ajuste_nome")
+        prod_id_a   = st.text_input("ID (opcional)", key="ajuste_id")
+    ca1,ca2=st.columns(2)
+    with ca1: data_a = st.date_input("Data do ajuste", value=date.today(), key="ajuste_data")
+    with ca2: qtd_a  = st.text_input("Qtd (use negativo para baixar, positivo para repor)", placeholder="Ex.: -1 ou 5", key="ajuste_qtd")
+    obs_a = st.text_input("Motivo/Observações", key="ajuste_obs")
+    salvar_a = st.form_submit_button("Registrar ajuste", use_container_width=True)
+
+if 'salvar_a' in locals() and salvar_a:
+    if not prod_nome_a.strip() and not prod_id_a.strip():
+        st.error("Selecione ou informe um produto.")
+        st.stop()
+    qa=_to_num(qtd_a)
+    if qa==0:
+        st.error("Informe uma quantidade diferente de zero.")
+        st.stop()
+    ws_mov=_ensure_ws(ABA_MOV, MOV_HEADERS)
+    _append_row(ws_mov, {
+        "Data": data_a.strftime("%d/%m/%Y"),
+        "IDProduto": _nz(prod_id_a),
+        "Produto": prod_nome_a,
+        "Tipo": "ajuste",
+        "Qtd": (str(int(qa)) if float(qa).is_integer() else str(qa)).replace(".", ","),
+        "Obs": _nz(obs_a)
+    })
+    st.success("Ajuste registrado com sucesso! ✅")
+    st.toast("Ajuste lançado", icon="🛠️")
+    st.cache_data.clear()
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# Rodapé
+# =========================
+st.markdown("<div class='small'>Dica: ajuste o <b>Limiar (≤)</b> para destacar baixo estoque e use a busca por nome/ID.</div>", unsafe_allow_html=True)
