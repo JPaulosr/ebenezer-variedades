@@ -1,356 +1,294 @@
+# pages/Contagem_Estoque.py — Definir nível de estoque (com delta automático)
 # -*- coding: utf-8 -*-
-# pages/03_contagem_inicial.py — Contagem de estoque (definir nível) — MOV + AJ
-import json, unicodedata, re, math, html
-from datetime import datetime, timedelta, date
 
+import json, re, unicodedata as _ud
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-import requests  # Telegram
 
-st.set_page_config(page_title="Contagem de estoque", page_icon="📋", layout="wide")
+st.set_page_config(page_title="Contagem de estoque (definir nível)", page_icon="📋", layout="wide")
 st.title("📋 Contagem de estoque (definir nível)")
 
-# =============================================================================
-# Credenciais / Sheets (mesmo padrão do 02_cadastrar_produto.py)
-# =============================================================================
+# ======================================================
+# Helpers de acesso (mesmo padrão do 01_produtos.py)
+# ======================================================
 def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str):
-        return key
+    if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
+    key = "".join(ch for ch in key if _ud.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
     return key
 
 def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
     if svc is None:
-        st.error("🛑 GCP_SERVICE_ACCOUNT ausente em st.secrets."); st.stop()
-    if isinstance(svc, str):
-        svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(svc["private_key"])
+        st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+    if isinstance(svc, str): svc = json.loads(svc)
+    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
     return svc
 
 @st.cache_resource
-def _client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    return gspread.authorize(creds)
-
-@st.cache_resource
 def _sheet():
-    gc = _client()
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
+    gc = gspread.authorize(creds)
     url_or_id = st.secrets.get("PLANILHA_URL")
     if not url_or_id:
-        st.error("🛑 PLANILHA_URL ausente em st.secrets."); st.stop()
+        st.error("🛑 PLANILHA_URL ausente."); st.stop()
     return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data(ttl=10)
-def _load_df(aba: str) -> pd.DataFrame:
-    ws = _sheet().worksheet(aba)
+@st.cache_data(ttl=10, show_spinner=False)
+def carregar_aba(nome_aba: str) -> pd.DataFrame:
+    ws = _sheet().worksheet(nome_aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
-    return df
+    return df.fillna("")
 
-def _safe_load(aba: str) -> pd.DataFrame:
-    try:
-        return _load_df(aba)
-    except Exception:
-        return pd.DataFrame()
-
-def _ensure_ws(name: str, headers: list[str]):
-    sh = _sheet()
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            df_head = pd.DataFrame(columns=cols)
-            ws.clear()
-            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-    except Exception:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-
-def _append_row(ws, row: dict):
-    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-    for col in cur.columns:
-        row.setdefault(col, "")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
-def _msg_ok(msg):
-    st.success(msg)
-    try: st.cache_data.clear()
-    except: pass
-
-# =============================================================================
-# Telegram — mesmo padrão do seu app
-# =============================================================================
-def _tg_enabled() -> bool:
-    try:
-        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
-    except Exception:
-        return False
-
-def _tg_conf():
-    token = st.secrets.get("TELEGRAM_TOKEN", "")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
-    return token, chat_id
-
-def _tg_send(msg: str):
-    if not _tg_enabled(): return
-    token, chat_id = _tg_conf()
-    if not token or not chat_id: return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        requests.post(url, json=payload, timeout=8)
-    except Exception:
-        pass
-
-# =============================================================================
-# Mapeamentos flexíveis (iguais ao base)
-# =============================================================================
-def _pick_col(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    low = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in low: return low[c.lower()]
+def _first_col(df: pd.DataFrame, cands: list[str]) -> str | None:
+    for c in cands:
+        if c in df.columns: return c
+    lower = {c.lower(): c for c in df.columns}
+    for c in cands:
+        if c.lower() in lower: return lower[c.lower()]
     return None
 
-def _map_cols_produtos(df):
-    return {
-        "id":        _pick_col(df, ["ID","Id","id","Codigo","Código"]),
-        "nome":      _pick_col(df, ["Nome","Produto","Descrição","Descricao"]),
-        "estoque":   _pick_col(df, ["EstoqueAtual","Estoque","QtdEstoque","Quantidade"]),
-    }
+# ======================================================
+# Helpers de normalização (idênticos ao 01_produtos.py)
+# ======================================================
+def _strip_accents_low(s: str) -> str:
+    s = _ud.normalize("NFKD", str(s or ""))
+    s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
+    return s.lower().strip()
 
-def _map_cols_compras(df):
-    return {
-        "data": _pick_col(df, ["Data","DATA"]),
-        "nome": _pick_col(df, ["Produto","Nome","Descrição","Descricao"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "id":   _pick_col(df, ["IDProduto","ID"]),
-    }
+def _to_num(x) -> float:
+    """Converte string/num para float preservando sinal negativo.
+       Suporta formatos: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
+    if x is None: 
+        return 0.0
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"):
+        return 0.0
 
-def _map_cols_mov(df):
-    return {
-        "data": _pick_col(df, ["Data","DATA"]),
-        "id":   _pick_col(df, ["IDProduto","ID"]),
-        "nome": _pick_col(df, ["Produto","Nome"]),
-        "tipo": _pick_col(df, ["Tipo","Movimento","Mov"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "obs":  _pick_col(df, ["Obs","Observação","Observacoes","Observações"])
-    }
+    # Normaliza variações de menos e parênteses negativos
+    s = s.replace("−", "-")  # unicode minus -> ascii
+    neg_paren = False
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+        neg_paren = True
 
-def _map_cols_vendas(df):
-    return {
-        "data": _pick_col(df, ["Data","DATA"]),
-        "id":   _pick_col(df, ["IDProduto","ID"]),
-        "nome": _pick_col(df, ["Produto","Nome"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"])
-    }
+    # Remove símbolos e espaços; trata separadores BR/US
+    s = s.replace("R$", "").replace(" ", "")
+    # Se tiver vírgula (padrão BR), remove pontos de milhar e troca vírgula por ponto
+    if "," in s:
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    # Mantém apenas dígitos, 1 ponto decimal e um '-' no início
+    # Remove sinais '-' que não estejam na posição inicial
+    s = re.sub(r"(?<!^)-", "", s)
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    # Garante apenas um '-'
+    if s.count("-") > 1:
+        s = "-" + s.replace("-", "")
+    # Conserta múltiplos pontos decimais (mantém o último como decimal)
+    if s.count(".") > 1:
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
 
-# =============================================================================
-# Carregar dados (abas)
-# =============================================================================
-ABA_PROD = "Produtos"
-ABA_COMP = "Compras"
-ABA_MOV  = "MovimentosEstoque"
-ABA_AJ   = "Ajustes"
-ABA_VEND = "Vendas"
-
-try:
-    dfp = _load_df(ABA_PROD)
-except Exception as e:
-    st.error("Erro ao abrir a aba Produtos.")
-    with st.expander("Detalhes técnicos"):
-        st.code(str(e))
-    st.stop()
-
-dfc  = _safe_load(ABA_COMP)
-dfm  = _safe_load(ABA_MOV)
-dfv  = _safe_load(ABA_VEND)
-
-COL  = _map_cols_produtos(dfp)
-CMP  = _map_cols_compras(dfc) if not dfc.empty else {}
-MOV  = _map_cols_mov(dfm) if not dfm.empty else {}
-VEN  = _map_cols_vendas(dfv) if not dfv.empty else {}
-
-MOV_HEADERS = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
-AJ_HEADERS  = ["Data","ID","Qtd","Motivo","Responsável","Obs"]
-
-# =============================================================================
-# Parse numéricos
-# =============================================================================
-def _to_float(x):
-    if x is None: return 0.0
-    s = str(x).strip().replace("R$","").replace(" ", "")
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace(".", "").replace(",", ".")
-    try: return float(s)
-    except: return 0.0
-
-def _fmt_int(v) -> str:
     try:
-        return f"{int(round(float(v))):,}".replace(",", ".")
+        v = float(s)
     except:
-        return str(v)
+        v = 0.0
 
-# =============================================================================
-# Cálculo de estoque atual (Compras + MovimentosEstoque + Vendas-fallback)
-# =============================================================================
-def _stock_balance(prod_id: str|None, nome: str) -> int:
-    entr = 0.0; sai = 0.0
-    # Compras
-    if not dfc.empty and CMP:
-        base = dfc.copy()
-        if prod_id and CMP.get("id"):
-            base = base[ base[CMP["id"]].astype(str) == str(prod_id) ]
-        elif CMP.get("nome"):
-            base = base[ base[CMP["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-        if not base.empty and CMP.get("qtd"):
-            entr += base[CMP["qtd"]].apply(_to_float).sum()
-    # Movimentos
-    if not dfm.empty and MOV:
-        base = dfm.copy()
-        if prod_id and MOV.get("id"):
-            base = base[ base[MOV["id"]].astype(str) == str(prod_id) ]
-        elif MOV.get("nome"):
-            base = base[ base[MOV["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-        if not base.empty and MOV.get("tipo") and MOV.get("qtd"):
-            tipos_ent = {"entrada","compra","ajuste+","entrada manual","in","b entrada"}
-            tipos_sai = {"saida","venda","ajuste-","saída manual","out","b saída","b saida"}
-            ent_m = base[ base[MOV["tipo"]].astype(str).str.lower().isin(tipos_ent) ][MOV["qtd"]].apply(_to_float).sum()
-            sai_m = base[ base[MOV["tipo"]].astype(str).str.lower().isin(tipos_sai) ][MOV["qtd"]].apply(_to_float).sum()
-            entr += (ent_m or 0.0); sai += (sai_m or 0.0)
-    # Vendas fallback (se não houver mov de venda)
-    if not dfv.empty and VEN:
-        base = dfv.copy()
-        if prod_id and VEN.get("id"):
-            base = base[ base[VEN["id"]].astype(str) == str(prod_id) ]
-        elif VEN.get("nome"):
-            base = base[ base[VEN["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-        if not base.empty and VEN.get("qtd"):
-            if dfm.empty or not MOV or MOV.get("tipo") is None:
-                sai += base[VEN["qtd"]].apply(_to_float).sum()
-            else:
-                check = dfm.copy()
-                if prod_id and MOV.get("id"):
-                    check = check[ check[MOV["id"]].astype(str) == str(prod_id) ]
-                elif MOV.get("nome"):
-                    check = check[ check[MOV["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-                has_mov_venda = False
-                if not check.empty and MOV.get("tipo"):
-                    has_mov_venda = check[MOV["tipo"]].astype(str).str.lower().isin({"venda","saida","saída manual","out","b saída","b saida"}).any()
-                if not has_mov_venda:
-                    sai += base[VEN["qtd"]].apply(_to_float).sum()
+    if neg_paren:
+        v = -abs(v)
+    return v
+
+def _norm_tipo(t: str) -> str:
+    """
+    Normaliza tipos de movimento:
+      - 'entrada' (compra, estorno, fracionamento +)
+      - 'saida'   (venda, baixa, fracionamento -)
+      - 'ajuste'  (ajuste, contagem/inventário)
+    """
+    raw = str(t or "")
+    low = _strip_accents_low(raw)
+    if "fracion" in low:
+        if "+" in raw: return "entrada"
+        if "-" in raw: return "saida"
+        return "outro"
+    lowc = re.sub(r"[^a-z]", "", low)
+    if "contagem" in lowc or "inventario" in lowc:  # 👈 contagem é ajuste
+        return "ajuste"
+    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc:
+        return "entrada"
+    if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc:
+        return "saida"
+    if "ajuste"  in lowc:
+        return "ajuste"
+    return "outro"
+
+def _nz(x):
+    if x is None: return ""
     try:
-        return int(round(entr - sai, 0))
-    except:
-        return 0
-
-# =============================================================================
-# UI — Seleção e ajuste
-# =============================================================================
-col_id = COL["id"]; col_nome = COL["nome"]
-if not col_id:
-    st.error("Coluna de ID não encontrada na aba Produtos."); st.stop()
-
-# Lista de produtos
-base_opts = dfp[[col_id] + ([col_nome] if col_nome else [])].astype(str).fillna("")
-def _fmt_opt(r):
-    return f"{r[col_id]} — {r[col_nome]}" if col_nome else f"{r[col_id]}"
-labels = ["(selecione)"] + base_opts.apply(_fmt_opt, axis=1).tolist()
-escolha = st.selectbox("Produto", labels, index=0)
-
-if escolha == "(selecione)":
-    st.info("Selecione um produto para definir o estoque.")
-    st.stop()
-
-pid = escolha.split(" — ")[0].strip()
-try:
-    nome_sel = dfp.loc[dfp[col_id].astype(str) == pid, col_nome].iloc[0] if col_nome else ""
-except:
-    nome_sel = ""
-
-atual = float(_stock_balance(pid, nome_sel))
-st.info(f"Estoque atual (calculado): **{_fmt_int(atual)}**")
-
-with st.form("form_ajuste"):
-    c1, c2 = st.columns(2)
-    with c1:
-        novo_nivel = st.number_input("Definir estoque para", min_value=0, step=1, value=int(atual))
-    with c2:
-        motivo_default = "Contagem inicial" if int(atual) == 0 else "Contagem"
-        motivo = st.text_input("Motivo", value=motivo_default)
-    resp = st.text_input("Responsável", value="")
-    obs  = st.text_area("Observações (opcional)", height=70)
-    salvar = st.form_submit_button("💾 Salvar contagem", type="primary", use_container_width=True)
-
-if salvar:
-    delta = int(novo_nivel - atual)
-    st.caption(f"Ajuste que será gravado: **{delta:+d}** (positivo entra / negativo sai)")
-    if delta == 0:
-        st.warning("Nada a ajustar — já está com essa quantidade."); st.stop()
-
-    agora = datetime.now()
-
-    # ===== 1) MovimentosEstoque (base única de cálculo)
-    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
-    tipo_mov = "ajuste+" if delta > 0 else "ajuste-"
-    row_mov = {
-        "Data": agora.strftime("%d/%m/%Y"),
-        "IDProduto": pid,
-        "Produto": nome_sel or "",
-        "Tipo": tipo_mov,
-        "Qtd": str(abs(delta)),
-        "Obs": f"{motivo or '-'} | Resp: {resp or '-'}" + (f" | {obs.strip()}" if (obs or '').strip() else "")
-    }
-    _append_row(ws_mov, row_mov)
-
-    # ===== 2) Ajustes (espelho para auditoria)
-    ws_aj = _ensure_ws(ABA_AJ, AJ_HEADERS)
-    row_aj = {
-        "Data": agora.strftime("%d/%m/%Y"),
-        "ID": pid,
-        "Qtd": str(delta),  # com sinal (ex.: -1)
-        "Motivo": motivo or ("Contagem inicial" if int(atual) == 0 else "Contagem"),
-        "Responsável": resp or "",
-        "Obs": (obs or "").strip()
-    }
-    _append_row(ws_aj, row_aj)
-
-    _msg_ok(f"Contagem salva! Ajuste de {delta:+d} para {pid}.")
-    st.session_state["_force_refresh"] = True
-
-    # Telegram
-    try:
-        msg = (
-            "📦 <b>Ajuste de Estoque</b>\n"
-            f"🧾 Produto: <b>{html.escape(nome_sel or '-')}</b>\n"
-            f"🔢 ID: <code>{html.escape(pid)}</code>\n"
-            f"📅 {agora.strftime('%d/%m/%Y %H:%M:%S')}\n"
-            f"📊 De: <b>{_fmt_int(atual)}</b> → Para: <b>{_fmt_int(novo_nivel)}</b>\n"
-            f"➕➖ Ajuste: <b>{_fmt_int(delta)}</b> ({'entrada' if delta>0 else 'saída'})\n"
-            f"📝 Motivo: {html.escape(motivo or '-')}\n"
-            f"👤 Responsável: {html.escape(resp or '-')}\n"
-            f"🗒️ Obs.: {html.escape((obs or '-').strip())}"
-        )
-        _tg_send(msg)
-    except:
+        if pd.isna(x): return ""
+    except: 
         pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan","none") else s
 
-st.divider()
-st.page_link("pages/01_produtos.py", label="↩️ Ir para Catálogo de Produtos", icon="📦")
-st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
+def _prod_key_from(prod_id, prod_nome):
+    pid = _nz(prod_id)
+    if pid: return pid
+    return f"nm:{_strip_accents_low(_nz(prod_nome))}"
+
+# ======================================================
+# Constantes de abas
+# ======================================================
+ABA_PRODUTOS = "Produtos"
+ABA_MOV      = "MovimentosEstoque"
+
+# ======================================================
+# Carregamento bases
+# ======================================================
+try:
+    df_prod = carregar_aba(ABA_PRODUTOS)
+except Exception as e:
+    st.error("Erro ao abrir a aba Produtos."); st.code(str(e)); st.stop()
+
+try:
+    df_mov = carregar_aba(ABA_MOV)
+except Exception:
+    df_mov = pd.DataFrame(columns=["Data","IDProduto","Produto","Tipo","Qtd","Obs"])
+
+# Colunas de interesse
+col_id   = _first_col(df_prod, ["ID","Id","Codigo","Código","SKU"])
+col_nome = _first_col(df_prod, ["Nome","Produto","Descrição","Descricao"])
+
+# Pré-processamento dos movimentos
+for c in ["Tipo","Qtd","IDProduto","Produto"]:
+    if c not in df_mov.columns: df_mov[c] = ""
+
+if not df_mov.empty:
+    df_mov["Tipo_norm"] = df_mov["Tipo"].apply(_norm_tipo)
+    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)   # 👈 agora preserva negativos
+    df_mov["__key"]     = df_mov.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
+else:
+    df_mov["Tipo_norm"] = []
+    df_mov["Qtd_num"]   = []
+    df_mov["__key"]     = []
+
+def estoque_atual_chave(ch) -> float:
+    if df_mov.empty: return 0.0
+    g = df_mov[df_mov["__key"] == ch].groupby("Tipo_norm")["Qtd_num"].sum()
+    return float(g.get("entrada",0.0) - g.get("saida",0.0) + g.get("ajuste",0.0))
+
+# ======================================================
+# UI — seleção de produto
+# ======================================================
+st.markdown("Selecione um produto e **defina o nível** desejado; o sistema grava **1 ajuste** com o delta necessário.")
+
+# Opções de produto (mostrar "ID — Nome" quando existir ID)
+df_prod["_id"]   = df_prod[col_id]   if col_id else ""
+df_prod["_nome"] = df_prod[col_nome] if col_nome else ""
+df_prod["__key"] = df_prod.apply(lambda r: _prod_key_from(r.get(col_id,""), r.get(col_nome,"")), axis=1)
+df_prod["__label"] = df_prod.apply(
+    lambda r: f"{r['_id']} — {r['_nome']}" if r["_id"] else str(r["_nome"]),
+    axis=1
+)
+
+opt = st.selectbox(
+    "Produto",
+    options=df_prod["__key"],
+    format_func=lambda k: df_prod.loc[df_prod["__key"]==k, "__label"].iloc[0] if (df_prod["__key"]==k).any() else k,
+    index=0 if not df_prod.empty else None
+)
+
+row = df_prod[df_prod["__key"]==opt].iloc[0] if not df_prod.empty else None
+prod_id   = row.get("_id","")
+prod_nome = row.get("_nome","")
+
+# Estoque atual real (Entradas − Saídas ± Ajustes)
+estoque_atual = estoque_atual_chave(opt)
+
+st.info(f"**Estoque atual (calculado): {int(estoque_atual) if float(estoque_atual).is_integer() else estoque_atual}**", icon="ℹ️")
+
+c1, c2 = st.columns([1,1])
+with c1:
+    alvo = st.number_input("Definir estoque para", min_value=0.0, step=1.0, value=float(estoque_atual))
+with c2:
+    motivo = st.text_input("Motivo", value="Contagem")
+
+responsavel = st.text_input("Responsável", value="")
+obs = st.text_area("Observações (opcional)", value="")
+
+delta = alvo - estoque_atual
+
+st.caption(f"Δ (delta) que será registrado como **Ajuste**: **{delta:.0f}**" if float(delta).is_integer() else f"Δ (delta): **{delta}**")
+
+# ======================================================
+# Persistência no MovimentosEstoque
+# ======================================================
+def _ws_mov():
+    return _sheet().worksheet(ABA_MOV)
+
+def _ensure_headers(ws, headers: list[str]):
+    try:
+        cur = ws.row_values(1)
+    except Exception:
+        cur = []
+    if not cur:
+        ws.update("A1", [headers])
+        return headers
+    return cur
+
+def _append_movimento(data_str, id_prod, nome_prod, tipo, qtd_str, obs_str):
+    ws = _ws_mov()
+    headers = _ensure_headers(ws, ["Data","IDProduto","Produto","Tipo","Qtd","Obs"])
+    row_map = {
+        "Data": data_str,
+        "IDProduto": id_prod,
+        "Produto": nome_prod,
+        "Tipo": tipo,
+        "Qtd": qtd_str,
+        "Obs": obs_str,
+    }
+    linha = [row_map.get(h, "") for h in headers]
+    ws.append_row(linha, value_input_option="USER_ENTERED")
+
+# ======================================================
+# Ação
+# ======================================================
+btn = st.button("💾 Salvar contagem", type="primary", use_container_width=True)
+
+if btn:
+    if row is None:
+        st.error("Selecione um produto válido.")
+        st.stop()
+
+    if delta == 0:
+        st.success("Nada a fazer: o estoque já está no valor desejado.")
+        st.stop()
+
+    data_str = datetime.now().strftime("%d/%m/%Y")
+    qtd_str  = str(delta).replace(".", ",")  # mantém padrão PT-BR
+
+    # Sempre grava como AJUSTE (classe correta para contagem/inventário)
+    obs_final = f"{motivo or 'Contagem'} por {responsavel}".strip()
+    if obs:
+        obs_final = (obs_final + " — " + obs) if obs_final else obs
+
+    try:
+        _append_movimento(data_str, prod_id, prod_nome, "Ajuste", qtd_str, obs_final)
+        st.success(
+            f"Ajuste gravado com sucesso! Δ = {delta:.0f} → estoque esperado = {alvo:.0f}"
+            if float(delta).is_integer() else
+            f"Ajuste gravado! Δ = {delta} → estoque esperado = {alvo}"
+        )
+        st.session_state["_force_refresh"] = True
+        st.cache_data.clear()
+        # st.rerun()  # habilite se quiser recarregar imediatamente
+    except Exception as e:
+        st.error("Falha ao gravar ajuste na aba MovimentosEstoque.")
+        st.code(str(e))
