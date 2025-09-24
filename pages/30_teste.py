@@ -699,5 +699,42 @@ else:
             except: pass
 
 st.divider()
-st.page_link("Catálogo de Produtos", label="↩️ Ir para Catálogo de Produtos", icon="📦")
-st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
+
+# ---- Catálogo de Produtos (tenta nome do menu > caminhos mais comuns)
+try:
+    st.page_link("Produtos", label="↩️ Ir para Catálogo de Produtos", icon="📦")
+except Exception:
+    ok = False
+    for path in (
+        "pages/01_Produtos.py",     # P maiúsculo
+        "pages/01_produtos.py",     # p minúsculo
+        "pages/01-Produtos.py",
+        "pages/01 Produtos.py",
+    ):
+        try:
+            st.page_link(path, label="↩️ Ir para Catálogo de Produtos", icon="📦")
+            ok = True
+            break
+        except Exception:
+            pass
+    if not ok:
+        st.info("Não achei a página de Produtos. Confira o nome no menu ou o caminho do arquivo em `pages/`.")
+
+# ---- Compras / Entradas (tenta nome do menu > caminhos mais comuns)
+try:
+    st.page_link("Compras/Entradas", label="🧾 Ir para Compras/Entradas", icon="🧾")
+except Exception:
+    ok = False
+    for path in (
+        "pages/03_compras_entradas.py",
+        "pages/03_Compras_Produtos_Entradas.py",
+        "pages/03-Compras-Entradas.py",
+    ):
+        try:
+            st.page_link(path, label="🧾 Ir para Compras/Entradas", icon="🧾")
+            ok = True
+            break
+        except Exception:
+            pass
+    if not ok:
+        st.info("Não achei a página Compras/Entradas. Confira o nome no menu ou o caminho do arquivo em `pages/`.")
