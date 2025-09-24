@@ -84,15 +84,12 @@ def carregar_produtos() -> pd.DataFrame:
 # ======================================================================
 def _cloudinary_conf() -> dict:
     cfg = st.secrets.get("CLOUDINARY", {})
-    if not cfg:
-        return {}
-    # normaliza chaves
     return {
-        "cloud_name": cfg.get("cloud_name", "").strip(),
-        "api_key":    cfg.get("api_key", "").strip(),
-        "api_secret": cfg.get("api_secret", "").strip(),
+        "cloud_name": (cfg.get("cloud_name") or "").strip(),
+        "api_key":    (cfg.get("api_key") or "").strip(),
+        "api_secret": (cfg.get("api_secret") or "").strip(),
         "folder":     (cfg.get("folder") or "Produtos").strip(),
-    }
+    } if cfg else {}
 
 def _slug(s: str) -> str:
     if not s: return "produto"
@@ -100,11 +97,23 @@ def _slug(s: str) -> str:
     s = re.sub(r"[^A-Za-z0-9\-_\.]+", "_", s).strip("_")
     return s or "produto"
 
+def _sign_cloudinary(params: dict, api_secret: str) -> str:
+    """Assina os parâmetros (alfabético, sem vazios, sem file/api_key/signature)."""
+    filtered = {
+        k: v for k, v in params.items()
+        if v not in (None, "", []) and k not in ("file", "api_key", "signature")
+    }
+    # listas devem virar string com vírgula; aqui não usamos listas, mas já deixo pronto
+    def _val(x):
+        return ",".join(x) if isinstance(x, list) else str(x)
+    to_sign = "&".join(f"{k}={_val(filtered[k])}" for k in sorted(filtered.keys()))
+    return hashlib.sha1((to_sign + api_secret).encode("utf-8")).hexdigest()
+
 def _cloudinary_upload(file_bytes: bytes, filename: str, *, folder: str, public_id: str,
-                       overwrite: bool = True) -> dict:
+                       overwrite: bool = True, invalidate: bool = True) -> dict:
     """
-    Faz upload assinado para Cloudinary usando requests.
-    Retorna dict JSON (com 'secure_url' em caso de sucesso).
+    Upload assinado para Cloudinary. Inclui overwrite e invalidate na assinatura.
+    Retorna o JSON (contendo 'secure_url' em caso de sucesso).
     """
     conf = _cloudinary_conf()
     cloud = conf.get("cloud_name"); key = conf.get("api_key"); secret = conf.get("api_secret")
@@ -112,28 +121,23 @@ def _cloudinary_upload(file_bytes: bytes, filename: str, *, folder: str, public_
         raise RuntimeError("Config do Cloudinary ausente em st.secrets['CLOUDINARY'].")
 
     url = f"https://api.cloudinary.com/v1_1/{cloud}/image/upload"
-    ts = int(time.time())
+    ts = str(int(time.time()))
 
-    # Parâmetros a assinar (ordenados alfabeticamente)
-    to_sign = {
-        "folder": folder,
-        "public_id": public_id,
-        "timestamp": str(ts),
-        # 'overwrite' não precisa estar na assinatura; deixamos apenas nos form-data
+    # Parâmetros da requisição (têm que ser os MESMOS que vamos assinar)
+    params = {
+        "folder": folder,                           # pode ter acentos/espaços
+        "public_id": public_id,                     # sem extensão
+        "timestamp": ts,
+        "overwrite": "true" if overwrite else "false",
+        "invalidate": "true" if invalidate else "false",
     }
-    sign_str = "&".join(f"{k}={to_sign[k]}" for k in sorted(to_sign.keys())) + secret
-    signature = hashlib.sha1(sign_str.encode("utf-8")).hexdigest()
+
+    signature = _sign_cloudinary(params, secret)
 
     files = {"file": (filename, file_bytes)}
-    data = {
-        "api_key": key,
-        "timestamp": ts,
-        "signature": signature,
-        "folder": folder,
-        "public_id": public_id,
-        "overwrite": "true" if overwrite else "false",
-        "invalidate": "true",
-    }
+    data = dict(params)
+    data.update({"api_key": key, "signature": signature})
+
     r = requests.post(url, files=files, data=data, timeout=30)
     r.raise_for_status()
     return r.json()
@@ -183,7 +187,7 @@ with col1:
                 sh = _sheet()
                 ws = sh.worksheet(ABA_PRODUTOS)
                 _, foto_col = _ensure_foto_col(ws)
-                target_row = int(sel_idx) + 2  # DF 0-based, planilha começa na 2
+                target_row = int(sel_idx) + 2  # DF 0-based; planilha começa na 2
                 ws.update_cell(target_row, foto_col, url.strip())
                 st.success("✅ URL salva no catálogo!")
                 st.session_state["_force_refresh"] = True
@@ -208,12 +212,12 @@ if not conf:
         st.markdown(
             """
             Adicione aos **Secrets**:
-            ```
+            ```toml
             [CLOUDINARY]
             cloud_name = "SEU_CLOUD_NAME"
             api_key    = "SUA_API_KEY"
             api_secret = "SEU_API_SECRET"
-            folder     = "Produtos"
+            folder     = "Ebenézer Variedades"
             ```
             """
         )
@@ -223,12 +227,12 @@ else:
     with up_col1:
         arquivo = st.file_uploader("Selecionar imagem", type=["jpg","jpeg","png","webp","gif"], accept_multiple_files=False)
     with up_col2:
-        # public_id padrão: prioriza SKU; senão slug do nome
         default_pid = _slug(sku or nome_prod)
         public_id = st.text_input("Nome do arquivo no Cloudinary (public_id)", value=default_pid, help="Sem extensão.")
     with up_col3:
         folder = st.text_input("Pasta", value=conf.get("folder") or "Produtos")
     overwrite = st.checkbox("Substituir se já existir (overwrite)", value=True)
+    invalidate = st.checkbox("Invalidar CDN após overwrite (invalidate)", value=True)
 
     if st.button("↑ Enviar para Cloudinary e salvar na planilha", type="primary", use_container_width=True):
         if not arquivo:
@@ -242,6 +246,7 @@ else:
                         folder=folder,
                         public_id=public_id,
                         overwrite=overwrite,
+                        invalidate=invalidate,
                     )
                 secure_url = data.get("secure_url") or data.get("url")
                 if not secure_url:
