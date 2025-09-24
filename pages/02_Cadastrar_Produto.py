@@ -699,5 +699,5 @@ else:
             except: pass
 
 st.divider()
-st.page_link("pages/01_Produtos.py", label="↩️ Ir para Catálogo de Produtos", icon="📦")
+st.page_link("Catálogo de Produtos", label="↩️ Ir para Catálogo de Produtos", icon="📦")
 st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
