@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pages/03_compras_entradas.py — Registrar compras/entradas de estoque + Telegram + Fracionamento
+# pages/03_compras_entradas.py — Registrar compras/entradas de estoque + Telegram + Fracionamento + Editar/Apagar
 import json, unicodedata, re, time
 import streamlit as st
 import pandas as pd
@@ -7,6 +7,7 @@ import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 from datetime import date
+from pathlib import Path  # 👈 para st.page_link seguro
 
 st.set_page_config(page_title="Compras / Entradas", page_icon="🧾", layout="wide")
 st.title("🧾 Compras / Entradas de Estoque")
@@ -15,8 +16,10 @@ st.title("🧾 Compras / Entradas de Estoque")
 def _refresh_now():
     st.session_state["_refresh_ts"] = time.time()
     st.cache_data.clear()
-    try: st.rerun()
-    except Exception: st.experimental_rerun()
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
 BUMP = st.session_state.get("_refresh_ts", 0)  # usado para invalidar cache
 
@@ -321,8 +324,16 @@ if salvar:
     _refresh_now()
 
 st.divider()
-st.page_link("pages/02_cadastrar_produto.py", label="↩️ Voltar ao Cadastro/Editar", icon="➕")
-st.page_link("pages/01_produtos.py", label="📦 Ir ao Catálogo", icon="📦")
+
+# ========== Links de navegação (seguros) ==========
+def _safe_page_link(path: str, label: str, icon: str):
+    if Path(path).exists():
+        st.page_link(path, label=label, icon=icon)
+    else:
+        st.caption(f"⚠️ Página não encontrada: `{path}`")
+
+_safe_page_link("pages/02_cadastrar_produto.py", label="↩️ Voltar ao Cadastro/Editar", icon="➕")
+_safe_page_link("pages/01_produtos.py", label="📦 Ir ao Catálogo", icon="📦")
 
 # =========================
 # 🧪 Fracionar granel → fracionados
@@ -491,3 +502,162 @@ else:
             st.success("Fracionamento registrado com sucesso! ✅")
             st.toast("Movimentos de fracionamento lançados", icon="✅")
             _refresh_now()
+
+# =========================
+# ✏️ Editar / 🗑️ Apagar registros
+# =========================
+st.divider()
+st.subheader("✏️ Editar / 🗑️ Apagar registros")
+
+def _load_with_rownums(aba: str, headers: list[str]):
+    ws = _ensure_ws(aba, headers)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    if df.empty:
+        df = pd.DataFrame(columns=headers)
+    df = df.fillna("")
+    df["__Linha"] = (df.index + 2).astype(int)  # cabeçalho está na linha 1
+    for h in headers:
+        if h not in df.columns:
+            df[h] = ""
+    cols = ["__Linha"] + [c for c in df.columns if c != "__Linha"]
+    return df[cols].copy(), ws
+
+def _save_df_over(ws, df: pd.DataFrame):
+    df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
+    ws.clear()
+    set_with_dataframe(ws, df2, include_index=False, include_column_header=True, resize=True)
+
+tab_edit_comp, tab_edit_mov = st.tabs(["🧾 Editar Compras", "📦 Editar Movimentos"])
+
+# ---------- Editar / Apagar COMPRAS ----------
+with tab_edit_comp:
+    dfc, ws_c = _load_with_rownums(COMPRAS_ABA, COMPRAS_HEADERS)
+    if dfc.empty:
+        st.info("Sem compras registradas ainda.")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            filt_prod = st.text_input("Filtrar por Produto (contém)", "")
+        with c2:
+            filt_data = st.text_input("Filtrar por Data (dd/mm/aaaa, contém)", "")
+
+        mask = pd.Series(True, index=dfc.index)
+        if filt_prod.strip():
+            mask &= dfc["Produto"].astype(str).str.contains(filt_prod.strip(), case=False, na=False)
+        if filt_data.strip():
+            mask &= dfc["Data"].astype(str).str.contains(filt_data.strip(), case=False, na=False)
+
+        dfc_view = dfc[mask].copy().sort_values("__Linha", ascending=False)
+        st.dataframe(dfc_view, use_container_width=True, hide_index=True)
+
+        linhas_opts = dfc_view["__Linha"].tolist()
+        if linhas_opts:
+            linha_sel = st.selectbox("Escolha a linha para editar/apagar", options=linhas_opts)
+            row_cur = dfc.loc[dfc["__Linha"] == linha_sel].iloc[0].copy()
+
+            with st.form("form_edit_compra"):
+                st.markdown(f"**Linha {linha_sel}** — edite os campos e salve")
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    data_n = st.text_input("Data", row_cur.get("Data",""))
+                    prod_n = st.text_input("Produto", row_cur.get("Produto",""))
+                    unid_n = st.text_input("Unidade", row_cur.get("Unidade",""))
+                with e2:
+                    forn_n = st.text_input("Fornecedor", row_cur.get("Fornecedor",""))
+                    qtd_n  = st.text_input("Qtd", row_cur.get("Qtd",""))
+                    custo_n= st.text_input("Custo Unitário", row_cur.get("Custo Unitário",""))
+                with e3:
+                    total_n= st.text_input("Total", row_cur.get("Total",""))
+                    idp_n  = st.text_input("IDProduto", row_cur.get("IDProduto",""))
+                    obs_n  = st.text_input("Obs", row_cur.get("Obs",""))
+
+                colb1, colb2 = st.columns([1,1])
+                salvar_ed = colb1.form_submit_button("💾 Salvar alterações", use_container_width=True)
+                apagar_ln = colb2.form_submit_button("🗑️ Apagar esta linha", use_container_width=True)
+
+            if salvar_ed:
+                idx_real = dfc.index[dfc["__Linha"] == linha_sel][0]
+                for k, v in {
+                    "Data": data_n, "Produto": prod_n, "Unidade": unid_n, "Fornecedor": forn_n,
+                    "Qtd": qtd_n, "Custo Unitário": custo_n, "Total": total_n,
+                    "IDProduto": idp_n, "Obs": obs_n
+                }.items():
+                    dfc.at[idx_real, k] = v
+                _save_df_over(ws_c, dfc)
+                st.success(f"Linha {linha_sel} salva.")
+                st.cache_data.clear()
+                st.rerun()
+
+            if apagar_ln:
+                dfc_drop = dfc[dfc["__Linha"] != linha_sel].copy()
+                _save_df_over(ws_c, dfc_drop)
+                st.success(f"Linha {linha_sel} apagada.")
+                st.cache_data.clear()
+                st.rerun()
+
+# ---------- Editar / Apagar MOVIMENTOS ----------
+with tab_edit_mov:
+    dfm, ws_m = _load_with_rownums(MOVS_ABA, MOV_HEADERS)
+    if dfm.empty:
+        st.info("Sem movimentos registrados ainda.")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            filt_prod_m = st.text_input("Filtrar por Produto (contém)", "")
+        with c2:
+            filt_data_m = st.text_input("Filtrar por Data (dd/mm/aaaa, contém)", "")
+
+        maskm = pd.Series(True, index=dfm.index)
+        if filt_prod_m.strip():
+            maskm &= dfm["Produto"].astype(str).str.contains(filt_prod_m.strip(), case=False, na=False)
+        if filt_data_m.strip():
+            maskm &= dfm["Data"].astype(str).str.contains(filt_data_m.strip(), case=False, na=False)
+
+        dfm_view = dfm[maskm].copy().sort_values("__Linha", ascending=False)
+        st.dataframe(dfm_view, use_container_width=True, hide_index=True)
+
+        linhas_opts_m = dfm_view["__Linha"].tolist()
+        if linhas_opts_m:
+            linha_sel_m = st.selectbox("Escolha a linha para editar/apagar (Movimentos)", options=linhas_opts_m)
+
+            row_mov = dfm.loc[dfm["__Linha"] == linha_sel_m].iloc[0].copy()
+            with st.form("form_edit_mov"):
+                st.markdown(f"**Linha {linha_sel_m}** — edite campos e salve")
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    data2  = st.text_input("Data", row_mov.get("Data",""))
+                    idp2   = st.text_input("IDProduto", row_mov.get("IDProduto",""))
+                    prod2  = st.text_input("Produto", row_mov.get("Produto",""))
+                with e2:
+                    tipo2  = st.text_input("Tipo", row_mov.get("Tipo",""))
+                    qtd2   = st.text_input("Qtd", row_mov.get("Qtd",""))
+                    obs2   = st.text_input("Obs", row_mov.get("Obs",""))
+                with e3:
+                    id2    = st.text_input("ID", row_mov.get("ID",""))
+                    doc2   = st.text_input("Documento/NF", row_mov.get("Documento/NF",""))
+                    org2   = st.text_input("Origem", row_mov.get("Origem",""))
+                saldo2 = st.text_input("SaldoApós", row_mov.get("SaldoApós",""))
+
+                colb1, colb2 = st.columns([1,1])
+                salvar_ed2 = colb1.form_submit_button("💾 Salvar alterações", use_container_width=True)
+                apagar_ln2 = colb2.form_submit_button("🗑️ Apagar esta linha", use_container_width=True)
+
+            if salvar_ed2:
+                idx_real = dfm.index[dfm["__Linha"] == linha_sel_m][0]
+                for k, v in {
+                    "Data": data2, "IDProduto": idp2, "Produto": prod2, "Tipo": tipo2,
+                    "Qtd": qtd2, "Obs": obs2, "ID": id2, "Documento/NF": doc2,
+                    "Origem": org2, "SaldoApós": saldo2
+                }.items():
+                    dfm.at[idx_real, k] = v
+                _save_df_over(ws_m, dfm)
+                st.success(f"Linha {linha_sel_m} salva.")
+                st.cache_data.clear()
+                st.rerun()
+
+            if apagar_ln2:
+                dfm_drop = dfm[dfm["__Linha"] != linha_sel_m].copy()
+                _save_df_over(ws_m, dfm_drop)
+                st.success(f"Linha {linha_sel_m} apagada.")
+                st.cache_data.clear()
+                st.rerun()
