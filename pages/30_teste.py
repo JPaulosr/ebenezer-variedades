@@ -48,7 +48,8 @@ def _sheet():
 
 def _headers(ws) -> list[str]:
     try:
-        return [h.strip() for h in ws.row_values(1)]
+        hdrs = [h.strip() for h in ws.row_values(1)]
+        return hdrs or []
     except Exception:
         return []
 
@@ -80,17 +81,8 @@ def carregar_produtos() -> pd.DataFrame:
     return df.fillna("")
 
 # ======================================================================
-# Cloudinary helpers (upload assinado sem SDK)
+# Helpers de string
 # ======================================================================
-def _cloudinary_conf() -> dict:
-    cfg = st.secrets.get("CLOUDINARY", {})
-    return {
-        "cloud_name": (cfg.get("cloud_name") or "").strip(),
-        "api_key":    (cfg.get("api_key") or "").strip(),
-        "api_secret": (cfg.get("api_secret") or "").strip(),
-        "folder":     (cfg.get("folder") or "Produtos").strip(),
-    } if cfg else {}
-
 def _slug(s: str) -> str:
     if not s: return "produto"
     s = "".join(c for c in _ud.normalize("NFKD", s) if not _ud.combining(c))
@@ -102,66 +94,110 @@ def _nfc(s: str) -> str:
     if s is None: return ""
     return _ud.normalize("NFC", str(s)).strip()
 
+# ======================================================================
+# Cloudinary helpers
+#   - Suporta upload assinado (padrão)
+#   - Suporta upload unsigned via upload_preset (opcional)
+# Secrets aceitos:
+# [CLOUDINARY]
+# cloud_name = "xxxxx"
+# api_key    = "xxxxx"
+# api_secret = "xxxxx"
+# folder     = "Ebenézer Variedades"
+# upload_preset = "preset_unsigned_opcional"
+# use_unsigned  = true  # (opcional)
+# ======================================================================
+def _cloudinary_conf() -> dict:
+    cfg = st.secrets.get("CLOUDINARY", {}) or {}
+    return {
+        "cloud_name": (cfg.get("cloud_name") or "").strip(),
+        "api_key":    (cfg.get("api_key") or "").strip(),
+        "api_secret": (cfg.get("api_secret") or "").strip(),
+        "folder":     (cfg.get("folder") or "Produtos").strip(),
+        "upload_preset": (cfg.get("upload_preset") or "").strip(),
+        "use_unsigned": str(cfg.get("use_unsigned", "")).lower() in ("1","true","yes","on"),
+    }
+
 def _sign_cloudinary(params: dict, api_secret: str) -> tuple[str, str]:
     """
-    Assina exatamente os params enviados (alfabético; sem file/api_key/signature).
+    Assina exatamente os params enviados (ordem alfabética; sem file/api_key/signature).
     Retorna (string_to_sign, signature_hex).
     """
     filtered = {
         k: v for k, v in params.items()
         if v not in (None, "", []) and k not in ("file", "api_key", "signature")
     }
-    parts = [f"{k}={filtered[k]}" for k in sorted(filtered.keys())]  # ordem alfabética por chave
+    parts = [f"{k}={filtered[k]}" for k in sorted(filtered.keys())]  # ordem alfabética
     string_to_sign = "&".join(parts)
     signature = hashlib.sha1((string_to_sign + api_secret).encode("utf-8")).hexdigest()
     return string_to_sign, signature
 
-def _cloudinary_upload(file_bytes: bytes, filename: str, *, folder: str, public_id: str,
-                       overwrite: bool = True, invalidate: bool = True, debug: bool = True) -> dict:
-    """
-    Upload assinado para Cloudinary, incluindo overwrite/invalidate na assinatura.
-    Se debug=True, mostra string_to_sign e assinatura local para comparação.
-    """
+def _cloudinary_upload_signed(file_bytes: bytes, filename: str, *, folder: str, public_id: str,
+                              overwrite: bool = True, invalidate: bool = True, debug: bool = True) -> dict:
     conf = _cloudinary_conf()
     cloud = (conf.get("cloud_name") or "").strip()
     key   = (conf.get("api_key") or "").strip()
     secret= (conf.get("api_secret") or "").strip()
     if not (cloud and key and secret):
-        raise RuntimeError("Config do Cloudinary ausente/incompleta em st.secrets['CLOUDINARY'].")
+        raise RuntimeError("Config do Cloudinary ausente/incompleta em st.secrets['CLOUDINARY']. (cloud_name/api_key/api_secret)")
 
     # Normaliza entradas (acentos/espacos invisíveis)
-    folder    = _nfc(folder)
-    public_id = _nfc(public_id)
+    folder_nfc    = _nfc(folder)
+    public_id_nfc = _nfc(public_id)
 
     url = f"https://api.cloudinary.com/v1_1/{cloud}/image/upload"
     ts = str(int(time.time()))
 
-    # Os mesmos parâmetros que iremos enviar no body precisam ser assinados
+    # Os MESMOS parâmetros que iremos enviar no body entram na assinatura
     params = {
-        "folder": folder,
-        "public_id": public_id,
-        "timestamp": ts,
-        "overwrite": "true" if overwrite else "false",
+        "folder": folder_nfc,
         "invalidate": "true" if invalidate else "false",
+        "overwrite": "true" if overwrite else "false",
+        "public_id": public_id_nfc,
+        "timestamp": ts,
     }
 
     string_to_sign, signature = _sign_cloudinary(params, secret)
 
     if debug:
         with st.expander("🛠️ Diagnóstico da assinatura (local)"):
-            st.write("string_to_sign enviada:")
+            st.write("Valores efetivos (repr) — confira espaços/acentos invisíveis:")
+            st.code(f"folder={folder_nfc!r}\npublic_id={public_id_nfc!r}\n", language="python")
+            st.write("string_to_sign calculada localmente:")
             st.code(string_to_sign, language="text")
-            st.write("signature (sha1):")
+            st.write("signature (sha1) local:")
             st.code(signature, language="text")
-            st.caption("Compare a string acima com a 'String to sign' retornada pelo erro do Cloudinary. "
-                       "Se forem idênticas e ainda der 'Invalid Signature', a causa é API key/secret incorretas "
-                       "ou secrets antigos em execução (reinicie o app).")
+            st.caption(
+                "A 'String to sign' do erro da Cloudinary deve ser **idêntica** à acima. "
+                "Se for igual e ainda der 'Invalid Signature', verifique se o api_secret é o correto "
+                "(gire a chave no painel caso tenha sido exposta) e reinicie o app após trocar os Secrets."
+            )
 
-    files = {"file": (filename, file_bytes)}
+    files = {"file": (filename, file_bytes)}  # 'file' NÃO entra na assinatura
     data = dict(params)
     data.update({"api_key": key, "signature": signature})
 
-    r = requests.post(url, files=files, data=data, timeout=30)
+    r = requests.post(url, files=files, data=data, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def _cloudinary_upload_unsigned(file_bytes: bytes, filename: str, *, folder: str, public_id: str, upload_preset: str) -> dict:
+    conf = _cloudinary_conf()
+    cloud = (conf.get("cloud_name") or "").strip()
+    if not (cloud and upload_preset):
+        raise RuntimeError("Para unsigned upload, configure cloud_name e upload_preset em st.secrets['CLOUDINARY'].")
+
+    folder_nfc    = _nfc(folder)
+    public_id_nfc = _nfc(public_id)
+
+    url = f"https://api.cloudinary.com/v1_1/{cloud}/image/upload"
+    files = {"file": (filename, file_bytes)}
+    data = {
+        "upload_preset": upload_preset,
+        "folder": folder_nfc,
+        "public_id": public_id_nfc,
+    }
+    r = requests.post(url, files=files, data=data, timeout=60)
     r.raise_for_status()
     return r.json()
 
@@ -230,17 +266,20 @@ st.divider()
 st.subheader("Ou envie um arquivo do computador (Cloudinary)")
 
 conf = _cloudinary_conf()
-if not conf:
+if not conf or not conf.get("cloud_name"):
     with st.expander("Configurar Cloudinary (clique para ver)"):
         st.markdown(
             """
             Adicione aos **Secrets**:
             ```toml
             [CLOUDINARY]
-            cloud_name = "SEU_CLOUD_NAME"
-            api_key    = "SUA_API_KEY"
-            api_secret = "SUA_API_SECRET"
-            folder     = "Ebenézer Variedades"
+            cloud_name   = "SEU_CLOUD_NAME"
+            api_key      = "SUA_API_KEY"
+            api_secret   = "SUA_API_SECRET"   # para upload assinado
+            folder       = "Ebenézer Variedades"
+            # Opcional:
+            upload_preset = "SEU_PRESET_UNSIGNED"  # para upload unsigned
+            use_unsigned  = false
             ```
             """
         )
@@ -257,21 +296,36 @@ else:
     overwrite = st.checkbox("Substituir se já existir (overwrite)", value=True)
     invalidate = st.checkbox("Invalidar CDN após overwrite (invalidate)", value=True)
 
+    use_unsigned = bool(conf.get("use_unsigned"))
+    upload_preset = conf.get("upload_preset")
+
     if st.button("↑ Enviar para Cloudinary e salvar na planilha", type="primary", use_container_width=True):
         if not arquivo:
             st.warning("Selecione um arquivo para enviar.")
         else:
             try:
                 with st.spinner("Enviando para o Cloudinary…"):
-                    data = _cloudinary_upload(
-                        file_bytes=arquivo.read(),
-                        filename=arquivo.name,
-                        folder=folder,
-                        public_id=public_id,
-                        overwrite=overwrite,
-                        invalidate=invalidate,
-                        debug=True,  # mostra a string_to_sign local
-                    )
+                    if use_unsigned:
+                        if not upload_preset:
+                            raise RuntimeError("use_unsigned=true exige 'upload_preset' nos Secrets.")
+                        data = _cloudinary_upload_unsigned(
+                            file_bytes=arquivo.read(),
+                            filename=arquivo.name,
+                            folder=folder,
+                            public_id=public_id,
+                            upload_preset=upload_preset,
+                        )
+                    else:
+                        data = _cloudinary_upload_signed(
+                            file_bytes=arquivo.read(),
+                            filename=arquivo.name,
+                            folder=folder,
+                            public_id=public_id,
+                            overwrite=overwrite,
+                            invalidate=invalidate,
+                            debug=True,  # mostra a string_to_sign local
+                        )
+
                 secure_url = data.get("secure_url") or data.get("url")
                 if not secure_url:
                     raise RuntimeError(f"Resposta sem URL: {data}")
