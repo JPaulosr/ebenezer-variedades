@@ -504,30 +504,24 @@ else:
             _refresh_now()
 
 # =========================
-# ✏️ Editar / 🗑️ Apagar registros
+# 🔧 Editar / Apagar registros
 # =========================
-st.divider()
-st.subheader("✏️ Editar / 🗑️ Apagar registros")
+st.subheader("📝 Editar / ❌ Apagar registros")
 
-def _load_with_rownums(aba: str, headers: list[str]):
-    ws = _ensure_ws(aba, headers)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    if df.empty:
-        df = pd.DataFrame(columns=headers)
-    df = df.fillna("")
-    df["__Linha"] = (df.index + 2).astype(int)  # cabeçalho está na linha 1
-    for h in headers:
-        if h not in df.columns:
-            df[h] = ""
-    cols = ["__Linha"] + [c for c in df.columns if c != "__Linha"]
-    return df[cols].copy(), ws
+aba = st.radio("Escolha a aba", ["Editar Compras", "Editar Movimentos"], horizontal=True)
 
-def _save_df_over(ws, df: pd.DataFrame):
-    df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
-    ws.clear()
-    set_with_dataframe(ws, df2, include_index=False, include_column_header=True, resize=True)
+colf1, colf2 = st.columns(2)
+with colf1:
+    if aba == "Editar Compras":
+        filt_prod = st.text_input("Filtrar por Produto (contém)", "", key="filt_prod_compras")
+    else:
+        filt_prod = st.text_input("Filtrar por Produto (contém)", "", key="filt_prod_mov")
 
-tab_edit_comp, tab_edit_mov = st.tabs(["🧾 Editar Compras", "📦 Editar Movimentos"])
+with colf2:
+    if aba == "Editar Compras":
+        filt_data = st.text_input("Filtrar por Data (dd/mm/aaaa, contém)", "", key="filt_data_compras")
+    else:
+        filt_data = st.text_input("Filtrar por Data (dd/mm/aaaa, contém)", "", key="filt_data_mov")
 
 # ---------- Editar / Apagar COMPRAS ----------
 with tab_edit_comp:
