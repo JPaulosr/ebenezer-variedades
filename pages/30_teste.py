@@ -204,7 +204,7 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
         sai += _sum(vend, v_qtd, vend[v_pid].astype(str).str.strip()==pid)
 
     # Ajustes
-    a_pid = _pick_col(ajus, ["ID","IDProduto","ProdutoID"])
+    a_pid = _pick_col(ajus, ["IDProduto","ProdutoID","ID"])
     a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
     aj = 0.0
     if a_qtd:
