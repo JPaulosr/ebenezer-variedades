@@ -164,7 +164,6 @@ COL = {
 
 # ===== helpers de normalização para comparações =====
 def _norm_series(series: pd.Series) -> pd.Series:
-    # remove NBSP, espaços múltiplos e faz strip
     return (series.astype(str)
                   .str.replace("\u00A0", " ", regex=False)
                   .str.replace("\xa0", " ", regex=False)
@@ -186,8 +185,8 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
             if sub.empty: return 0.0
             return pd.to_numeric(
                 sub[col_q].astype(str)
-                          .str.replace(".", "", regex=False)  # remove separador de milhar
-                          .str.replace(",", ".", regex=False),  # vírgula -> ponto
+                          .str.replace(".", "", regex=False)
+                          .str.replace(",", ".", regex=False),
                 errors="coerce"
             ).fillna(0).sum()
         except Exception:
@@ -208,7 +207,6 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
     if c_qtd:
         if pid and c_pid: ent += _sum(comp, c_qtd, _eq(comp[c_pid], pid))
         if nome and c_nom:
-            # só soma por nome quando não houver ID preenchido
             filtro_nome = _eq(comp[c_nom], nome) & (_norm_series(comp.get(c_pid, "")) == "")
             ent += _sum(comp, c_qtd, filtro_nome)
 
@@ -219,7 +217,7 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
     if v_qtd and v_pid and pid:
         sai += _sum(vend, v_qtd, _eq(vend[v_pid], pid))
 
-    # Ajustes (agora prioriza IDProduto!)
+    # Ajustes (prioriza IDProduto/ProdutoID e depois ID)
     a_pid = _pick_col(ajus, ["IDProduto","ProdutoID","ID"])
     a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
     aj = 0.0
@@ -468,7 +466,6 @@ else:
             v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
             a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
 
-            ent = _estoque_atual(pid=gid, nome=gnome) + 0  # reusa cálculo
             def _sum(df, col_q, filtro):
                 if df.empty or not col_q: return 0.0
                 sub = df[filtro].copy()
@@ -512,7 +509,6 @@ else:
 
         confirmar = st.button("Registrar fracionamento", use_container_width=True, key=f"btn_frac_{BUMP}")
 
-        # ====== baixa via AJUSTES e entrada via COMPRAS ======
         if confirmar:
             if total_litros <= 0:
                 st.error("Informe quantidades > 0 para fracionar."); st.stop()
@@ -528,19 +524,34 @@ else:
                 custo_litro = 0.0
 
             ws_mov = _ensure_ws(MOVS_ABA, MOV_HEADERS)
-            ws_aj  = _ensure_ws(AJUSTES_ABA, AJUSTES_HEADERS)
             ws_com = _ensure_ws(COMPRAS_ABA, COMPRAS_HEADERS)
             data_str = date.today().strftime("%d/%m/%Y")
 
-            # ----- SAÍDA do granel -----
-            _append_row(ws_aj, {
+            # ----- SAÍDA do granel (AJUSTES) - compatível com colunas existentes -----
+            ws_aj  = _ensure_ws(AJUSTES_ABA, AJUSTES_HEADERS)
+            cur_aj = get_as_dataframe(ws_aj, evaluate_formulas=False, header=0).dropna(how="all")
+            cur_cols = [c.strip() for c in cur_aj.columns] if not cur_aj.empty else AJUSTES_HEADERS
+
+            aj_row = {
                 "Data": data_str,
-                "IDProduto": gid,
-                "Produto": gnome,
                 "Qtd": f"-{str(total_litros).replace('.', ',')}",
-                "Unidade": "L",
                 "Obs": "Fracionamento → baixa de granel"
-            })
+            }
+            # ID: usa a primeira coluna que existir
+            for c in ["IDProduto", "ProdutoID", "ID"]:
+                if c in cur_cols:
+                    aj_row[c] = gid
+                    break
+            # Nome: idem
+            for c in ["Produto", "Nome", "Descrição", "Descricao"]:
+                if c in cur_cols:
+                    aj_row[c] = gnome
+                    break
+            if "Unidade" in cur_cols:
+                aj_row["Unidade"] = "L"
+            _append_row(ws_aj, aj_row)
+
+            # ----- MOVIMENTO informativo -----
             _append_row(ws_mov, {
                 "Data": data_str,
                 "IDProduto": gid,
@@ -558,7 +569,7 @@ else:
             def _brl(x: float) -> str:
                 return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
-            # ----- ENTRADA fracionados -----
+            # ----- ENTRADAS dos fracionados (gera custo médio) -----
             if qtd_1 > 0:
                 r1 = df_un.iloc[idx_1]
                 id1 = _nz(r1.get(COL_ID,"")); nm1 = _nz(r1.get(COL_NOME,""))
@@ -647,9 +658,7 @@ def _load_with_rownums(aba: str, headers: list[str]):
     if df.empty:
         df = pd.DataFrame(columns=headers)
     df = df.fillna("")
-    # __Linha = linha real da planilha (1 = cabeçalho); dados começam na 2
-    df["__Linha"] = (df.index + 2).astype(int)
-    # Garante todas as colunas pedidas
+    df["__Linha"] = (df.index + 2).astype(int)  # linha real na planilha
     for h in headers:
         if h not in df.columns:
             df[h] = ""
@@ -657,7 +666,6 @@ def _load_with_rownums(aba: str, headers: list[str]):
     return df[cols].copy(), ws
 
 def _save_df_over(ws, df: pd.DataFrame):
-    # remove coluna técnica antes de gravar
     df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
     ws.clear()
     set_with_dataframe(ws, df2.fillna(""), include_index=False, include_column_header=True, resize=True)
@@ -694,7 +702,6 @@ with tab_edit_comp:
         st.markdown("**Registro selecionado:**")
         st.json(rec)
 
-        # Form de edição
         with st.form(f"form_edit_comp_{BUMP}"):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -716,11 +723,9 @@ with tab_edit_comp:
             with col_s2:
                 apagar = st.form_submit_button("🗑️ Apagar registro", use_container_width=True)
 
-        # Ações
         if salvar or apagar:
-            # Localiza a linha real na base completa
             linha_real = int(rec["__Linha"])
-            base = df.copy()  # com __Linha
+            base = df.copy()
             pos = base.index[base["__Linha"] == linha_real]
             if len(pos) != 1:
                 st.error("Não foi possível localizar a linha na planilha.")
@@ -732,7 +737,6 @@ with tab_edit_comp:
                     st.success(f"Registro da linha {linha_real} apagado.")
                     _refresh_now()
                 else:
-                    # Atualiza campos editáveis
                     base.at[base_idx, "Data"] = e_data
                     base.at[base_idx, "Produto"] = e_prod
                     base.at[base_idx, "Unidade"] = e_unid
