@@ -103,23 +103,39 @@ def _append_row(ws, row: dict):
 # =========================
 # Utilidades
 # =========================
-def _to_float_or_zero(x):
-    """Converte '1,16', '11.60', '1.234,56', etc. em float seguro."""
+def _to_num(x) -> float:
+    """Converte para float preservando negativos.
+       Suporta: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
     if x is None:
         return 0.0
     s = str(x).strip()
-    if s == "":
+    if s == "" or s.lower() in ("nan", "none"):
         return 0.0
+    s = s.replace("−", "-")            # unicode minus -> ascii
+    neg_paren = s.startswith("(") and s.endswith(")")
+    if neg_paren:
+        s = s[1:-1]
+
     s = s.replace("R$", "").replace(" ", "")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.]", "", s)
+    if "," in s:
+        s = s.replace(".", "")         # remove milhar
+        s = s.replace(",", ".")        # vírgula -> ponto
+
+    s = re.sub(r"(?<!^)-", "", s)      # remove '-' fora do início
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s.count("-") > 1:
+        s = "-" + s.replace("-", "")
     if s.count(".") > 1:
         parts = s.split(".")
         s = "".join(parts[:-1]) + "." + parts[-1]
+
     try:
-        return float(s)
-    except Exception:
-        return 0.0
+        v = float(s)
+    except:
+        v = 0.0
+    if neg_paren:
+        v = -abs(v)
+    return v  # 👈 usar esta função em TODO parser numérico
 
 def _nz(x):
     if x is None:
@@ -149,14 +165,13 @@ def _norm_tipo(t: str) -> str:
     low = _strip_accents_low(raw)
 
     # Trata fracionamento primeiro (olha o sinal no texto bruto)
-    if "fracion" in low:  # fracionamento, fracionar...
+    if "fracion" in low:
         if "+" in raw:
             return "entrada"
         if "-" in raw:
             return "saida"
         return "outro"
 
-    # Demais tipos (sem sinais)
     low_clean = re.sub(r"[^a-z]", "", low)
     if "entrada" in low_clean or "compra" in low_clean or "estorno" in low_clean:
         return "entrada"
@@ -170,7 +185,7 @@ def _prod_key_from(prod_id, prod_nome):
     """Chave de produto priorizando ID; se não houver, usa nome normalizado."""
     pid = _nz(prod_id)
     if pid:
-        return pid  # prioriza casar por IDProduto
+        return pid
     return f"nm:{_strip_accents_low(_nz(prod_nome))}"
 
 # =========================
@@ -189,9 +204,9 @@ MOV_HEADERS     = ["Data", "IDProduto", "Produto", "Tipo", "Qtd", "Obs", "ID", "
 # =========================
 titles = _sheet_titles()
 
-prod_df   = _load_df(ABA_PRODUTOS)
+prod_df    = _load_df(ABA_PRODUTOS)
 compras_df = _load_df(ABA_COMPRAS) if ABA_COMPRAS in titles else pd.DataFrame(columns=COMPRAS_HEADERS)
-mov_df    = _load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEADERS)
+mov_df     = _load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEADERS)
 
 # =========================
 # Normalizações
@@ -206,8 +221,8 @@ if COLP["nome"] is None:
     st.stop()
 
 base = prod_df.copy()
-base["__key"]    = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
-base["Produto"]  = base[COLP["nome"]]
+base["__key"]     = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
+base["Produto"]   = base[COLP["nome"]]
 base["IDProduto"] = base[COLP["id"]] if COLP["id"] else ""
 
 # Custo médio/atual (última compra)
@@ -216,7 +231,7 @@ for c in COMPRAS_HEADERS:
         compras_df[c] = ""
 if not compras_df.empty:
     compras_df["__key"]     = compras_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
-    compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_float_or_zero)
+    compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_num)  # 👈
     last_cost = compras_df.groupby("__key", as_index=False).tail(1)
     custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 else:
@@ -228,7 +243,7 @@ for c in MOV_HEADERS:
         mov_df[c] = ""
 if not mov_df.empty:
     mov_df["Tipo_norm"] = mov_df["Tipo"].apply(_norm_tipo)
-    mov_df["Qtd_num"]   = mov_df["Qtd"].apply(_to_float_or_zero)
+    mov_df["Qtd_num"]   = mov_df["Qtd"].apply(_to_num)  # 👈 preserva negativos
     mov_df["__key"]     = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
 
     def _sum_mov(tipo):
@@ -252,8 +267,8 @@ def _get(mapper, key):
     return float(mapper.get(key, 0.0))
 
 df["Entradas"] = df["__key"].apply(lambda k: _get(entradas_mov, k))
-df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov, k))
-df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov, k))
+df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov,   k))
+df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov,  k))
 
 df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
 df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
@@ -342,7 +357,7 @@ if salvar_s:
     if not prod_nome_s.strip() and not prod_id_s.strip():
         st.error("Selecione ou informe um produto.")
         st.stop()
-    q = _to_float_or_zero(qtd_s)
+    q = _to_num(qtd_s)  # 👈
     if q <= 0:
         st.error("Informe uma quantidade válida (> 0).")
         st.stop()
@@ -398,7 +413,7 @@ if salvar_a:
     if not prod_nome_a.strip() and not prod_id_a.strip():
         st.error("Selecione ou informe um produto.")
         st.stop()
-    qa = _to_float_or_zero(qtd_a)  # pode ser negativo
+    qa = _to_num(qtd_a)  # 👈 pode ser negativo
     if qa == 0:
         st.error("Informe uma quantidade diferente de zero.")
         st.stop()
