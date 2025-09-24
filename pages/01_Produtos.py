@@ -241,15 +241,31 @@ with cols[4]:
     view_cards = st.toggle("🖼️ Cards", value=default_view_cards, key="prod_view_cards")
 _set_qp(low=int(only_low), cards=int(view_cards))
 
-# Sliders persistentes
+# Sliders persistentes (default 240/250, mas ajustáveis)
 st.caption(f"{len(df)} item(ns) no total.")
 c1, c2, _ = st.columns([1.2, 1.2, 3])
-img_h_default     = _get_qp("img_h", st.session_state.get("prod_img_h", 160))
-min_card_w_default= _get_qp("minw",  st.session_state.get("prod_min_w", 220))
+
+# Semeia valores padrão na primeira visita
+try:
+    qps = dict(st.query_params)
+except Exception:
+    qps = st.experimental_get_query_params()
+
+if "prod_img_h" not in st.session_state:
+    st.session_state["prod_img_h"] = int((qps.get("img_h",[240])[0] if isinstance(qps.get("img_h"), list) else qps.get("img_h", 240)) or 240)
+if "prod_min_w" not in st.session_state:
+    st.session_state["prod_min_w"] = int((qps.get("minw",[250])[0] if isinstance(qps.get("minw"), list) else qps.get("minw", 250)) or 250)
+
+# Defaults vindos de URL (se houver) ou sessão (senão)
+img_h_default      = _get_qp("img_h", st.session_state.get("prod_img_h", 240))
+min_card_w_default = _get_qp("minw",  st.session_state.get("prod_min_w", 250))
+
 with c1:
     img_h = st.slider("📷 Foto (px)", 100, 300, int(img_h_default), 10, key="prod_img_h")
 with c2:
     min_card_w = st.slider("🧱 Largura mínima (px)", 180, 340, int(min_card_w_default), 10, key="prod_min_w")
+
+# Atualiza os query params para compartilhar o layout atual
 _set_qp(img_h=st.session_state["prod_img_h"], minw=st.session_state["prod_min_w"])
 
 # =========================
