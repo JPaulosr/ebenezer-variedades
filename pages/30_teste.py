@@ -162,6 +162,19 @@ COL = {
     "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
 }
 
+# ===== helpers de normalização para comparações =====
+def _norm_series(series: pd.Series) -> pd.Series:
+    # remove NBSP, espaços múltiplos e faz strip
+    return (series.astype(str)
+                  .str.replace("\u00A0", " ", regex=False)
+                  .str.replace("\xa0", " ", regex=False)
+                  .str.replace("\u2007", " ", regex=False)
+                  .str.replace("\u202F", " ", regex=False)
+                  .str.strip())
+
+def _eq(series: pd.Series, value: str) -> pd.Series:
+    return _norm_series(series).eq(str(value).strip())
+
 # ------- estoque atual (Compras - Vendas + Ajustes) -------
 def _estoque_atual(pid: str="", nome: str="") -> float:
     pid = (pid or "").strip(); nome = (nome or "").strip()
@@ -172,7 +185,9 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
             sub = df[filtro].copy()
             if sub.empty: return 0.0
             return pd.to_numeric(
-                sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+                sub[col_q].astype(str)
+                          .str.replace(".", "", regex=False)  # remove separador de milhar
+                          .str.replace(",", ".", regex=False),  # vírgula -> ponto
                 errors="coerce"
             ).fillna(0).sum()
         except Exception:
@@ -191,27 +206,29 @@ def _estoque_atual(pid: str="", nome: str="") -> float:
     c_nom = _pick_col(comp, ["Produto","Nome"])
     ent = 0.0
     if c_qtd:
-        if pid and c_pid: ent += _sum(comp, c_qtd, comp[c_pid].astype(str).str.strip()==pid)
+        if pid and c_pid: ent += _sum(comp, c_qtd, _eq(comp[c_pid], pid))
         if nome and c_nom:
-            ent += _sum(comp, c_qtd, (comp[c_nom].astype(str).str.strip()==nome) &
-                        (False if not c_pid else comp[c_pid].astype(str).str.strip().eq("").fillna(True)))
+            # só soma por nome quando não houver ID preenchido
+            filtro_nome = _eq(comp[c_nom], nome) & (_norm_series(comp.get(c_pid, "")) == "")
+            ent += _sum(comp, c_qtd, filtro_nome)
 
     # Vendas
     v_pid = _pick_col(vend, ["IDProduto","ProdutoID","ID"])
     v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
     sai = 0.0
     if v_qtd and v_pid and pid:
-        sai += _sum(vend, v_qtd, vend[v_pid].astype(str).str.strip()==pid)
+        sai += _sum(vend, v_qtd, _eq(vend[v_pid], pid))
 
-    # Ajustes
+    # Ajustes (agora prioriza IDProduto!)
     a_pid = _pick_col(ajus, ["IDProduto","ProdutoID","ID"])
     a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
     aj = 0.0
     if a_qtd:
-        if pid and a_pid: aj += _sum(ajus, a_qtd, ajus[a_pid].astype(str).str.strip()==pid)
+        if pid and a_pid:
+            aj += _sum(ajus, a_qtd, _eq(ajus[a_pid], pid))
         elif nome:
             an = _pick_col(ajus, ["Produto","Nome"])
-            if an: aj += _sum(ajus, a_qtd, ajus[an].astype(str).str.strip()==nome)
+            if an: aj += _sum(ajus, a_qtd, _eq(ajus[an], nome))
 
     return float(ent - sai + aj)
 
@@ -382,9 +399,9 @@ def _ultima_compra(pid: str, nome: str):
 
     df = comp.copy()
     if col_id:
-        df = df[df[col_id].astype(str).str.strip() == str(pid).strip()]
+        df = df[_eq(df[col_id], pid)]
     elif col_nome:
-        df = df[df[col_nome].astype(str).str.strip() == str(nome).strip()]
+        df = df[_eq(df[col_nome], nome)]
 
     if df.empty: return None
     if col_data and col_data in df.columns:
@@ -435,6 +452,43 @@ else:
         estoque_g = _estoque_atual(pid=gid, nome=gnome)
         st.caption(f"📦 Estoque atual (granel): {estoque_g if isinstance(estoque_g,(int,float)) else 0} L")
 
+        # 🔎 Debug rápido para ver o que está sendo somado
+        with st.expander("🔎 Debug do estoque (produto selecionado)"):
+            try:
+                comp = _load_df(COMPRAS_ABA, BUMP)
+                vend = _load_df(VENDAS_ABA,  BUMP)
+                ajus = _load_df(AJUSTES_ABA,  BUMP)
+            except Exception:
+                comp = vend = ajus = pd.DataFrame()
+
+            c_pid = _pick_col(comp, ["IDProduto","ProdutoID","ID"])
+            v_pid = _pick_col(vend, ["IDProduto","ProdutoID","ID"])
+            a_pid = _pick_col(ajus, ["IDProduto","ProdutoID","ID"])
+            c_qtd = _pick_col(comp, ["Qtd","Quantidade"])
+            v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
+            a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
+
+            ent = _estoque_atual(pid=gid, nome=gnome) + 0  # reusa cálculo
+            def _sum(df, col_q, filtro):
+                if df.empty or not col_q: return 0.0
+                sub = df[filtro].copy()
+                return pd.to_numeric(
+                    sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+                    errors="coerce"
+                ).fillna(0).sum()
+
+            ent_dbg = _sum(comp, c_qtd, _eq(comp[c_pid], gid)) if (not comp.empty and c_pid and c_qtd) else 0.0
+            sai_dbg = _sum(vend, v_qtd, _eq(vend[v_pid], gid)) if (not vend.empty and v_pid and v_qtd) else 0.0
+            aj_dbg  = _sum(ajus, a_qtd, _eq(ajus[a_pid], gid)) if (not ajus.empty and a_pid and a_qtd) else 0.0
+
+            st.write(f"Entradas (Compras): **{_fmt_num(ent_dbg,2)}**  ·  Saídas (Vendas): **{_fmt_num(sai_dbg,2)}**  ·  Ajustes: **{_fmt_num(aj_dbg,2)}**")
+            if not ajus.empty and a_pid:
+                st.caption("Últimos 10 ajustes deste produto:")
+                st.dataframe(
+                    ajus[_eq(ajus[a_pid], gid)].tail(10),
+                    use_container_width=True, hide_index=True
+                )
+
         info = _ultima_compra(gid, gnome)
         if info:
             st.caption(f"🧾 Última compra: {info['data']} · Qtd {info['qtd']} {info['unid']} · Custo unit {info['custo_unit']} · Total {info['total']}")
@@ -458,7 +512,7 @@ else:
 
         confirmar = st.button("Registrar fracionamento", use_container_width=True, key=f"btn_frac_{BUMP}")
 
-        # ====== NOVA LÓGICA: baixa via AJUSTES e entrada via COMPRAS ======
+        # ====== baixa via AJUSTES e entrada via COMPRAS ======
         if confirmar:
             if total_litros <= 0:
                 st.error("Informe quantidades > 0 para fracionar."); st.stop()
@@ -479,7 +533,6 @@ else:
             data_str = date.today().strftime("%d/%m/%Y")
 
             # ----- SAÍDA do granel -----
-            # (1) Ajuste (conta para o estoque)
             _append_row(ws_aj, {
                 "Data": data_str,
                 "IDProduto": gid,
@@ -488,7 +541,6 @@ else:
                 "Unidade": "L",
                 "Obs": "Fracionamento → baixa de granel"
             })
-            # (2) Movimento (auditoria)
             _append_row(ws_mov, {
                 "Data": data_str,
                 "IDProduto": gid,
@@ -503,11 +555,10 @@ else:
             })
 
             linhas = []
-
             def _brl(x: float) -> str:
                 return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
-            # ----- ENTRADA dos fracionados (gera custo médio) -----
+            # ----- ENTRADA fracionados -----
             if qtd_1 > 0:
                 r1 = df_un.iloc[idx_1]
                 id1 = _nz(r1.get(COL_ID,"")); nm1 = _nz(r1.get(COL_NOME,""))
