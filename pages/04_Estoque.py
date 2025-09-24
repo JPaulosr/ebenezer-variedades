@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-# pages/04_estoque.py — Estoque (MovimentosEstoque como fonte única) + busca + auto-refresh
+# pages/04_estoque.py — Estoque (MovimentosEstoque como fonte única) + busca + auto-refresh (UI moderna com cards)
 
 import json, unicodedata as _ud, re
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import streamlit as st
 import pandas as pd
@@ -11,12 +12,34 @@ from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 
 # =========================
-# UI
+# UI BASE / TEMA
 # =========================
 st.set_page_config(page_title="Estoque — Movimentos & Ajustes", page_icon="📦", layout="wide")
-st.title("📦 Estoque — Movimentos & Ajustes")
 
-# ---------- refresh automático (limpa cache 1x ao abrir a página) ----------
+st.markdown("""
+<style>
+:root{
+  --bg: rgba(255,255,255,.03);
+  --bg2: rgba(255,255,255,.06);
+  --borda: rgba(255,255,255,.12);
+  --muted: rgba(255,255,255,.65);
+  --ok: #22c55e; --warn:#f59e0b; --err:#ef4444; --info:#3b82f6;
+}
+.block-container { padding-top: 1.2rem; }
+.kpi{border:1px solid var(--borda); background:var(--bg); padding:1rem 1.1rem; border-radius:16px;}
+.kpi h3{margin:.2rem 0 .6rem 0; font-size:1.05rem; color:var(--muted); font-weight:600}
+.kpi .big{font-size:1.8rem; font-weight:800; line-height:1.1}
+.kpi .sub{font-size:.9rem; color:var(--muted)}
+.card{border:1px solid var(--borda); background:var(--bg); padding:1rem; border-radius:16px; margin:.4rem 0 1rem 0;}
+.card h3{margin:0 0 .6rem 0}
+.badge{display:inline-block; padding:.15rem .5rem; border-radius:999px; border:1px solid var(--borda); background:var(--bg2); font-size:.78rem; color:var(--muted)}
+.small{color:var(--muted); font-size:.86rem}
+.stDataFrame{border-radius:14px; overflow:hidden; border:1px solid var(--borda);}
+hr{border:0; border-top:1px solid var(--borda); margin:1rem 0}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- refresh automático ----------
 if st.session_state.pop("_first_load_estoque", True):
     st.cache_data.clear()
 st.session_state.setdefault("_first_load_estoque", False)
@@ -44,36 +67,57 @@ def _load_sa() -> dict:
 
 @st.cache_resource
 def _client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
     return gspread.authorize(creds)
 
+# ---- PATCH: abrir planilha com mensagens claras (URL/Permissão) ----
 @st.cache_resource
 def _sheet():
     gc = _client()
     url_or_id = st.secrets.get("PLANILHA_URL")
     if not url_or_id:
-        st.error("🛑 Segredo PLANILHA_URL ausente.")
+        st.error("🛑 Segredo PLANILHA_URL ausente em st.secrets.")
         st.stop()
-    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
+    try:
+        sh = gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
+        return sh
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error("🛑 Planilha não encontrada. Verifique o ID/URL em PLANILHA_URL.")
+        st.stop()
+    except gspread.exceptions.APIError as e:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
+        st.error(f"🛑 Sem acesso à planilha (provável 403). Compartilhe a planilha com: **{client_email}** (Editor).")
+        st.caption(f"Detalhe técnico: {e}")
+        st.stop()
 
 @st.cache_resource
 def _sheet_titles() -> set[str]:
     try:
         return {ws.title for ws in _sheet().worksheets()}
-    except Exception:
+    except gspread.exceptions.APIError as e:
+        st.error("Falha ao listar abas da planilha. Verifique permissões.")
+        st.caption(f"Detalhe técnico: {e}")
         return set()
 
-# ↓ TTL curto: sempre que entrar na página, recarrega "fresco"
+# ---- PATCH: carregamento de aba à prova de erro ----
 @st.cache_data(ttl=1, show_spinner=False)
 def _load_df(aba: str) -> pd.DataFrame:
-    ws = _sheet().worksheet(aba)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df.fillna("")
+    """Carrega uma aba e devolve DataFrame; se não existir, devolve vazio sem quebrar o app."""
+    try:
+        ws = _sheet().worksheet(aba)
+        df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+        df.columns = [c.strip() for c in df.columns]
+        return df.fillna("")
+    except gspread.exceptions.WorksheetNotFound:
+        return pd.DataFrame().fillna("")
+    except gspread.exceptions.APIError as e:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
+        st.error(f"🛑 Erro de acesso ao Sheets. Compartilhe a planilha com **{client_email}** e confira PLANILHA_URL.")
+        st.caption(f"Aba pedida: {aba} • Detalhe técnico: {e}")
+        st.stop()
 
 def _ensure_ws(name: str, headers: list[str]):
     sh = _sheet()
@@ -104,264 +148,265 @@ def _append_row(ws, row: dict):
 # Utilidades
 # =========================
 def _to_num(x) -> float:
-    """Converte para float preservando negativos.
-       Suporta: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
-    if x is None:
-        return 0.0
+    """Converte para float preservando negativos; aceita vírgula, R$, (6) etc."""
+    if x is None: return 0.0
     s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"):
-        return 0.0
-    s = s.replace("−", "-")            # unicode minus -> ascii
+    if s == "" or s.lower() in ("nan","none"): return 0.0
+    s = s.replace("−","-")
     neg_paren = s.startswith("(") and s.endswith(")")
-    if neg_paren:
-        s = s[1:-1]
-
-    s = s.replace("R$", "").replace(" ", "")
-    if "," in s:
-        s = s.replace(".", "")         # remove milhar
-        s = s.replace(",", ".")        # vírgula -> ponto
-
-    s = re.sub(r"(?<!^)-", "", s)      # remove '-' fora do início
-    s = re.sub(r"[^0-9.\-]", "", s)
-    if s.count("-") > 1:
-        s = "-" + s.replace("-", "")
-    if s.count(".") > 1:
-        parts = s.split(".")
-        s = "".join(parts[:-1]) + "." + parts[-1]
-
-    try:
-        v = float(s)
-    except:
-        v = 0.0
-    if neg_paren:
-        v = -abs(v)
-    return v  # 👈 usar esta função em TODO parser numérico
+    if neg_paren: s = s[1:-1]
+    s = s.replace("R$","").replace(" ","")
+    if "," in s: s = s.replace(".","").replace(",",".")
+    s = re.sub(r"(?<!^)-","",s)
+    s = re.sub(r"[^0-9.\-]","",s)
+    try: v=float(s)
+    except: v=0.0
+    if neg_paren: v=-abs(v)
+    return v
 
 def _nz(x):
-    if x is None:
-        return ""
+    if x is None: return ""
     try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-    s = str(x).strip()
-    return "" if s.lower() in ("nan", "none") else s
+        if pd.isna(x): return ""
+    except: pass
+    s=str(x).strip()
+    return "" if s.lower() in ("nan","none") else s
 
 def _strip_accents_low(s: str) -> str:
-    s = _ud.normalize("NFKD", str(s or ""))
-    s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
+    s=_ud.normalize("NFKD", str(s or ""))
+    s="".join(ch for ch in s if _ud.category(ch)!="Mn")
     return s.lower().strip()
 
 def _norm_tipo(t: str) -> str:
-    """
-    Normaliza o campo Tipo em:
-      - 'entrada'  (compra, estorno, fracionamento +)
-      - 'saida'    (venda, baixa, fracionamento -)
-      - 'ajuste'   (ajuste)
-      - 'outro'
-    """
-    raw = str(t or "")
-    low = _strip_accents_low(raw)
-
-    # Trata fracionamento primeiro (olha o sinal no texto bruto)
+    raw=str(t or ""); low=_strip_accents_low(raw)
     if "fracion" in low:
-        if "+" in raw:
-            return "entrada"
-        if "-" in raw:
-            return "saida"
+        if "+" in raw: return "entrada"
+        if "-" in raw: return "saida"
         return "outro"
-
-    low_clean = re.sub(r"[^a-z]", "", low)
-    if "entrada" in low_clean or "compra" in low_clean or "estorno" in low_clean:
-        return "entrada"
-    if "saida" in low_clean or "venda" in low_clean or "baixa" in low_clean:
-        return "saida"
-    if "ajuste" in low_clean:
-        return "ajuste"
+    low_clean=re.sub(r"[^a-z]","",low)
+    if "entrada" in low_clean or "compra" in low_clean or "estorno" in low_clean: return "entrada"
+    if "saida" in low_clean or "venda" in low_clean or "baixa" in low_clean: return "saida"
+    if "ajuste" in low_clean: return "ajuste"
     return "outro"
 
 def _prod_key_from(prod_id, prod_nome):
-    """Chave de produto priorizando ID; se não houver, usa nome normalizado."""
-    pid = _nz(prod_id)
-    if pid:
-        return pid
-    return f"nm:{_strip_accents_low(_nz(prod_nome))}"
+    pid=_nz(prod_id)
+    return pid if pid else f"nm:{_strip_accents_low(_nz(prod_nome))}"
 
 # =========================
 # Abas & Headers
 # =========================
-ABA_PRODUTOS = "Produtos"
-ABA_COMPRAS  = "Compras"            # só para custo médio
-ABA_MOV      = "MovimentosEstoque"  # FONTE ÚNICA de quantidades
-ABA_VENDAS   = "Vendas"             # não usamos para quantidade (evita duplicar)
+ABA_PRODUTOS="Produtos"
+ABA_COMPRAS="Compras"             # só para custo
+ABA_MOV="MovimentosEstoque"       # FONTE ÚNICA de quantidades
+ABA_VENDAS="Vendas"
 
-COMPRAS_HEADERS = ["Data", "Produto", "Unidade", "Fornecedor", "Qtd", "Custo Unitário", "Total", "IDProduto", "Obs"]
-MOV_HEADERS     = ["Data", "IDProduto", "Produto", "Tipo", "Qtd", "Obs", "ID", "Documento/NF", "Origem", "SaldoApós"]
+COMPRAS_HEADERS=["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
+MOV_HEADERS=["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"]
 
 # =========================
 # Carregar bases
 # =========================
-titles = _sheet_titles()
-
-prod_df    = _load_df(ABA_PRODUTOS)
-compras_df = _load_df(ABA_COMPRAS) if ABA_COMPRAS in titles else pd.DataFrame(columns=COMPRAS_HEADERS)
-mov_df     = _load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEADERS)
+titles=_sheet_titles()
+prod_df=_load_df(ABA_PRODUTOS)
+compras_df=_load_df(ABA_COMPRAS) if ABA_COMPRAS in titles else pd.DataFrame(columns=COMPRAS_HEADERS)
+mov_df=_load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEADERS)
 
 # =========================
 # Normalizações
 # =========================
-# Produtos
-COLP = {
-    "id":   next((c for c in ["ID", "Id", "id", "Codigo", "Código", "SKU"] if c in prod_df.columns), None),
-    "nome": next((c for c in ["Nome", "Produto", "Descrição", "Descricao"] if c in prod_df.columns), None),
+COLP={
+    "id":   next((c for c in ["ID","Id","id","Codigo","Código","SKU"] if c in prod_df.columns),None),
+    "nome": next((c for c in ["Nome","Produto","Descrição","Descricao"] if c in prod_df.columns),None),
 }
 if COLP["nome"] is None:
-    st.error("Aba **Produtos** precisa ter uma coluna de nome (ex.: Nome/Produto/Descrição).")
+    st.error("Aba **Produtos** precisa ter coluna de nome.")
     st.stop()
 
-base = prod_df.copy()
-base["__key"]     = base.apply(lambda r: _prod_key_from(r.get(COLP["id"], ""), r.get(COLP["nome"], "")), axis=1)
-base["Produto"]   = base[COLP["nome"]]
-base["IDProduto"] = base[COLP["id"]] if COLP["id"] else ""
+base=prod_df.copy()
+base["__key"]=base.apply(lambda r:_prod_key_from(r.get(COLP["id"],""), r.get(COLP["nome"],"")),axis=1)
+base["Produto"]=base[COLP["nome"]]
+base["IDProduto"]=base[COLP["id"]] if COLP["id"] else ""
 
-# Custo médio/atual (última compra)
+# custo atual (última compra por chave)
 for c in COMPRAS_HEADERS:
-    if c not in compras_df.columns:
-        compras_df[c] = ""
+    if c not in compras_df.columns: compras_df[c]=""
 if not compras_df.empty:
-    compras_df["__key"]     = compras_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
-    compras_df["Custo_num"] = compras_df["Custo Unitário"].apply(_to_num)  # 👈
-    last_cost = compras_df.groupby("__key", as_index=False).tail(1)
-    custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
+    compras_df["__key"]=compras_df.apply(lambda r:_prod_key_from(r.get("IDProduto",""), r.get("Produto","")),axis=1)
+    compras_df["Custo_num"]=compras_df["Custo Unitário"].apply(_to_num)
+    last_cost=compras_df.groupby("__key",as_index=False).tail(1)
+    custo_atual_map=dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 else:
-    custo_atual_map = {}
+    custo_atual_map={}
 
-# Movimentos — FONTE ÚNICA DE QUANTIDADES
+# movimentos
 for c in MOV_HEADERS:
-    if c not in mov_df.columns:
-        mov_df[c] = ""
+    if c not in mov_df.columns: mov_df[c]=""
 if not mov_df.empty:
-    mov_df["Tipo_norm"] = mov_df["Tipo"].apply(_norm_tipo)
-    mov_df["Qtd_num"]   = mov_df["Qtd"].apply(_to_num)  # 👈 preserva negativos
-    mov_df["__key"]     = mov_df.apply(lambda r: _prod_key_from(r.get("IDProduto", ""), r.get("Produto", "")), axis=1)
-
+    mov_df["Tipo_norm"]=mov_df["Tipo"].apply(_norm_tipo)
+    mov_df["Qtd_num"]=mov_df["Qtd"].apply(_to_num)
+    mov_df["__key"]=mov_df.apply(lambda r:_prod_key_from(r.get("IDProduto",""), r.get("Produto","")),axis=1)
     def _sum_mov(tipo):
-        m = mov_df[mov_df["Tipo_norm"] == tipo]
-        if m.empty:
-            return {}
-        return m.groupby("__key")["Qtd_num"].sum().to_dict()
-
-    entradas_mov = _sum_mov("entrada")
-    saidas_mov   = _sum_mov("saida")
-    ajustes_mov  = _sum_mov("ajuste")
+        m=mov_df[mov_df["Tipo_norm"]==tipo]
+        return {} if m.empty else m.groupby("__key")["Qtd_num"].sum().to_dict()
+    entradas_mov=_sum_mov("entrada"); saidas_mov=_sum_mov("saida"); ajustes_mov=_sum_mov("ajuste")
 else:
-    entradas_mov, saidas_mov, ajustes_mov = {}, {}, {}
+    entradas_mov,saidas_mov,ajustes_mov={},{},{}
 
 # =========================
-# Consolidação Estoque (somente MOVIMENTOS)
+# Consolidação
 # =========================
-df = base[["__key", "Produto", "IDProduto"]].copy()
+df=base[["__key","Produto","IDProduto"]].copy()
+def _get(mapper,key): return float(mapper.get(key,0.0))
+df["Entradas"]=df["__key"].apply(lambda k:_get(entradas_mov,k))
+df["Saidas"]=df["__key"].apply(lambda k:_get(saidas_mov,k))
+df["Ajustes"]=df["__key"].apply(lambda k:_get(ajustes_mov,k))
+df["EstoqueAtual"]=df["Entradas"]-df["Saidas"]+df["Ajustes"]
+df["CustoAtual"]=df["__key"].apply(lambda k:float(custo_atual_map.get(k,0.0)))
+df["ValorTotal"]=(df["EstoqueAtual"].astype(float)*df["CustoAtual"].astype(float)).round(2)
 
-def _get(mapper, key):
-    return float(mapper.get(key, 0.0))
+# =========================
+# HEADER
+# =========================
+left,right=st.columns([0.7,0.3])
+with left:
+    st.markdown("<h1>📦 Estoque — Movimentos & Ajustes</h1>",unsafe_allow_html=True)
+    st.markdown(f"<div class='small'>Fonte única: <b>{ABA_MOV}</b> • Atualizado: <code>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</code></div>",unsafe_allow_html=True)
+with right:
+    if Path("pages/03_Compras_Produtos_Entradas.py").exists():
+        st.page_link("pages/03_Compras_Produtos_Entradas.py", label="🧾 Registrar Compras / Entradas", icon="🧾")
+    if Path("pages/01_Produtos.py").exists():
+        st.page_link("pages/01_Produtos.py", label="📦 Ir ao Catálogo", icon="📦")
 
-df["Entradas"] = df["__key"].apply(lambda k: _get(entradas_mov, k))
-df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov,   k))
-df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov,  k))
+st.markdown("<div class='badge'>Consolidação por movimentos (Entradas - Saídas + Ajustes)</div>", unsafe_allow_html=True)
+st.markdown("<hr/>", unsafe_allow_html=True)
 
-df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
-df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
-df["ValorTotal"]   = (df["EstoqueAtual"].astype(float) * df["CustoAtual"].astype(float)).round(2)
+# ------ Painel de diagnóstico (ajuda a resolver 403/URL) ------
+with st.expander("🧩 Diagnóstico de Conexão com Google Sheets"):
+    try:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email", ""))
+        st.write("**Service Account:**", client_email)
+        st.write("**PLANILHA_URL:**", st.secrets.get("PLANILHA_URL"))
+        try:
+            sh = _sheet()
+            st.write("**Título da planilha:**", getattr(sh, "title", "(desconhecido)"))
+            st.write("**Abas disponíveis:**", sorted(list(_sheet_titles())) or "(nenhuma)")
+        except Exception as e:
+            st.warning(f"Falha ao abrir planilha: {e}")
+    except Exception as e:
+        st.error(f"Não foi possível ler os segredos. Erro: {e}")
 
 # =========================
 # Busca / Filtros
 # =========================
-st.subheader("Tabela de Estoque")
-cBusca, cLow = st.columns([3, 1])
+cBusca, cLow, cThr, cExp = st.columns([3,1.1,1.1,1])
 with cBusca:
     termo = st.text_input("🔎 Buscar", placeholder="Nome ou ID do produto...")
 with cLow:
-    only_low = st.checkbox("Somente baixo estoque (≤ 0)", value=False)
+    only_low = st.checkbox("Somente baixo estoque", value=False)
+with cThr:
+    low_thr = st.number_input("Limiar (≤)", value=0, step=1)
+with cExp:
+    exportar = st.button("⬇️ Exportar CSV")
 
-mask = pd.Series([True] * len(df))
+mask = pd.Series([True]*len(df))
 if termo.strip():
-    t = _strip_accents_low(termo)
+    t=_strip_accents_low(termo)
     by_nome = df["Produto"].astype(str).apply(_strip_accents_low).str.contains(t)
     by_id   = df["IDProduto"].astype(str).str.contains(termo.strip(), case=False, na=False)
     mask &= (by_nome | by_id)
 if only_low:
-    mask &= (df["EstoqueAtual"] <= 0)
+    mask &= (df["EstoqueAtual"] <= float(low_thr))
 
 df_view = df[mask].copy()
 
 # =========================
-# Cards + Tabela
+# CARDS (KPIs)
 # =========================
-c1, c2, c3 = st.columns(3)
+c1,c2,c3,c4 = st.columns(4)
 with c1:
-    st.metric("🧮 Itens com estoque > 0", int((df_view["EstoqueAtual"] > 0).sum()))
+    st.markdown(f"<div class='kpi'><h3>Itens cadastrados</h3><div class='big'>{len(df):,}</div><div class='sub'>Total em Produtos</div></div>".replace(",", "."), unsafe_allow_html=True)
 with c2:
-    st.metric("📦 Quantidade total em estoque", f"{df_view['EstoqueAtual'].sum():.0f}")
+    st.markdown(f"<div class='kpi'><h3>Com estoque &gt; 0</h3><div class='big'>{int((df_view['EstoqueAtual']>0).sum()):,}</div><div class='sub'>Filtrados</div></div>".replace(",", "."), unsafe_allow_html=True)
 with c3:
-    st.metric("💰 Valor total (R$)", f"R$ {df_view['ValorTotal'].sum():.2f}")
+    st.markdown(f"<div class='kpi'><h3>Qtd total</h3><div class='big'>{df_view['EstoqueAtual'].sum():.0f}</div><div class='sub'>Entradas - Saídas + Ajustes</div></div>", unsafe_allow_html=True)
+with c4:
+    vtotal=(df_view['EstoqueAtual']*df_view['CustoAtual']).sum()
+    st.markdown(f"<div class='kpi'><h3>Valor total (R$)</h3><div class='big'>R$ {vtotal:,.2f}</div><div class='sub'>Estoque x custo</div></div>".replace(",", "X").replace(".", ",").replace("X","."), unsafe_allow_html=True)
 
-cols_show = ["IDProduto", "Produto", "Entradas", "Saidas", "Ajustes", "EstoqueAtual", "CustoAtual", "ValorTotal"]
+# =========================
+# TABELA
+# =========================
+cols_show=["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
 for c in cols_show:
     if c not in df_view.columns:
-        df_view[c] = 0 if c not in ("IDProduto", "Produto") else ""
-st.dataframe(df_view[cols_show].sort_values("Produto"), use_container_width=True, hide_index=True)
+        df_view[c]=0 if c not in ("IDProduto","Produto") else ""
 
+dfv=df_view[cols_show].copy()
+dfv["Entradas"]=dfv["Entradas"].astype(float).round(2)
+dfv["Saidas"]=dfv["Saidas"].astype(float).round(2)
+dfv["Ajustes"]=dfv["Ajustes"].astype(float).round(2)
+dfv["EstoqueAtual"]=dfv["EstoqueAtual"].astype(float).round(2)
+dfv["CustoAtual"]=dfv["CustoAtual"].astype(float).round(2)
+dfv["ValorTotal"]=(df_view["EstoqueAtual"].astype(float)*df_view["CustoAtual"].astype(float)).round(2)
+
+st.markdown("<div class='card'><h3>📊 Tabela de Estoque</h3>", unsafe_allow_html=True)
+st.dataframe(dfv.sort_values("Produto"), use_container_width=True, hide_index=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if exportar:
+    csv = dfv.sort_values("Produto").to_csv(index=False, sep=";").encode("utf-8-sig")
+    st.download_button("Baixar CSV (utf-8)", data=csv, file_name="estoque.csv", mime="text/csv")
+
+# =========================
+# Últimos movimentos (debug)
+# =========================
 with st.expander("🧾 Últimos movimentos (debug)"):
     if mov_df.empty:
         st.caption("Sem movimentos ainda.")
     else:
-        dbg_cols = [c for c in ["Data", "Produto", "IDProduto", "Tipo", "Qtd", "Tipo_norm"] if c in mov_df.columns]
+        dbg_cols=[c for c in ["Data","Produto","IDProduto","Tipo","Qtd","Tipo_norm"] if c in mov_df.columns]
         st.dataframe(mov_df[dbg_cols].tail(30), use_container_width=True, hide_index=True)
 
-st.divider()
+st.markdown("<hr/>", unsafe_allow_html=True)
 
 # =========================
-# FORM: Registrar Saída (baixa manual)
+# FORM: Saída
 # =========================
-st.subheader("➖ Registrar Saída / Baixa de Estoque")
+st.markdown("<div class='card'><h3>➖ Registrar Saída / Baixa de Estoque</h3>", unsafe_allow_html=True)
 with st.form("form_saida"):
     usar_lista_s = st.checkbox("Selecionar produto da lista", value=True, key="saida_lista")
-    df_select = df_view if usar_lista_s and not df_view.empty else df  # usa filtro da busca
+    df_select = df_view if usar_lista_s and not df_view.empty else df
     if usar_lista_s:
         if df_select.empty:
             st.warning("Sem produtos para saída.")
+            st.form_submit_button("Registrar saída", disabled=True)
             st.stop()
-
         def _fmt_saida(i):
-            r = df_select.iloc[i]
+            r=df_select.iloc[i]
             return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
-
         idx = st.selectbox("Produto", options=range(len(df_select)), format_func=_fmt_saida)
         row = df_select.iloc[idx]
-        prod_nome_s = _nz(row["Produto"])
-        prod_id_s   = _nz(row["IDProduto"])
+        prod_nome_s=_nz(row["Produto"]); prod_id_s=_nz(row["IDProduto"])
     else:
         prod_nome_s = st.text_input("Produto (nome exato)", key="saida_nome")
         prod_id_s   = st.text_input("ID (opcional)", key="saida_id")
-
-    csa, csb = st.columns(2)
-    with csa:
-        data_s = st.date_input("Data da saída", value=date.today(), key="saida_data")
-    with csb:
-        qtd_s = st.text_input("Qtd", placeholder="Ex.: 2", key="saida_qtd")
+    csa,csb=st.columns(2)
+    with csa: data_s = st.date_input("Data da saída", value=date.today(), key="saida_data")
+    with csb: qtd_s  = st.text_input("Qtd", placeholder="Ex.: 2", key="saida_qtd")
     obs_s = st.text_input("Observações (opcional)", key="saida_obs")
-    salvar_s = st.form_submit_button("Registrar saída")
+    salvar_s = st.form_submit_button("Registrar saída", use_container_width=True)
 
-if salvar_s:
+if 'salvar_s' in locals() and salvar_s:
     if not prod_nome_s.strip() and not prod_id_s.strip():
         st.error("Selecione ou informe um produto.")
         st.stop()
-    q = _to_num(qtd_s)  # 👈
-    if q <= 0:
+    q=_to_num(qtd_s)
+    if q<=0:
         st.error("Informe uma quantidade válida (> 0).")
         st.stop()
-    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
+    ws_mov=_ensure_ws(ABA_MOV, MOV_HEADERS)
     _append_row(ws_mov, {
         "Data": data_s.strftime("%d/%m/%Y"),
         "IDProduto": _nz(prod_id_s),
@@ -374,50 +419,44 @@ if salvar_s:
     st.toast("Saída lançada", icon="➖")
     st.cache_data.clear()
 
-st.divider()
+st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# FORM: Registrar Ajuste
+# FORM: Ajuste
 # =========================
-st.subheader("🛠️ Registrar Ajuste de Estoque")
+st.markdown("<div class='card'><h3>🛠️ Registrar Ajuste de Estoque</h3>", unsafe_allow_html=True)
 with st.form("form_ajuste"):
     usar_lista_a = st.checkbox("Selecionar produto da lista", value=True, key="ajuste_lista")
     df_select = df_view if usar_lista_a and not df_view.empty else df
     if usar_lista_a:
         if df_select.empty:
             st.warning("Sem produtos para ajuste.")
+            st.form_submit_button("Registrar ajuste", disabled=True)
             st.stop()
-
         def _fmt_aj(i):
-            r = df_select.iloc[i]
+            r=df_select.iloc[i]
             return f"{_nz(r['Produto'])} — Estq: {int(float(r['EstoqueAtual']))}"
-
         idxa = st.selectbox("Produto", options=range(len(df_select)), format_func=_fmt_aj, key="ajuste_idx")
         rowa = df_select.iloc[idxa]
-        prod_nome_a = _nz(rowa["Produto"])
-        prod_id_a   = _nz(rowa["IDProduto"])
+        prod_nome_a=_nz(rowa["Produto"]); prod_id_a=_nz(rowa["IDProduto"])
     else:
         prod_nome_a = st.text_input("Produto (nome exato)", key="ajuste_nome")
         prod_id_a   = st.text_input("ID (opcional)", key="ajuste_id")
-
-    ca1, ca2 = st.columns(2)
-    with ca1:
-        data_a = st.date_input("Data do ajuste", value=date.today(), key="ajuste_data")
-    with ca2:
-        qtd_a = st.text_input("Qtd (use negativo para baixar, positivo para repor)", placeholder="Ex.: -1 ou 5", key="ajuste_qtd")
-
+    ca1,ca2=st.columns(2)
+    with ca1: data_a = st.date_input("Data do ajuste", value=date.today(), key="ajuste_data")
+    with ca2: qtd_a  = st.text_input("Qtd (use negativo para baixar, positivo para repor)", placeholder="Ex.: -1 ou 5", key="ajuste_qtd")
     obs_a = st.text_input("Motivo/Observações", key="ajuste_obs")
-    salvar_a = st.form_submit_button("Registrar ajuste")
+    salvar_a = st.form_submit_button("Registrar ajuste", use_container_width=True)
 
-if salvar_a:
+if 'salvar_a' in locals() and salvar_a:
     if not prod_nome_a.strip() and not prod_id_a.strip():
         st.error("Selecione ou informe um produto.")
         st.stop()
-    qa = _to_num(qtd_a)  # 👈 pode ser negativo
-    if qa == 0:
+    qa=_to_num(qtd_a)
+    if qa==0:
         st.error("Informe uma quantidade diferente de zero.")
         st.stop()
-    ws_mov = _ensure_ws(ABA_MOV, MOV_HEADERS)
+    ws_mov=_ensure_ws(ABA_MOV, MOV_HEADERS)
     _append_row(ws_mov, {
         "Data": data_a.strftime("%d/%m/%Y"),
         "IDProduto": _nz(prod_id_a),
@@ -430,6 +469,9 @@ if salvar_a:
     st.toast("Ajuste lançado", icon="🛠️")
     st.cache_data.clear()
 
-st.divider()
-st.page_link("pages/03_compras_entradas.py", label="🧾 Registrar Compras / Entradas", icon="🧾")
-st.page_link("pages/01_produtos.py", label="📦 Ir ao Catálogo", icon="📦")
+st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# Rodapé
+# =========================
+st.markdown("<div class='small'>Dica: ajuste o <b>Limiar (≤)</b> para destacar baixo estoque e use a busca por nome/ID.</div>", unsafe_allow_html=True)
