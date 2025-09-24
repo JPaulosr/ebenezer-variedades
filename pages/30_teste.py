@@ -1,4 +1,4 @@
-# pages/01_produtos.py — Catálogo de Produtos (estoque via MovimentosEstoque) — versão com Cards estilizados
+# pages/01_produtos.py — Catálogo de Produtos (estoque via MovimentosEstoque) — Dark Cards
 # -*- coding: utf-8 -*-
 import json, unicodedata as _ud, re
 import streamlit as st
@@ -65,7 +65,8 @@ def _to_num(x) -> float:
     s = re.sub(r"(?<!^)-", "", s)
     s = re.sub(r"[^0-9.\-]", "", s)
     if s.count("-") > 1: s = "-" + s.replace("-", "")
-    if s.count(".") > 1: p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
+    if s.count(".") > 1: 
+        p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
     try: v = float(s)
     except: v = 0.0
     if neg_paren: v = -abs(v)
@@ -222,14 +223,16 @@ if view_cards:
 
     css=f"""
     <style>
-    body{{margin:0;font-family:sans-serif;color:#111}}
+    body{{margin:0;font-family:sans-serif;color:#fff;background:#000}}
     .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax({min_card_w}px,1fr));gap:12px}}
-    .card{{border:1px solid #ddd;border-radius:12px;overflow:hidden;background:#fff}}
-    .img{{width:100%;height:{img_h}px;object-fit:contain;background:#f9f9f9}}
-    .body{{padding:8px}}
-    .title{{font-weight:600;font-size:.9rem;margin-bottom:4px}}
-    .meta{{font-size:.75rem;color:#555}}
-    .badge{{font-size:.7rem;padding:2px 6px;border-radius:6px;border:1px solid #ccc;margin-right:4px}}
+    .card{{border:1px solid #333;border-radius:12px;overflow:hidden;background:#111;color:#fff}}
+    .img{{width:100%;height:{img_h}px;object-fit:contain;background:#000}}
+    .body{{padding:10px}}
+    .title{{font-weight:600;font-size:.95rem;margin-bottom:4px;color:#fff}}
+    .meta{{font-size:.8rem;color:#ccc}}
+    .badge{{font-size:.75rem;padding:2px 6px;border-radius:6px;margin-right:4px;color:#fff}}
+    .badge.low{{background:#ef4444}}
+    .badge.ok{{background:#22c55e}}
     </style>
     """
     html=[css,"<div class='grid'>"]
@@ -238,12 +241,15 @@ if view_cards:
         pid=_nz(r.get("IDProduto",""))
         img=_nz(r.get("ImagemURL","")) or PLACEHOLDER
         estq=_to_num(r.get("EstoqueAtual",0))
+        estq_min=_to_num(r.get(col_estq_min,0)) if col_estq_min else 0
+        badge=f"<span class='badge {'low' if estq<=estq_min else 'ok'}'>Estoque: {estq}</span>"
         html.append(f"""
         <div class='card'>
           <img class='img' src='{img}' alt='{nome}'>
           <div class='body'>
             <div class='title'>{nome}</div>
-            <div class='meta'>#{pid} • Estoque: {estq}</div>
+            <div class='meta'>#{pid}</div>
+            {badge}
           </div>
         </div>
         """)
