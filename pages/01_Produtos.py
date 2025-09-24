@@ -58,16 +58,42 @@ def _first_col(df: pd.DataFrame, cands: list[str]) -> str | None:
     return None
 
 def _to_num(x) -> float:
-    if x is None: return 0.0
+    """Converte string/num para float preservando sinal negativo.
+       Suporta: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
+    if x is None:
+        return 0.0
     s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("R$","").replace(" ","")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.]", "", s)
+    if s == "" or s.lower() in ("nan","none"):
+        return 0.0
+
+    # Normaliza variações de 'menos' e parênteses negativos
+    s = s.replace("−", "-")  # unicode minus -> ascii
+    neg_paren = False
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+        neg_paren = True
+
+    s = s.replace("R$", "").replace(" ", "")
+    if "," in s:
+        s = s.replace(".", "")   # remove separador de milhar
+        s = s.replace(",", ".")  # vírgula -> ponto decimal
+
+    # Mantém dígitos, 1 ponto, e um '-' apenas no início
+    s = re.sub(r"(?<!^)-", "", s)      # remove '-' fora do início
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s.count("-") > 1:
+        s = "-" + s.replace("-", "")
     if s.count(".") > 1:
         p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
-    try: return float(s)
-    except: return 0.0
+
+    try:
+        v = float(s)
+    except:
+        v = 0.0
+
+    if neg_paren:
+        v = -abs(v)
+    return v
 
 def _strip_accents_low(s: str) -> str:
     s = _ud.normalize("NFKD", str(s or ""))
@@ -78,7 +104,7 @@ def _norm_tipo(t: str) -> str:
     """
     'entrada'  (compra, estorno, fracionamento +)
     'saida'    (venda, baixa, fracionamento -)
-    'ajuste'   (ajuste)
+    'ajuste'   (ajuste; contagem/inventário)
     """
     raw = str(t or "")
     low = _strip_accents_low(raw)
@@ -89,7 +115,7 @@ def _norm_tipo(t: str) -> str:
     lowc = re.sub(r"[^a-z]", "", low)
     if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
     if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
-    if "ajuste"  in lowc: return "ajuste"
+    if "ajuste"  in lowc or "contagem" in lowc or "inventario" in lowc: return "ajuste"
     return "outro"
 
 def _nz(x):
@@ -159,7 +185,7 @@ for c in ["Tipo","Qtd","IDProduto","Produto"]:
 
 if not df_mov.empty:
     df_mov["Tipo_norm"] = df_mov["Tipo"].apply(_norm_tipo)
-    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)
+    df_mov["Qtd_num"]   = df_mov["Qtd"].map(_to_num)   # 👈 agora preserva negativos
     df_mov["__key"]     = df_mov.apply(lambda r: _prod_key_from(r.get("IDProduto",""), r.get("Produto","")), axis=1)
 
     def _sum_mov(tipo):
@@ -224,22 +250,30 @@ with c2:
         forn = "(todos)"
 
 # junta info de categoria/fornecedor para filtro (sem poluir a saída)
-df = df.merge(df_prod[[col_id, col_nome, col_cat, col_forn]] if col_id else df_prod[[col_nome, col_cat, col_forn]],
-              left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left")
+df = df.merge(
+    df_prod[[col_id, col_nome, col_cat, col_forn]] if col_id else df_prod[[col_nome, col_cat, col_forn]],
+    left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left"
+)
 
 mask = pd.Series(True, index=df.index)
 if termo:
     t = termo.lower()
-    mask &= df.apply(lambda r: t in " ".join([str(x).lower() for x in [r.get("IDProduto",""), r.get("Produto",""), r.get(col_cat,""), r.get(col_forn,"")]]), axis=1)
+    mask &= df.apply(
+        lambda r: t in " ".join([str(x).lower() for x in [
+            r.get("IDProduto",""), r.get("Produto",""), r.get(col_cat,""), r.get(col_forn,"")
+        ]]),
+        axis=1
+    )
 if col_cat and cat != "(todas)" and col_cat in df.columns:
     mask &= (df[col_cat].astype(str) == cat)
 if col_forn and forn != "(todos)" and col_forn in df.columns:
     mask &= (df[col_forn].astype(str) == forn)
 
 if only_low and col_estq_min and col_estq_min in df_prod.columns:
-    # traz EstoqueMin para o df e filtra
-    df = df.merge(df_prod[[col_id, col_estq_min]] if col_id else df_prod[[col_nome, col_estq_min]],
-                  left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left", suffixes=("","_x"))
+    df = df.merge(
+        df_prod[[col_id, col_estq_min]] if col_id else df_prod[[col_nome, col_estq_min]],
+        left_on="IDProduto", right_on=col_id if col_id else col_nome, how="left", suffixes=("","_x")
+    )
     estq_min = df[col_estq_min].map(_to_num).fillna(0)
     mask &= (df["EstoqueAtual"] <= estq_min)
 
