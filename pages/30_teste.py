@@ -1,294 +1,328 @@
-# pages/00_vendas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar)
+# pages/upload_fotos.py
 # -*- coding: utf-8 -*-
-import json, unicodedata
-from datetime import datetime, date, timedelta
-import re
-import unicodedata as _ud
+import json, re, unicodedata as _ud
+from typing import Optional
 
 import streamlit as st
 import pandas as pd
 import gspread
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
-import requests  # Telegram
 
-st.set_page_config(page_title="Vendas rápidas", page_icon="🧾", layout="wide")
-st.title("🧾 Vendas rápidas (carrinho)")
+# >>> Cloudinary (SDK oficial, assinatura automática)
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
 
-# ================= Helpers =================
+st.set_page_config(page_title="Upload de Fotos (Produtos)", page_icon="🖼️", layout="wide")
+st.title("🖼️ Upload/URL de Foto para Produtos")
+
+# ======================================================================
+# Config / Conexão
+# ======================================================================
+ABA_PRODUTOS = "Produtos"  # nome da sua aba de catálogo
+
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
-    return key
+    return "".join(ch for ch in key if _ud.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
 
 def _load_sa():
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    svc = {**svc, "private_key": _normalize_private_key(svc["private_key"])}
+    if svc is None:
+        st.error("🛑 Falta o secret GCP_SERVICE_ACCOUNT.")
+        st.stop()
+    if isinstance(svc, str):
+        svc = json.loads(svc)
+    svc = dict(svc)
+    svc["private_key"] = _normalize_private_key(svc["private_key"])
     return svc
 
 @st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+def _sheet():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
     gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL", "")
-    if not url_or_id: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
+    url_or_id = st.secrets.get("PLANILHA_URL") or st.secrets.get("PLANILHA_ID")
+    if not url_or_id:
+        st.error("🛑 Coloque PLANILHA_URL ou PLANILHA_ID nos Secrets.")
+        st.stop()
+    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data(ttl=10)
-def carregar_aba(nome: str) -> pd.DataFrame:
-    ws = conectar_sheets().worksheet(nome)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def _first_col(df: pd.DataFrame, candidates) -> str | None:
-    if df is None or df.empty: return None
-    for c in candidates:
-        if c in df.columns: return c
-    low = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in low: return low[c.lower()]
-    return None
-
-def _to_num(x):
-    if x is None: return 0.0
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"): return 0.0
-    s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>1 else s.replace(",", ".")
-    try: return float(s)
-    except: return 0.0
-
-def _fmt_brl_num(v):
-    return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-
-def _gerar_id(prefixo="F"):
-    return f"{prefixo}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-def _garantir_aba(sh, nome, cols):
+def _headers(ws) -> list[str]:
     try:
-        ws = sh.worksheet(nome)
-    except Exception:
-        ws = sh.add_worksheet(title=nome, rows=3000, cols=max(10,len(cols)))
-        ws.update("A1", [cols])
-        return ws
-    headers = ws.row_values(1) or []
-    headers = [h.strip() for h in headers]
-    falt = [c for c in cols if c not in headers]
-    if falt:
-        ws.update("A1", [headers + falt])
-    return ws
-
-def _append_rows(ws, rows: list[dict]):
-    headers = ws.row_values(1)
-    hdr = [h.strip() for h in headers]
-    to_append = []
-    for d in rows:
-        to_append.append([d.get(h, "") for h in hdr])
-    if to_append:
-        ws.append_rows(to_append, value_input_option="USER_ENTERED")
-
-# -------- Telegram --------
-def _tg_enabled() -> bool:
-    try:
-        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
-    except Exception:
-        return False
-
-def _tg_conf():
-    token = st.secrets.get("TELEGRAM_TOKEN", "")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
-    return token, chat_id
-
-def _tg_send(msg: str, photo_url: str | None = None):
-    if not _tg_enabled(): return
-    token, chat_id = _tg_conf()
-    if not token or not chat_id: return
-    try:
-        if photo_url:
-            caption = msg if len(msg) <= 1000 else "🧾 Venda registrada — detalhes abaixo ⤵️"
-            url = f"https://api.telegram.org/bot{token}/sendPhoto"
-            payload = {
-                "chat_id": str(chat_id),
-                "photo": photo_url,
-                "caption": caption,
-                "parse_mode": "HTML",
-                "disable_notification": True,
-            }
-            requests.post(url, json=payload, timeout=8)
-            if caption != msg:
-                url2 = f"https://api.telegram.org/bot{token}/sendMessage"
-                payload2 = {
-                    "chat_id": str(chat_id),
-                    "text": msg,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                    "disable_notification": True,
-                }
-                requests.post(url2, json=payload2, timeout=8)
-        else:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {"chat_id": str(chat_id),"text": msg,"parse_mode": "HTML","disable_web_page_preview": True}
-            requests.post(url, json=payload, timeout=8)
-    except Exception:
-        pass
-
-def _tg_send_media_group(media: list[dict]):
-    if not _tg_enabled(): return
-    token, chat_id = _tg_conf()
-    if not token or not chat_id or not media: return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
-        payload = {"chat_id": str(chat_id), "media": media}
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
-
-# ---------------- Clientes ----------------
-ABA_CLIENTES = "Clientes"
-COLS_CLIENTES = ["Cliente","Telefone","Obs"]
-
-def _strip_accents(s: str) -> str:
-    if not isinstance(s, str): return ""
-    return "".join(ch for ch in _ud.normalize("NFD", s) if _ud.category(ch) != "Mn")
-
-def _normalize_cliente(nome: str) -> str:
-    nome = (nome or "").strip()
-    nome = re.sub(r"\s+", " ", nome)
-    return nome.title()
-
-def _cliente_key(nome: str) -> str:
-    base = _normalize_cliente(nome)
-    base = _strip_accents(base).lower()
-    return re.sub(r"\s+", " ", base).strip()
-
-def _carregar_clientes() -> list[str]:
-    try:
-        dfc = carregar_aba(ABA_CLIENTES)
-        if dfc.empty: return []
-        col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        vistos = {}
-        for raw in dfc[col_cli].dropna().astype(str):
-            norm = _normalize_cliente(raw)
-            k = _cliente_key(norm)
-            if k and k not in vistos:
-                vistos[k] = norm
-        return sorted(vistos.values())
+        return [h.strip() for h in ws.row_values(1)]
     except Exception:
         return []
 
-def _ensure_cliente(cli_nome: str):
-    cli_nome = _normalize_cliente(cli_nome)
-    if not cli_nome:
-        return
-    sh = conectar_sheets()
-    ws_cli = _garantir_aba(sh, ABA_CLIENTES, COLS_CLIENTES)
-    try:
-        dfc = carregar_aba(ABA_CLIENTES)
-    except Exception:
-        dfc = pd.DataFrame(columns=COLS_CLIENTES)
-    ja_tem = False
-    if not dfc.empty:
-        col_cli = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        for raw in dfc[col_cli].dropna().astype(str):
-            if _cliente_key(raw) == _cliente_key(cli_nome):
-                ja_tem = True
-                break
-    if not ja_tem:
-        _append_rows(ws_cli, [{"Cliente": cli_nome, "Telefone": "", "Obs": ""}])
+def _find_col(headers: list[str], candidates: list[str]) -> Optional[int]:
+    """retorna índice 1-based da primeira coluna que casar (case-insensitive)."""
+    if not headers: return None
+    lower = {h.lower(): i+1 for i, h in enumerate(headers)}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
 
-# ---------------- Catálogo / Estoque ----------------
-ABA_PROD, ABA_VEND = "Produtos", "Vendas"
-ABA_COMPRAS = "Compras"
-ABA_AJUSTES = "Ajustes"
-ABA_MOVS   = "MovimentosEstoque"
-ABA_FIADO  = "Fiado"
+def _ensure_foto_col(ws) -> tuple[str, int]:
+    """Garante que exista uma coluna para foto. Retorna (nome, índice 1-based)."""
+    hdrs = _headers(ws)
+    foto_idx = _find_col(hdrs, ["Foto","FotoURL","Imagem","Image","Link","UrlFoto","URL_Foto"])
+    if foto_idx:
+        return hdrs[foto_idx-1], foto_idx
+    # cria uma nova no fim chamada "Foto"
+    new_idx = len(hdrs) + 1 if hdrs else 1
+    ws.update_cell(1, new_idx, "Foto")
+    return "Foto", new_idx
 
-COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
+@st.cache_data(ttl=20, show_spinner=False)
+def carregar_produtos() -> pd.DataFrame:
+    ws = _sheet().worksheet(ABA_PRODUTOS)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
+    return df.fillna("")
 
-def _build_maps_e_estoque():
-    try:
-        dfp = carregar_aba(ABA_PROD)
-    except Exception:
-        st.error("Erro ao abrir a aba Produtos."); st.stop()
-    col_id   = _first_col(dfp, ["ID","Codigo","Código","SKU"])
-    col_nome = _first_col(dfp, ["Nome","Produto","Descrição"])
-    col_preco= _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"])
-    col_unid = _first_col(dfp, ["Unidade","Und"])
-    col_custo= _first_col(dfp, ["Custo","PreçoCusto","PrecoCusto","CustoUnit","Custo Unidade"])
-    col_foto = _first_col(dfp, ["Foto","Imagem","Image","Photo","FotoURL","ImagemURL"])
-    if not col_id or not col_nome:
-        st.error("A aba Produtos precisa ter colunas de ID e Nome."); st.stop()
+# ======================================================================
+# Cloudinary (SDK) — mesma lógica do arquivo que funciona
+# ======================================================================
+def _cloud_cfg():
+    cfg = st.secrets.get("CLOUDINARY", {}) or {}
+    if not (cfg.get("cloud_name") and cfg.get("api_key") and cfg.get("api_secret")):
+        return None
+    cloudinary.config(
+        cloud_name = cfg["cloud_name"],
+        api_key    = cfg["api_key"],
+        api_secret = cfg["api_secret"],
+        secure     = True,
+    )
+    pasta = (cfg.get("folder") or "Produtos").strip()  # pode ter acento/espaço
+    return {"folder": pasta}
 
-    # usar só nome como label
-    dfp["_label"] = dfp[col_nome].astype(str).fillna("").str.strip()
-    dup_counts = {}
-    def _dedupe(lbl):
-        c = dup_counts.get(lbl, 0)
-        dup_counts[lbl] = c + 1
-        return lbl if c == 0 else f"{lbl} ({c+1})"
-    dfp["_label"] = dfp["_label"].map(_dedupe)
+def _slug(s: str) -> str:
+    if not s: return "produto"
+    s = "".join(c for c in _ud.normalize("NFKD", s) if not _ud.combining(c))
+    s = re.sub(r"[^A-Za-z0-9\-_\.]+", "_", s).strip("_").lower()
+    return s or "produto"
 
-    cat_map = dfp.set_index("_label")[[col_id, col_nome, col_preco, col_unid, col_foto]].to_dict("index")
-    labels = ["(selecione)"] + sorted(cat_map.keys(), key=lambda x: x.lower())
-    id_to_name, id_to_cost, id_to_stock, id_to_img = {}, {}, {}, {}
-    for _, r in dfp.iterrows():
-        pid = str(r[col_id]).strip()
-        if pid:
-            id_to_name[pid] = str(r.get(col_nome,"") or "").strip()
-            if col_custo: id_to_cost[pid] = _to_num(r.get(col_custo))
-            if col_foto: id_to_img[pid] = str(r.get(col_foto,"") or "").strip()
+def _nrm_name(s: str) -> str:
+    return str(s or "").strip()
 
-    return dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid, id_to_img
+# ======================================================================
+# UI — escolher produto (mostrar só o NOME)
+# ======================================================================
+dfp = carregar_produtos()
+if dfp.empty:
+    st.info("Nenhum produto cadastrado na aba **Produtos**.")
+    st.stop()
 
-dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid, id_to_img = _build_maps_e_estoque()
+# tenta adivinhar a coluna de nome e a de ID
+NOME_CANDS = ["Nome", "Produto", "Descrição", "Descricao", "Título", "Titulo"]
+ID_CANDS   = ["ID", "Sku", "SKU", "Codigo", "Código"]
+col_nome = next((c for c in NOME_CANDS if c in dfp.columns), None)
+col_id   = next((c for c in ID_CANDS if c in dfp.columns), None)
+if not col_nome:
+    st.error("Não encontrei uma coluna de nome (ex.: Nome/Produto/Descrição) na aba Produtos.")
+    st.stop()
 
-# ================= Estado inicial =================
-if "cart" not in st.session_state: st.session_state["cart"] = []
+st.subheader("Selecione o produto")
+opcoes = dfp.index.tolist()
+sel_idx = st.selectbox(
+    "Produto",
+    options=opcoes,
+    format_func=lambda i: _nrm_name(dfp.loc[i, col_nome]) or "(sem nome)",
+)
+nome_prod = _nrm_name(dfp.loc[sel_idx, col_nome])
+sku = _nrm_name(dfp.loc[sel_idx, col_id]) if col_id else ""
 
-# ================= Carrinho =================
-st.subheader("Nova venda / cupom")
+# ======================================================================
+# URL manual de imagem
+# ======================================================================
+st.divider()
+st.subheader("Colar URL da imagem")
+url = st.text_input("URL da imagem (https…)", value="", placeholder="https://…")
+preview_size = st.slider("Tamanho da prévia (px)", 120, 600, 320, 10)
 
-with st.form("add_item"):
-    sel = st.selectbox("Produto", labels, index=0)
-    c1, c2, c3 = st.columns([1,1,1])
-    with c1:
-        qtd = st.number_input("Qtd", min_value=1, step=1, value=1)
-    with c2:
-        preco_sug = 0.0
-        if sel != "(selecione)" and col_preco:
-            preco_sug = _to_num(cat_map[sel].get(col_preco))
-        preco = st.number_input("Preço unitário (R$)", min_value=0.0, value=float(preco_sug), step=0.1, format="%.2f")
-    with c3:
-        unid_show = cat_map[sel].get(col_unid) if sel != "(selecione)" and col_unid else "un"
-        st.text_input("Unidade", value=str(unid_show), disabled=True)
-    add = st.form_submit_button("➕ Adicionar ao carrinho", use_container_width=True)
+col1, col2 = st.columns([0.5, 0.5])
+with col1:
+    if st.button("💾 Salvar URL manual no catálogo", type="primary"):
+        if not url.strip():
+            st.warning("Cole uma URL primeiro.")
+        else:
+            try:
+                sh = _sheet()
+                ws = sh.worksheet(ABA_PRODUTOS)
+                _, foto_col = _ensure_foto_col(ws)
+                target_row = int(sel_idx) + 2  # DF 0-based; planilha começa na 2
+                ws.update_cell(target_row, foto_col, url.strip())
+                st.success("✅ URL salva no catálogo!")
+                st.session_state["_force_refresh"] = True
+            except Exception as e:
+                st.error(f"Erro ao salvar: {e}")
 
-if add and sel != "(selecione)":
-    info = cat_map[sel]
-    pid = str(info[col_id])
-    st.session_state["cart"].append({
-        "id": pid,
-        "nome": str(info[col_nome]),
-        "unid": str(info.get(col_unid, "un")),
-        "foto": str(info.get("Foto") or info.get("Imagem") or ""),
-        "qtd": int(qtd),
-        "preco": float(preco)
-    })
-    st.success("Item adicionado.")
+with col2:
+    if url.strip():
+        st.image(url.strip(), width=preview_size, caption=nome_prod)
 
-st.subheader("Carrinho")
-if not st.session_state["cart"]:
-    st.info("Nenhum item no carrinho.")
+st.caption("A URL fica registrada na coluna **Foto** da aba Produtos. O arquivo continua hospedado no endereço da URL.")
+
+# ======================================================================
+# Upload do computador → Cloudinary (SDK) e salvar URL
+# ======================================================================
+st.divider()
+st.subheader("Ou envie um arquivo do computador (Cloudinary)")
+
+cfg = _cloud_cfg()
+if not cfg:
+    with st.expander("Configurar Cloudinary (clique para ver)"):
+        st.markdown(
+            """
+            Adicione aos **Secrets**:
+            ```toml
+            [CLOUDINARY]
+            cloud_name = "SEU_CLOUD_NAME"
+            api_key    = "SUA_API_KEY"
+            api_secret = "SUA_API_SECRET"
+            folder     = "Ebenézer Variedades"  # pode ter espaço/acentos
+            ```
+            """
+        )
+    st.warning("Configure o Cloudinary nos Secrets para habilitar o upload.")
 else:
-    for idx, it in enumerate(st.session_state["cart"]):
-        c0, c1, c2, c3 = st.columns([1,2,2,2])
-        if it.get("foto"):
-            c0.image(it["foto"], width=60)
-        c1.write(f"**{it['nome']}**")
-        c2.write(f"Qtd: {it['qtd']}")
-        c3.write(f"Preço: {_fmt_brl_num(it['preco'])}")
+    up_col1, up_col2, up_col3 = st.columns([0.45, 0.35, 0.20])
+    with up_col1:
+        arquivo = st.file_uploader("Selecionar imagem", type=["jpg","jpeg","png","webp","gif"], accept_multiple_files=False)
+    with up_col2:
+        default_pid = _slug(sku or nome_prod)
+        public_id = st.text_input("Nome do arquivo no Cloudinary (public_id)", value=default_pid, help="Sem extensão.")
+    with up_col3:
+        folder = st.text_input("Pasta", value=cfg["folder"])
+
+    # Verifica se já existe imagem no Cloudinary ou link na planilha
+    pid_path = f"{folder}/{public_id}".strip("/")
+    existe_url = None
+    try:
+        r = cloudinary.api.resource(pid_path)
+        existe_url = r.get("secure_url")
+    except Exception:
+        # tenta ler o que está na planilha (se houver coluna Foto)
+        try:
+            ws = _sheet().worksheet(ABA_PRODUTOS)
+            hdrs = _headers(ws)
+            foto_idx = _find_col(hdrs, ["Foto","FotoURL","Imagem","Image","Link","UrlFoto","URL_Foto"])
+            if foto_idx:
+                # dfp é cacheado — pegamos da mesma linha/coluna
+                existe_url = str(dfp.iloc[sel_idx, foto_idx-1]).strip()
+        except Exception:
+            pass
+
+    if existe_url:
+        st.image(existe_url, width=220, caption=f"Imagem atual — {nome_prod}")
+        st.warning("Este produto já possui imagem. Marque a caixa abaixo para substituir.")
+        must_confirm = not st.checkbox("Confirmo que desejo substituir a imagem existente.")
+    else:
+        st.info("Este produto ainda não possui imagem cadastrada.")
+        must_confirm = False
+
+    colA, colB = st.columns([0.55, 0.45])
+    with colA:
+        if st.button("↑ Enviar para Cloudinary e salvar na planilha", type="primary", use_container_width=True, disabled=must_confirm):
+            if not arquivo:
+                st.warning("Selecione um arquivo para enviar.")
+            else:
+                try:
+                    with st.spinner("Enviando para o Cloudinary…"):
+                        up = cloudinary.uploader.upload(
+                            arquivo,                     # o SDK aceita o file-like
+                            folder=folder,               # pode ter acento/espaço
+                            public_id=public_id,
+                            overwrite=True,
+                            invalidate=True,
+                            resource_type="image",
+                        )
+                    secure_url = up.get("secure_url")
+                    if not secure_url:
+                        raise RuntimeError(f"Resposta sem URL: {up}")
+
+                    # salva URL na aba Produtos
+                    sh = _sheet()
+                    ws = sh.worksheet(ABA_PRODUTOS)
+                    _, foto_col = _ensure_foto_col(ws)
+                    target_row = int(sel_idx) + 2
+                    ws.update_cell(target_row, foto_col, secure_url)
+
+                    st.success("✅ Upload concluído e URL salva no catálogo!")
+                    st.image(secure_url, width=preview_size, caption=f"{nome_prod} (Cloudinary)")
+                    st.code(secure_url, language="text")
+                    st.session_state["_force_refresh"] = True
+                except Exception as e:
+                    st.error(f"Erro ao enviar/salvar imagem: {e}")
+
+    with colB:
+        if existe_url and st.button("🗑️ Deletar imagem", use_container_width=True):
+            try:
+                try:
+                    cloudinary.uploader.destroy(pid_path, resource_type="image")
+                    st.success("Imagem deletada do Cloudinary.")
+                except Exception:
+                    pass
+                # limpar link na planilha
+                sh = _sheet()
+                ws = sh.worksheet(ABA_PRODUTOS)
+                _, foto_col = _ensure_foto_col(ws)
+                target_row = int(sel_idx) + 2
+                ws.update_cell(target_row, foto_col, "")
+                st.success("Link removido da planilha.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao deletar imagem: {e}")
+
+# ======================================================================
+# Preview do que está salvo (se já houver)
+# ======================================================================
+st.divider()
+st.subheader("Pré-visualização do que está salvo")
+try:
+    ws = _sheet().worksheet(ABA_PRODUTOS)
+    hdrs = _headers(ws)
+    foto_idx = _find_col(hdrs, ["Foto","FotoURL","Imagem","Image","Link","UrlFoto","URL_Foto"])
+    if foto_idx:
+        # dfp foi carregado antes; pode estar desatualizado se acabou de salvar.
+        # Em um app real, você pode recarregar; aqui só tentamos exibir.
+        try:
+            foto_url_salva = dfp.iloc[sel_idx, foto_idx-1]
+        except Exception:
+            foto_url_salva = ""
+        if str(foto_url_salva).strip():
+            st.image(str(foto_url_salva).strip(), width=preview_size, caption=f"{nome_prod} (salvo)")
+        else:
+            st.info("Este produto ainda não tem foto salva.")
+    else:
+        st.info("A planilha ainda não tem a coluna **Foto**.")
+except Exception:
+    st.info("Não consegui carregar a foto salva agora, mas a URL foi gravada.")
+
+# ======================================================================
+# Galeria (opcional) — mostra miniaturas dos produtos com foto
+# ======================================================================
+st.markdown("---")
+st.subheader("🖼️ Galeria rápida (Produtos com foto)")
+
+cols = st.columns(6)
+i = 0
+try:
+    ws = _sheet().worksheet(ABA_PRODUTOS)
+    hdrs = _headers(ws)
+    foto_idx = _find_col(hdrs, ["Foto","FotoURL","Imagem","Image","Link","UrlFoto","URL_Foto"])
+    if foto_idx:
+        for i_row in range(len(dfp)):
+            nome = _nrm_name(dfp.loc[i_row, col_nome])
+            url_foto = str(dfp.iloc[i_row, foto_idx-1]).strip()
+            if url_foto:
+                with cols[i % 6]:
+                    st.image(url_foto, width=110, caption=nome)
+                i += 1
+    if i == 0:
+        st.caption("Sem fotos salvas na planilha ainda.")
+except Exception:
+    st.caption("Não foi possível carregar a galeria agora.")
