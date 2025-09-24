@@ -1,5 +1,5 @@
 # pages/00_vendas.py — Vendas rápidas (carrinho + histórico/estorno/duplicar)
-# COM CLIENTES (selectbox + dedupe), FIADO, TELEGRAM, ESTOQUE (Compras/Vendas/Ajustes),
+# COM CLIENTES (selectbox + dedupe), FIADO, TELEGRAM (com miniatura), ESTOQUE (Compras/Vendas/Ajustes),
 # MOVIMENTOS, RESUMO DO DIA e LUCRO (estimado)
 # -*- coding: utf-8 -*-
 import json, unicodedata
@@ -16,6 +16,8 @@ import requests  # Telegram
 
 st.set_page_config(page_title="Vendas rápidas", page_icon="🧾", layout="wide")
 st.title("🧾 Vendas rápidas (carrinho)")
+
+PLACEHOLDER_IMG = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
 
 # ================= Helpers =================
 def _normalize_private_key(key: str) -> str:
@@ -61,7 +63,13 @@ def _to_num(x):
     if isinstance(x, (int, float)): return float(x)
     s = str(x).strip()
     if s == "" or s.lower() in ("nan", "none"): return 0.0
-    s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>1 else s.replace(",", ".")
+    s = s.replace("−","-")
+    # heurística para pt-BR
+    if s.count(",")==1 and s.count(".")>1:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    s = re.sub(r"[^\d\.\-]", "", s)
     try: return float(s)
     except: return 0.0
 
@@ -106,14 +114,45 @@ def _tg_conf():
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
     return token, chat_id
 
-def _tg_send(msg: str):
-    if not _tg_enabled(): return
+def _tg_send(msg: str, photo_url: str | None = None):
+    """Envia mensagem; se houver photo_url, manda a miniatura com caption."""
+    if not _tg_enabled():
+        return
     token, chat_id = _tg_conf()
-    if not token or not chat_id: return
+    if not token or not chat_id:
+        return
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        requests.post(url, json=payload, timeout=6)
+        if photo_url:
+            caption = msg if len(msg) <= 1000 else "🧾 Venda registrada — detalhes abaixo ⤵️"
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            payload = {
+                "chat_id": str(chat_id),
+                "photo": photo_url,
+                "caption": caption,
+                "parse_mode": "HTML",
+                "disable_notification": True,
+            }
+            requests.post(url, json=payload, timeout=8)
+            if caption != msg:
+                url2 = f"https://api.telegram.org/bot{token}/sendMessage"
+                payload2 = {
+                    "chat_id": str(chat_id),
+                    "text": msg,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "disable_notification": True,
+                }
+                requests.post(url2, json=payload2, timeout=8)
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": str(chat_id),
+                "text": msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "disable_notification": True,
+            }
+            requests.post(url, json=payload, timeout=8)
     except Exception:
         pass
 
@@ -192,6 +231,7 @@ def _build_maps_e_estoque():
     col_preco= _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"])
     col_unid = _first_col(dfp, ["Unidade","Und"])
     col_custo= _first_col(dfp, ["Custo","PreçoCusto","PrecoCusto","CustoUnit","Custo Unidade"])
+    col_img  = _first_col(dfp, ["Imagem","Foto","URLImagem","ImagemURL","LinkImagem","Imagem URL","LinkImagemURL"])
     if not col_id or not col_nome:
         st.error("A aba Produtos precisa ter colunas de ID e Nome."); st.stop()
 
@@ -199,13 +239,16 @@ def _build_maps_e_estoque():
     dfp["_label"] = dfp.apply(lambda r: f"{str(r[col_id])} — {str(r[col_nome])}", axis=1)
     cat_map = dfp.set_index("_label")[[col_id, col_nome, col_preco, col_unid]].to_dict("index")
     labels = ["(selecione)"] + sorted(cat_map.keys())
-    id_to_name = {}
-    id_to_cost = {}
+    id_to_name, id_to_cost, id_to_img = {}, {}, {}
     for _, r in dfp.iterrows():
         pid = str(r[col_id]).strip()
-        if pid:
-            id_to_name[pid] = str(r.get(col_nome,"") or "").strip()
-            if col_custo: id_to_cost[pid] = _to_num(r.get(col_custo))
+        if not pid: 
+            continue
+        id_to_name[pid] = str(r.get(col_nome,"") or "").strip()
+        if col_custo:
+            id_to_cost[pid] = _to_num(r.get(col_custo))
+        if col_img:
+            id_to_img[pid] = str(r.get(col_img, "") or "").strip()
 
     # Fallback custo: última compra
     try:
@@ -269,10 +312,10 @@ def _build_maps_e_estoque():
         a = ajustes.get(pid, 0.0)
         id_to_stock[pid] = e - s + a
 
-    return dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid
+    return dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid, id_to_img
 
 # ====== carrega mapas/estoque uma vez ======
-dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid = _build_maps_e_estoque()
+dfp, cat_map, labels, id_to_name, id_to_cost, id_to_stock, col_id, col_nome, col_preco, col_unid, id_to_img = _build_maps_e_estoque()
 
 # ---------- Render universal do item (carrinho/linhas) ----------
 def _render_item_line_universal(x: dict, id_to_name: dict, stock_before_after: dict) -> str:
@@ -325,12 +368,14 @@ if add:
         st.warning("Selecione um produto.")
     else:
         info = cat_map[sel]
+        pid = str(info[col_id])
         st.session_state["cart"].append({
-            "id": str(info[col_id]),
+            "id": pid,
             "nome": str(info[col_nome]),
             "unid": str(info.get(col_unid, "un")),
             "qtd": int(qtd),
-            "preco": float(preco)
+            "preco": float(preco),
+            "img": id_to_img.get(pid, "") or PLACEHOLDER_IMG
         })
         st.success("Item adicionado.")
 
@@ -340,7 +385,10 @@ if not st.session_state["cart"]:
     st.info("Nenhum item no carrinho.")
 else:
     for idx, it in enumerate(st.session_state["cart"]):
-        c1, c2, c3, c4, c5, c6 = st.columns([2.6, 1, 1.2, 1.6, 1.8, 0.8])
+        # layout com miniatura
+        cimg, c1, c2, c3, c4, c5, c6 = st.columns([0.7, 2.2, 0.9, 1.1, 1.4, 1.6, 0.7])
+        with cimg:
+            st.image(it.get("img") or id_to_img.get(it["id"], "") or PLACEHOLDER_IMG, width=56)
         c1.write(f"**{it['nome']}**")
         c2.caption(f"Estoque: {int(id_to_stock.get(it['id'], 0))}")
         with c3:
@@ -512,7 +560,7 @@ else:
                 })
             _append_rows(ws_m, movs)
 
-            # ===== TELEGRAM (sem IDs públicos) =====
+            # ===== TELEGRAM (com miniatura) =====
             fonte_itens = novas if novas else st.session_state.get("cart", [])
             itens_txt = "\n".join(_render_item_line_universal(x, id_to_name, stock_before_after) for x in fonte_itens)
             cliente_linha = f"\n👤 Cliente: <b>{cli_nome}</b>" if cli_nome else ""
@@ -590,7 +638,15 @@ else:
                 f"{fiado_msg}"
                 f"{resumo_dia_txt}"
             )
-            _tg_send(msg)
+
+            # escolhe a 1ª miniatura disponível no carrinho
+            thumb = ""
+            for it in st.session_state.get("cart", []):
+                u = it.get("img") or id_to_img.get(str(it["id"]), "")
+                if u:
+                    thumb = u
+                    break
+            _tg_send(msg, photo_url=(thumb or None))
 
             # limpa carrinho e força refresh
             st.session_state["cart"] = []
@@ -658,12 +714,14 @@ else:
             linhas = vend[vend[col_venda]==venda_id].copy()
             cart = []
             for _, r in linhas.iterrows():
+                pidx = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
                 cart.append({
-                    "id": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                    "nome": id_to_name.get(str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")), ""),
+                    "id": pidx,
+                    "nome": id_to_name.get(pidx, ""),
                     "unid": "un",
                     "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
-                    "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
+                    "preco": float(_to_num(r[col_preco])) if col_preco else 0.0,
+                    "img": id_to_img.get(pidx, "") or PLACEHOLDER_IMG
                 })
             st.session_state["prefill_cart"] = {
                 "cart": cart,
@@ -750,7 +808,7 @@ else:
                 })
             _append_rows(ws_m, movs)
 
-            # Telegram (enxuto, sem IDs)
+            # Telegram (com miniatura)
             itens_txt_estorno = "\n".join(
                 _render_item_line_universal(
                     {"IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
@@ -772,8 +830,18 @@ else:
                 f"{'-'*24}\n"
                 f"{itens_txt_estorno}"
             )
-            _tg_send(msg)
 
+            # miniatura do primeiro item estornado
+            thumb_est = ""
+            pid_col = _first_col(linhas, ["IDProduto","ProdutoID","ID"])
+            if pid_col:
+                for _, rr in linhas.iterrows():
+                    u = id_to_img.get(str(rr.get(pid_col, "")), "")
+                    if u:
+                        thumb_est = u
+                        break
+
+            _tg_send(msg, photo_url=(thumb_est or None))
             st.success("Estorno lançado.")
 
         c1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_carrega_carrinho, args=(row["VendaID"],))
