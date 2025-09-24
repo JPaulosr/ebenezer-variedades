@@ -1,6 +1,6 @@
-# pages/01_produtos.py — Catálogo de Produtos (estoque via MovimentosEstoque) — versão com Cards de Fotos
+# pages/01_produtos.py — Catálogo de Produtos (estoque via MovimentosEstoque) — versão com Cards de Fotos (HTML componente)
 # -*- coding: utf-8 -*-
-import json, unicodedata as _ud, re, math
+import json, unicodedata as _ud, re
 import streamlit as st
 import pandas as pd
 import gspread
@@ -62,6 +62,7 @@ st.markdown("""
 .badge.warn{ border-color: rgba(245,158,11,.4); color:#f59e0b; }
 .badge.info{ border-color: rgba(6,182,212,.4); color:#06b6d4; }
 .badge.ok{ border-color: rgba(34,197,94,.4); color:#22c55e; }
+.badge.err{ border-color: rgba(239,68,68,.4); color:#ef4444; }
 .price-row{
   display:flex; align-items:baseline; justify-content:space-between; margin-top: 6px;
 }
@@ -74,9 +75,6 @@ st.markdown("""
   font-variant-numeric: tabular-nums; font-size:.78rem; padding:.25rem .5rem; border-radius:8px; border:1px dashed var(--card-bd); color:var(--muted)
 }
 .hr{ height:1px; background:var(--card-bd); margin:8px 0 }
-.toolbar{
-  display:flex; gap: 12px; align-items:end; flex-wrap: wrap;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -128,31 +126,22 @@ def _first_col(df: pd.DataFrame, cands: list[str]) -> str | None:
     return None
 
 def _to_num(x) -> float:
-    """Converte string/num para float preservando sinal negativo.
-       Suporta: -6, -6,0, (6), 1.234,56, 'R$ -1.234,56' e '−6' (unicode minus)."""
-    if x is None:
-        return 0.0
+    """Converte string/num para float preservando sinal negativo."""
+    if x is None: return 0.0
     s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"):
-        return 0.0
-
-    s = s.replace("−", "-")  # unicode minus -> ascii
+    if s == "" or s.lower() in ("nan","none"): return 0.0
+    s = s.replace("−", "-")
     neg_paren = False
     if s.startswith("(") and s.endswith(")"):
         s = s[1:-1]; neg_paren = True
-
     s = s.replace("R$", "").replace(" ", "")
     if "," in s:
-        s = s.replace(".", "")
-        s = s.replace(",", ".")
-
+        s = s.replace(".", "").replace(",", ".")
     s = re.sub(r"(?<!^)-", "", s)
     s = re.sub(r"[^0-9.\-]", "", s)
-    if s.count("-") > 1:
-        s = "-" + s.replace("-", "")
+    if s.count("-") > 1: s = "-" + s.replace("-", "")
     if s.count(".") > 1:
         p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
-
     try: v = float(s)
     except: v = 0.0
     if neg_paren: v = -abs(v)
@@ -164,11 +153,6 @@ def _strip_accents_low(s: str) -> str:
     return s.lower().strip()
 
 def _norm_tipo(t: str) -> str:
-    """
-    'entrada'  (compra, estorno, fracionamento +)
-    'saida'    (venda, baixa, fracionamento -)
-    'ajuste'   (ajuste; contagem/inventário)
-    """
     raw = str(t or "")
     low = _strip_accents_low(raw)
     if "fracion" in low:
@@ -195,20 +179,15 @@ def _prod_key_from(prod_id, prod_nome):
     return f"nm:{_strip_accents_low(_nz(prod_nome))}"
 
 def _fmt_money_br(v: float | int) -> str:
-    try:
-        f = float(v)
-    except:
-        f = 0.0
-    s = f"{abs(f):,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    try: f = float(v)
+    except: f = 0.0
+    s = f"{abs(f):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return ("-R$ " if f < 0 else "R$ ") + s
 
 def _fmt_num(v) -> str:
     try:
         f = float(v)
-        if abs(f - round(f)) < 1e-9:
-            return f"{int(round(f))}"
-        # até 2 casas para estoques quebrados
+        if abs(f - round(f)) < 1e-9: return f"{int(round(f))}"
         return f"{f:.2f}".rstrip("0").rstrip(".")
     except:
         return str(v)
@@ -217,8 +196,8 @@ def _fmt_num(v) -> str:
 # Abas
 # =========================
 ABA_PRODUTOS = "Produtos"
-ABA_MOV      = "MovimentosEstoque"   # fonte única de quantidades
-ABA_COMPRAS  = "Compras"             # custo
+ABA_MOV      = "MovimentosEstoque"
+ABA_COMPRAS  = "Compras"
 
 # =========================
 # Carregamento
@@ -247,7 +226,7 @@ col_cat       = _first_col(df_prod, ["Categoria"])
 col_forn      = _first_col(df_prod, ["Fornecedor"])
 col_estq_min  = _first_col(df_prod, ["EstoqueMin","Estoque Mínimo","EstqMin","Estoque Mínimo (un)"])
 col_preco     = _first_col(df_prod, ["PreçoVenda","PrecoVenda","Preço","Preco","Preço Venda"])
-col_img       = _first_col(df_prod, ["Imagem","Foto","URLImagem","LinkImagem","ImagemURL","FotoURL"])  # 👈 imagem
+col_img       = _first_col(df_prod, ["Imagem","Foto","URLImagem","LinkImagem","ImagemURL","FotoURL"])
 
 if not col_nome:
     st.error("Aba **Produtos** precisa ter uma coluna de nome (ex.: Nome/Produto)."); st.stop()
@@ -259,13 +238,10 @@ base = df_prod.copy()
 base["__key"] = base.apply(lambda r: _prod_key_from(r.get(col_id,""), r.get(col_nome,"")), axis=1)
 base["IDProduto"] = base[col_id] if col_id else ""
 base["Produto"]   = base[col_nome]
-if col_img and col_img in base.columns:
-    base["ImagemURL"] = base[col_img].astype(str).fillna("")
-else:
-    base["ImagemURL"] = ""
+base["ImagemURL"] = base[col_img].astype(str).fillna("") if col_img and col_img in base.columns else ""
 
 # =========================
-# Movimentos → Entradas/Saídas/Ajustes (fonte única)
+# Movimentos
 # =========================
 for c in ["Tipo","Qtd","IDProduto","Produto"]:
     if c not in df_mov.columns: df_mov[c] = ""
@@ -287,14 +263,13 @@ else:
     entradas_mov, saidas_mov, ajustes_mov = {}, {}, {}
 
 # =========================
-# Compras → custo atual (última compra)
+# Compras → custo atual (última)
 # =========================
 col_comp_id = _first_col(df_comp, ["IDProduto","ProdutoID","ID"])
 col_comp_cu = _first_col(df_comp, ["Custo Unitário","CustoUnitário","Custo Unit","Custo"])
 if not df_comp.empty and col_comp_id and col_comp_cu:
     df_comp["__key"] = df_comp.apply(lambda r: _prod_key_from(r.get(col_comp_id,""), r.get("Produto","")), axis=1)
     df_comp["Custo_num"] = df_comp[col_comp_cu].map(_to_num)
-    # última compra por __key (mantendo ordem original da planilha)
     last_cost = df_comp.groupby("__key", as_index=False).tail(1)
     custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 else:
@@ -306,14 +281,13 @@ else:
 df = base[["__key","IDProduto","Produto","ImagemURL"]].copy()
 def _get(m, k): return float(m.get(k, 0.0))
 
-df["Entradas"] = df["__key"].apply(lambda k: _get(entradas_mov, k))
-df["Saidas"]   = df["__key"].apply(lambda k: _get(saidas_mov,   k))
-df["Ajustes"]  = df["__key"].apply(lambda k: _get(ajustes_mov,  k))
+df["Entradas"]     = df["__key"].apply(lambda k: _get(entradas_mov, k))
+df["Saidas"]       = df["__key"].apply(lambda k: _get(saidas_mov,   k))
+df["Ajustes"]      = df["__key"].apply(lambda k: _get(ajustes_mov,  k))
 df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
 df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k, 0.0)))
 df["ValorTotal"]   = (df["EstoqueAtual"] * df["CustoAtual"]).round(2)
 
-# Anexa campos de produto (cat/forn/preço/estoque mínimo)
 extra_cols = [c for c in [col_id, col_nome, col_cat, col_forn, col_preco, col_estq_min] if c]
 df = df.merge(df_prod[extra_cols], left_on="IDProduto",
               right_on=col_id if col_id else col_nome, how="left")
@@ -321,27 +295,25 @@ df = df.merge(df_prod[extra_cols], left_on="IDProduto",
 # =========================
 # Filtros
 # =========================
-with st.container():
-    col_filtros = st.columns([2.2, 1.4, 1.3, 1.2, 1.1])
-    with col_filtros[0]:
-        termo = st.text_input("🔎 Buscar", placeholder="ID, nome, fornecedor, categoria...").strip()
-    with col_filtros[1]:
-        if col_cat and col_cat in df.columns:
-            cats = ["(todas)"] + sorted(pd.Series(df[col_cat].dropna().astype(str).unique()).tolist())
-            cat = st.selectbox("Categoria", cats)
-        else:
-            cat = "(todas)"
-    with col_filtros[2]:
-        if col_forn and col_forn in df.columns:
-            forns = ["(todos)"] + sorted(pd.Series(df[col_forn].dropna().astype(str).unique()).tolist())
-            forn = st.selectbox("Fornecedor", forns)
-        else:
-            forn = "(todos)"
-    with col_filtros[3]:
-        only_low = st.checkbox("⚠️ Baixo estoque", value=False,
-                               help="Itens com EstoqueAtual ≤ Estoque Mínimo (se existir).")
-    with col_filtros[4]:
-        view_cards = st.toggle("🖼️ Cards", value=True, help="Alterna entre cards e tabela")
+col_filtros = st.columns([2.2, 1.4, 1.3, 1.2, 1.1])
+with col_filtros[0]:
+    termo = st.text_input("🔎 Buscar", placeholder="ID, nome, fornecedor, categoria...").strip()
+with col_filtros[1]:
+    if col_cat and col_cat in df.columns:
+        cats = ["(todas)"] + sorted(pd.Series(df[col_cat].dropna().astype(str).unique()).tolist())
+        cat = st.selectbox("Categoria", cats)
+    else:
+        cat = "(todas)"
+with col_filtros[2]:
+    if col_forn and col_forn in df.columns:
+        forns = ["(todos)"] + sorted(pd.Series(df[col_forn].dropna().astype(str).unique()).tolist())
+        forn = st.selectbox("Fornecedor", forns)
+    else:
+        forn = "(todos)"
+with col_filtros[3]:
+    only_low = st.checkbox("⚠️ Baixo estoque", value=False, help="Itens com EstoqueAtual ≤ Estoque Mínimo (se existir).")
+with col_filtros[4]:
+    view_cards = st.toggle("🖼️ Cards", value=True, help="Alterna entre cards e tabela")
 
 mask = pd.Series(True, index=df.index)
 if termo:
@@ -358,28 +330,23 @@ if col_forn and forn != "(todos)" and col_forn in df.columns:
     mask &= (df[col_forn].astype(str) == forn)
 
 if only_low and col_estq_min and col_estq_min in df.columns:
-    estq_min = df[col_estq_min].map(_to_num).fillna(0)
-    mask &= (df["EstoqueAtual"] <= estq_min)
+    estq_min_series = df[col_estq_min].map(_to_num).fillna(0)
+    mask &= (df["EstoqueAtual"] <= estq_min_series)
 
 dfv = df[mask].copy()
 
 # =========================
-# Exibição — Cards (com foto)
+# Exibição — Cards via HTML componente
 # =========================
-PLACEHOLDER = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"  # fallback
-# ^ você pode trocar por uma imagem genérica da sua loja
+PLACEHOLDER = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
 
 if view_cards:
-    total_itens = len(dfv)
-    st.caption(f"{total_itens} item(ns) encontrado(s).")
-
-    # Ordenação padrão por nome
+    st.caption(f"{len(dfv)} item(ns) encontrado(s).")
     try:
         dfv = dfv.sort_values("Produto", na_position="last")
     except:
         pass
 
-    # Monta HTML dos cards (mais performático para muitas imagens)
     cards_html_parts = ['<div class="card-grid">']
     for _, r in dfv.iterrows():
         nome   = _nz(r.get("Produto",""))
@@ -398,7 +365,6 @@ if view_cards:
         custo  = _fmt_money_br(r.get("CustoAtual",0))
         vtot   = _fmt_money_br(r.get("ValorTotal",0))
 
-        # badge baixo estoque
         badge_low = ""
         if col_estq_min and col_estq_min in dfv.columns:
             try:
@@ -408,13 +374,11 @@ if view_cards:
             except:
                 pass
 
-        # metadados categoria/fornecedor
         subs = []
         if cat_: subs.append(f"🏷️ {cat_}")
         if forn_: subs.append(f"🚚 {forn_}")
         subs_html = " • ".join(subs) if subs else ""
 
-        # KPIs de movimento
         kpis = f'''
           <div class="kpis">
             <div class="kpi">⬆️ Entradas: <b>{ent}</b></div>
@@ -423,54 +387,58 @@ if view_cards:
           </div>
         '''
 
-        price_row = ""
-        if preco_ or custo or vtot:
-            price_row = f'''
-            <div class="price-row">
-              <div>
-                <div class="price">{preco_ if preco_ else ""}</div>
-                <div class="meta">{custo} custo • {vtot} total</div>
-              </div>
-              <div class="badge {'ok' if _to_num(estq)>0 else 'err'}">📦 Estoque: <b>{estq_s}</b></div>
+        price_row = f'''
+          <div class="price-row">
+            <div>
+              <div class="price">{preco_ if preco_ else ""}</div>
+              <div class="meta">{custo} custo • {vtot} total</div>
             </div>
-            '''
+            <div class="badge {'ok' if estq>0 else 'err'}">📦 Estoque: <b>{estq_s}</b></div>
+          </div>
+        '''
 
         cards_html_parts.append(f"""
-        <div class="card">
-          <img class="card-img" src="{img}" alt="{nome}">
-          <div class="card-body">
-            <div class="card-title">{nome}</div>
-            <div class="card-sub">
-              {'<span class="badge info">#'+pid+'</span>' if pid else ''}
-              {badge_low}
-            </div>
-            <div class="meta">{subs_html}</div>
-            <div class="hr"></div>
-            {kpis}
-            {price_row}
-          </div>
-        </div>
-        """)
+<div class="card">
+  <img class="card-img" src="{img}" alt="{nome}">
+  <div class="card-body">
+    <div class="card-title">{nome}</div>
+    <div class="card-sub">
+      {'<span class="badge info">#'+pid+'</span>' if pid else ''}
+      {badge_low}
+    </div>
+    <div class="meta">{subs_html}</div>
+    <div class="hr"></div>
+    {kpis}
+    {price_row}
+  </div>
+</div>
+""")
     cards_html_parts.append("</div>")
-    st.markdown("\n".join(cards_html_parts), unsafe_allow_html=True)
+    html_cards = "".join(cards_html_parts)
+
+    # Renderiza como HTML real (não markdown)
+    try:
+        # Streamlit >= 1.37
+        st.html(html_cards, scrolling=True, height=900)
+    except Exception:
+        import streamlit.components.v1 as components
+        components.html(html_cards, height=900, scrolling=True)
 
 else:
     # =========================
-    # Exibição — Tabela (original)
+    # Exibição — Tabela
     # =========================
     cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
     if col_cat and col_cat in dfv.columns: cols_show.insert(2, col_cat)
     if col_forn and col_forn in dfv.columns: cols_show.insert(3, col_forn)
-    if col_estq_min and col_estq_min in dfv.columns:
-        if col_estq_min not in cols_show: cols_show.append(col_estq_min)
+    if col_estq_min and col_estq_min in dfv.columns and col_estq_min not in cols_show:
+        cols_show.append(col_estq_min)
     if col_preco and col_preco in dfv.columns and col_preco not in cols_show:
         cols_show.insert(2, col_preco)
     if "ImagemURL" in dfv.columns and "ImagemURL" not in cols_show:
         cols_show.append("ImagemURL")
 
     df_show = dfv.loc[:, [c for c in cols_show if c in dfv.columns]].copy()
-
-    # formatações rápidas
     if "CustoAtual" in df_show: df_show["CustoAtual"] = df_show["CustoAtual"].map(_fmt_money_br)
     if "ValorTotal" in df_show: df_show["ValorTotal"] = df_show["ValorTotal"].map(_fmt_money_br)
     if col_preco and col_preco in df_show: df_show[col_preco] = df_show[col_preco].map(lambda x: _fmt_money_br(_to_num(x)))
@@ -481,7 +449,7 @@ else:
 # Rodapé / Ajuda
 # =========================
 st.caption("""
-• **EstoqueAtual** = Entradas − Saídas ± Ajustes (a partir da aba **MovimentosEstoque**, incluindo Fracionamento).
+• **EstoqueAtual** = Entradas − Saídas ± Ajustes (aba **MovimentosEstoque**).
 • **CustoAtual** = último custo de compra (aba **Compras**).
 • Para fotos, adicione uma coluna **Imagem** (ou **Foto**, **URLImagem**, **LinkImagem**) na aba **Produtos**.
 • Use **Compras** / **Fracionar** / **Ajustes** para movimentar estoque.
