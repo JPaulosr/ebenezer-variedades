@@ -121,13 +121,11 @@ def _fmt_num(v) -> str:
 # Persistência via Query Params + Session
 # -------------------------
 def _get_qp(name, default):
-    # API nova
     try:
         val = st.query_params.get(name, default)
         return type(default)(val)
     except Exception:
         pass
-    # API antiga
     try:
         vals = st.experimental_get_query_params().get(name, [default])
         return type(default)(vals[0])
@@ -136,9 +134,9 @@ def _get_qp(name, default):
 
 def _set_qp(**kwargs):
     try:
-        st.query_params.update(**kwargs)          # novo
+        st.query_params.update(**kwargs)
     except Exception:
-        st.experimental_set_query_params(**kwargs)  # antigo
+        st.experimental_set_query_params(**kwargs)
 
 # =========================
 # Abas / Carregamento
@@ -151,18 +149,19 @@ df_prod = carregar_aba(ABA_PRODUTOS)
 try: df_mov  = carregar_aba(ABA_MOV)
 except: df_mov  = pd.DataFrame(columns=["Data","IDProduto","Produto","Tipo","Qtd","Obs"])
 try: df_comp = carregar_aba(ABA_COMPRAS)
-except: df_comp = pd.DataFrame(columns=["IDProduto","Qtd","Custo Unitário"])
+except: df_comp = pd.DataFrame(columns=["IDProduto","Qtd","Custo Unitário","Produto"])
 
 # =========================
 # Colunas
 # =========================
-col_id   = _first_col(df_prod, ["ID","Codigo","SKU"])
-col_nome = _first_col(df_prod, ["Nome","Produto","Descrição"])
+col_id   = _first_col(df_prod, ["ID","Codigo","SKU","IDProduto","ProdutoID"])
+col_nome = _first_col(df_prod, ["Nome","Produto","Descrição","Descricao"])
 col_cat  = _first_col(df_prod, ["Categoria"])
 col_forn = _first_col(df_prod, ["Fornecedor"])
 col_estq_min = _first_col(df_prod, ["EstoqueMin","Estoque Mínimo"])
 col_preco = _first_col(df_prod, ["PreçoVenda","PrecoVenda","Preço"])
 col_img   = _first_col(df_prod, ["Imagem","Foto","URLImagem","ImagemURL"])
+col_custo_prod = _first_col(df_prod, ["CustoAtual"])  # <- pode existir
 
 if not col_nome:
     st.error("Aba **Produtos** precisa ter uma coluna de nome (ex.: Nome/Produto)."); st.stop()
@@ -176,6 +175,7 @@ base["IDProduto"] = base[col_id] if col_id else ""
 base["Produto"]   = base[col_nome]
 base["ImagemURL"] = base[col_img].astype(str).fillna("") if col_img and col_img in base.columns else ""
 
+# ---- Movimentos (quantidade)
 for c in ["Tipo","Qtd","IDProduto","Produto"]:
     if c not in df_mov.columns: df_mov[c] = ""
 if not df_mov.empty:
@@ -189,15 +189,31 @@ if not df_mov.empty:
 else:
     entradas_mov, saidas_mov, ajustes_mov = {}, {}, {}
 
+# ---- Custos (PRIORIDADE: Produtos.CustoAtual  ➜  fallback: última compra)
+# 1) Produtos.CustoAtual
+custo_produto_map = {}
+if col_custo_prod and col_custo_prod in df_prod.columns:
+    tmp = df_prod.copy()
+    tmp["__key"] = tmp.apply(lambda r: _prod_key_from(r.get(col_id,""), r.get(col_nome,"")), axis=1)
+    tmp["CustoAtual_num"] = tmp[col_custo_prod].map(_to_num)
+    custo_produto_map = dict(zip(tmp["__key"], tmp["CustoAtual_num"]))
+
+# 2) Última compra
 col_comp_id = _first_col(df_comp, ["IDProduto","ProdutoID"])
 col_comp_cu = _first_col(df_comp, ["Custo Unitário","Custo"])
 if not df_comp.empty and col_comp_id and col_comp_cu:
     df_comp["__key"] = df_comp.apply(lambda r: _prod_key_from(r.get(col_comp_id,""), r.get("Produto","")), axis=1)
     df_comp["Custo_num"] = df_comp[col_comp_cu].map(_to_num)
     last_cost = df_comp.groupby("__key", as_index=False).tail(1)
-    custo_atual_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
+    custo_compra_map = dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 else:
-    custo_atual_map = {}
+    custo_compra_map = {}
+
+def _custo_atual(key: str) -> float:
+    v_prod = float(custo_produto_map.get(key, 0.0))
+    if v_prod > 0:
+        return v_prod
+    return float(custo_compra_map.get(key, 0.0))
 
 # =========================
 # Consolidação
@@ -207,7 +223,7 @@ df["Entradas"]     = df["__key"].apply(lambda k: float(entradas_mov.get(k,0)))
 df["Saidas"]       = df["__key"].apply(lambda k: float(saidas_mov.get(k,0)))
 df["Ajustes"]      = df["__key"].apply(lambda k: float(ajustes_mov.get(k,0)))
 df["EstoqueAtual"] = df["Entradas"] - df["Saidas"] + df["Ajustes"]
-df["CustoAtual"]   = df["__key"].apply(lambda k: float(custo_atual_map.get(k,0)))
+df["CustoAtual"]   = df["__key"].apply(_custo_atual)  # <— prioridade Produtos; fallback Compras
 df["ValorTotal"]   = (df["EstoqueAtual"] * df["CustoAtual"]).round(2)
 if col_cat:       df[col_cat]       = df_prod[col_cat]
 if col_forn:      df[col_forn]      = df_prod[col_forn]
@@ -245,7 +261,6 @@ _set_qp(low=int(only_low), cards=int(view_cards))
 st.caption(f"{len(df)} item(ns) no total.")
 c1, c2, _ = st.columns([1.2, 1.2, 3])
 
-# Semeia valores padrão na primeira visita
 try:
     qps = dict(st.query_params)
 except Exception:
@@ -256,7 +271,6 @@ if "prod_img_h" not in st.session_state:
 if "prod_min_w" not in st.session_state:
     st.session_state["prod_min_w"] = int((qps.get("minw",[250])[0] if isinstance(qps.get("minw"), list) else qps.get("minw", 250)) or 250)
 
-# Defaults vindos de URL (se houver) ou sessão (senão)
 img_h_default      = _get_qp("img_h", st.session_state.get("prod_img_h", 240))
 min_card_w_default = _get_qp("minw",  st.session_state.get("prod_min_w", 250))
 
@@ -265,7 +279,6 @@ with c1:
 with c2:
     min_card_w = st.slider("🧱 Largura mínima (px)", 180, 340, int(min_card_w_default), 10, key="prod_min_w")
 
-# Atualiza os query params para compartilhar o layout atual
 _set_qp(img_h=st.session_state["prod_img_h"], minw=st.session_state["prod_min_w"])
 
 # =========================
@@ -344,7 +357,7 @@ if view_cards:
     sthtml("".join(cards), height=900, scrolling=True)
 
 else:
-    # tabela fallback
+    # tabela
     cols_show = ["IDProduto","Produto","Entradas","Saidas","Ajustes","EstoqueAtual","CustoAtual","ValorTotal"]
     if col_cat and col_cat in dfv.columns: cols_show.insert(2, col_cat)
     if col_forn and col_forn in dfv.columns: cols_show.insert(3, col_forn)
@@ -363,7 +376,7 @@ else:
 # =========================
 st.caption("""
 • **EstoqueAtual** = Entradas − Saídas ± Ajustes (aba **MovimentosEstoque**).
-• **CustoAtual** = último custo de compra (aba **Compras**).
+• **CustoAtual** = prioridade para **Produtos.CustoAtual**; se vazio/zero, usa **última compra** (aba **Compras**).
 • Para fotos, adicione uma coluna **Imagem**/**Foto**/**URLImagem** na aba **Produtos**.
-• Os controles (cards/baixo estoque/foto/largura) ficam salvos no URL e na sessão. Compartilhe o link para manter o layout. 
+• Os controles (cards/baixo estoque/foto/largura) ficam salvos no URL e na sessão. 
 """)
