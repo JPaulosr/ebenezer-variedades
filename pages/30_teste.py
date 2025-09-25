@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pages/03_Compras_Produtos_Entradas.py — Compras/entradas + Telegram + Fracionamento + Edição/Exclusão (modo simples)
+# pages/03_Compras_Produtos_Entradas.py — Compras/entradas + Telegram + Fracionamento (grava custo unitário) + Editar/Excluir (modo simples)
 from __future__ import annotations
 
 import json, unicodedata, re, time
@@ -160,7 +160,7 @@ def _pick_col(df: pd.DataFrame, cands: Iterable[str] ) -> str | None:
     return None
 
 COL = {
-    "id":   _pick_col(prod_df, ["ID","Id","id","Codigo","Código","SKU"]),
+    "id":   _pick_col(prod_df, ["ID","Id","id","Codigo","Código","SKU","IDProduto","ProdutoID"]),
     "nome": _pick_col(prod_df, ["Nome","Produto","Descrição","Descricao"]),
     "forn": _pick_col(prod_df, ["Fornecedor","FornecedorNome"]),
     "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
@@ -323,7 +323,7 @@ if salvar:
     _refresh_now()
 
 # =========================
-# 🧪 Fracionar granel → fracionados (com custo)
+# 🧪 Fracionar granel → fracionados (com custo unitário)
 # =========================
 st.divider()
 st.subheader("🧪 Fracionar — converter GRANEL (L) em fracionados")
@@ -407,23 +407,36 @@ def _custo_por_litro_granel(prod_id: str, prod_nome: str) -> float | None:
     # Considera que granel é em L -> custo unitário já é por L
     return float(cu)
 
-def _update_custo_atual_produto(prod_id: str, novo_custo: float) -> bool:
-    """Escreve Produtos.CustoAtual do SKU informado. Cria a coluna se não existir."""
+def _update_custo_atual_produto(prod_id: str, novo_custo: float, prod_nome: str = "") -> bool:
+    """
+    Escreve Produtos.CustoAtual para o SKU informado (valor unitário por frasco).
+    - Tenta casar por ID em várias colunas; se não achar, tenta por Nome.
+    - Cria a coluna CustoAtual se não existir.
+    """
     try:
         ws = _ensure_ws(PRODUTOS_ABA)
         df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).fillna("")
         if df.empty:
             return False
-        col_id = _pick_col(df, ["ID","Id","id","Codigo","Código","SKU","IDProduto"])
-        if not col_id:
-            return False
+
+        col_id = _pick_col(df, ["ID","Id","id","Codigo","Código","SKU","IDProduto","ProdutoID"])
+        col_nome = _pick_col(df, ["Nome","Produto","Descrição","Descricao"])
+
         if "CustoAtual" not in df.columns:
             df["CustoAtual"] = ""
-        m = df[col_id].astype(str).str.strip() == str(prod_id).strip()
-        if not m.any():
+
+        mask = pd.Series([False]*len(df))
+        if prod_id and col_id:
+            mask = mask | (df[col_id].astype(str).str.strip() == str(prod_id).strip())
+        if (not mask.any()) and prod_nome and col_nome:
+            mask = mask | (df[col_nome].astype(str).str.strip() == str(prod_nome).strip())
+
+        if not mask.any():
             return False
-        idx = df.index[m][0]
-        df.at[idx, "CustoAtual"] = f"{novo_custo:.2f}".replace(".", ",")
+
+        idx = df.index[mask][0]
+        df.at[idx, "CustoAtual"] = f"{float(novo_custo):.2f}".replace(".", ",")
+
         ws.clear()
         set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
         return True
@@ -528,6 +541,7 @@ else:
 
             linhas = []
             id_a = id_b = ""
+            nome_a = nome_b = ""
 
             # entrada fracionado A (unidades)
             if qtd_1 > 0:
@@ -567,14 +581,25 @@ else:
                 })
                 linhas.append(f"• {nome_b}: <b>{qtd_2}</b> un ({_fmt_num(vol_2_l)} L/frasco)")
 
-            # Atualiza custo atual dos SKUs fracionados
+            # ---- grava custo unitário (por frasco) em Produtos.CustoAtual ----
             try:
+                gravou_a = gravou_b = False
                 if id_a and custo_a > 0:
-                    _update_custo_atual_produto(id_a, custo_a)
+                    gravou_a = _update_custo_atual_produto(id_a, custo_a, prod_nome=nome_a)
                 if id_b and custo_b > 0:
-                    _update_custo_atual_produto(id_b, custo_b)
+                    gravou_b = _update_custo_atual_produto(id_b, custo_b, prod_nome=nome_b)
+
+                st.cache_data.clear()  # reflete em páginas como Estoque
+
+                if gravou_a or gravou_b:
+                    msg_ok = []
+                    if gravou_a: msg_ok.append(f"A = R$ {custo_a:.2f}")
+                    if gravou_b: msg_ok.append(f"B = R$ {custo_b:.2f}")
+                    st.info("Custo atualizado (por frasco): " + " | ".join(msg_ok))
+                else:
+                    st.warning("Não consegui atualizar o CustoAtual no(s) SKU(s). Verifique colunas/IDs na aba Produtos.")
             except Exception:
-                pass
+                st.warning("Fracionamento ok, mas a atualização de custo falhou. Veja a aba Produtos.")
 
             # ---- Telegram do fracionamento ----
             saldo_depois = (estoque_g - total_litros) if isinstance(estoque_g, (int,float)) else None
@@ -762,7 +787,7 @@ else:
             m_id   = st.text_input("ID", value=_nz(rec.get("ID","")))
             m_doc  = st.text_input("Documento/NF", value=_nz(rec.get("Documento/NF","")))
             m_org  = st.text_input("Origem", value=_nz(rec.get("Origem","")))
-        m_saldo = st.text_input("SaldoApós", value=_nz(rec.get("SaldoApós","")))
+        m_saldo = st.text_input("SaldoApós", value=_nz(recm.get("SaldoApós","")) if (recm:=rec) else _nz(rec.get("SaldoApós","")))
         campos_update = {
             "Data": m_data, "IDProduto": m_idp, "Produto": m_prod, "Tipo": m_tipo,
             "Qtd": m_qtd, "Obs": m_obs, "ID": m_id, "Documento/NF": m_doc,
