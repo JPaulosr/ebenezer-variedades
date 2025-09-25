@@ -382,40 +382,13 @@ with c_nav2:
 st.divider()
 st.subheader("🧪 Fracionar — converter GRANEL (L) em fracionados")
 
+# ⭐⭐ BOTÃO DE ATUALIZAÇÃO ⭐⭐
+if st.button("🔄 Atualizar Estoque", key="btn_atualizar_fracionamento"):
+    _refresh_now()
+
 # helper: última compra do granel (info rápida)
 def _ultima_compra(pid: str, nome: str):
-    try: comp = _load_df(COMPRAS_ABA, BUMP)
-    except Exception: return None
-    if comp.empty: return None
-
-    col_id = None
-    for c in ["IDProduto","ProdutoID","ID"]:
-        if c in comp.columns:
-            col_id = c; break
-    col_nome = "Produto" if "Produto" in comp.columns else None
-    col_data = "Data" if "Data" in comp.columns else None
-
-    df = comp.copy()
-    if col_id:
-        df = df[_eq(df[col_id], pid)]
-    elif col_nome:
-        df = df[_eq(df[col_nome], nome)]
-
-    if df.empty: return None
-    if col_data and col_data in df.columns:
-        try:
-            df["_d"] = pd.to_datetime(df[col_data], format="%d/%m/%Y", errors="coerce")
-            df = df.sort_values("_d", ascending=False)
-        except Exception: pass
-
-    row = df.iloc[0].to_dict()
-    return {
-        "data": row.get("Data",""),
-        "qtd": row.get("Qtd",""),
-        "unid": row.get("Unidade",""),
-        "custo_unit": row.get("Custo Unitário",""),
-        "total": row.get("Total","")
-    }
+    # ... (mantenha o código existente) ...
 
 # carregar produtos
 try:
@@ -447,7 +420,10 @@ else:
         gid   = _nz(row_g.get(COL_ID,""))
         gnome = _nz(row_g.get(COL_NOME,""))
 
-        estoque_g = _estoque_atual(pid=gid, nome=gnome)
+        # ⭐⭐ ESTOQUE COM ATUALIZAÇÃO FORÇADA ⭐⭐
+        with st.spinner("Calculando estoque..."):
+            estoque_g = _estoque_atual(pid=gid, nome=gnome)
+        
         st.caption(f"📦 Estoque atual (granel): {estoque_g if isinstance(estoque_g,(int,float)) else 0} L")
 
         # 🔎 Debug rápido para ver o que está sendo somado
