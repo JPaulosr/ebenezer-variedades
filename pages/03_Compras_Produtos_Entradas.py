@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 # pages/03_Compras_Produtos_Entradas.py — Compras/entradas de estoque + Telegram + Fracionamento + Edição/Exclusão
+from __future__ import annotations
+
 import json, unicodedata, re, time
 import streamlit as st
 import pandas as pd
@@ -7,6 +9,7 @@ import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
 from datetime import date, datetime
+from typing import Iterable
 
 st.set_page_config(page_title="Compras / Entradas", page_icon="🧾", layout="wide")
 st.title("🧾 Compras / Entradas de Estoque")
@@ -149,7 +152,7 @@ except Exception as e:
     with st.expander("Detalhes"): st.code(str(e))
     st.stop()
 
-def _pick_col(df, cands):
+def _pick_col(df: pd.DataFrame, cands: Iterable[str] ) -> str | None:
     for c in cands:
         if c in df.columns: return c
     return None
@@ -161,58 +164,67 @@ COL = {
     "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
 }
 
-# ------- estoque atual (Compras - Vendas + Ajustes) -------
-def _estoque_atual(pid: str="", nome: str="") -> float:
-    pid = (pid or "").strip(); nome = (nome or "").strip()
+# ======== ESTOQUE ATUAL — PADRÃO ÚNICO: MovimentosEstoque ========
+def _estoque_atual(pid: str = "", nome: str = "") -> float:
+    """
+    Calcula estoque atual SOMENTE a partir da aba MovimentosEstoque,
+    para ficar consistente com a página 'Estoque' e refletir fracionamentos.
+    """
+    pid = (pid or "").strip()
+    nome = (nome or "").strip()
 
-    def _sum(df, col_q, filtro):
-        if df.empty or not col_q: return 0.0
+    try:
+        mov = _load_df(MOVS_ABA, BUMP)
+    except Exception:
+        mov = pd.DataFrame()
+
+    if mov.empty:
+        return 0.0
+
+    col_id   = _pick_col(mov, ["IDProduto", "ProdutoID", "ID"])
+    col_nome = _pick_col(mov, ["Produto", "Nome"])
+    col_qtd  = _pick_col(mov, ["Qtd", "Quantidade", "Qtde"])
+    col_tipo = _pick_col(mov, ["Tipo"])
+
+    if not col_qtd or not col_tipo:
+        return 0.0
+
+    df = mov.copy()
+    if pid and col_id:
+        df = df[df[col_id].astype(str).str.strip() == pid]
+    elif nome and col_nome:
+        df = df[df[col_nome].astype(str).str.strip() == nome]
+
+    if df.empty:
+        return 0.0
+
+    def _num(x: str) -> float:
+        s = str(x or "").strip().replace(" ", "")
+        s = s.replace(".", "").replace(",", ".")
         try:
-            sub = df[filtro].copy()
-            if sub.empty: return 0.0
-            return pd.to_numeric(
-                sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
-                errors="coerce"
-            ).fillna(0).sum()
+            return float(s)
         except Exception:
             return 0.0
 
-    try: comp = _load_df(COMPRAS_ABA, BUMP)
-    except Exception: comp = pd.DataFrame()
-    try: vend = _load_df(VENDAS_ABA,  BUMP)
-    except Exception: vend = pd.DataFrame()
-    try: ajus = _load_df(AJUSTES_ABA,  BUMP)
-    except Exception: ajus = pd.DataFrame()
+    def _sign(tipo: str) -> int:
+        t = (tipo or "").lower()
+        if "+" in t: return +1
+        if "-" in t: return -1
+        if t.startswith("b"):  # B entrada
+            return +1
+        if t.startswith("v"):  # V venda
+            return -1
+        if t.startswith("a"):  # A ajuste (+/- no texto)
+            if "-" in t: return -1
+            if "+" in t: return +1
+            return 0
+        return 0
 
-    # Compras
-    c_pid = _pick_col(comp, ["IDProduto","ProdutoID","ID"])
-    c_qtd = _pick_col(comp, ["Qtd","Quantidade"])
-    c_nom = _pick_col(comp, ["Produto","Nome"])
-    ent = 0.0
-    if c_qtd:
-        if pid and c_pid: ent += _sum(comp, c_qtd, comp[c_pid].astype(str).str.strip()==pid)
-        if nome and c_nom:
-            ent += _sum(comp, c_qtd, (comp[c_nom].astype(str).str.strip()==nome) &
-                        (False if not c_pid else comp[c_pid].astype(str).str.strip().eq("").fillna(True)))
+    qtd = 0.0
+    for _, r in df.iterrows():
+        qtd += _num(r.get(col_qtd, 0)) * _sign(r.get(col_tipo, ""))
 
-    # Vendas
-    v_pid = _pick_col(vend, ["IDProduto","ProdutoID","ID"])
-    v_qtd = _pick_col(vend, ["Qtd","Quantidade"])
-    sai = 0.0
-    if v_qtd and v_pid and pid:
-        sai += _sum(vend, v_qtd, vend[v_pid].astype(str).str.strip()==pid)
-
-    # Ajustes
-    a_pid = _pick_col(ajus, ["ID","IDProduto","ProdutoID"])
-    a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
-    aj = 0.0
-    if a_qtd:
-        if pid and a_pid: aj += _sum(ajus, a_qtd, ajus[a_pid].astype(str).str.strip()==pid)
-        elif nome:
-            an = _pick_col(ajus, ["Produto","Nome"])
-            if an: aj += _sum(ajus, a_qtd, ajus[an].astype(str).str.strip()==nome)
-
-    return float(ent - sai + aj)
+    return float(qtd)
 
 # =========================
 # ENTRADA DE COMPRAS
@@ -366,17 +378,13 @@ with c_nav2:
 st.divider()
 st.subheader("🧪 Fracionar — converter GRANEL (L) em fracionados")
 
-# helper: última compra do granel (info rápida)
 def _ultima_compra(pid: str, nome: str):
     try: comp = _load_df(COMPRAS_ABA, BUMP)
     except Exception: return None
     if comp.empty: return None
 
-    col_id = None
-    for c in ["IDProduto","ProdutoID","ID"]:
-        if c in comp.columns:
-            col_id = c; break
-    col_nome = "Produto" if "Produto" in comp.columns else None
+    col_id = _pick_col(comp, ["IDProduto","ProdutoID","ID"])
+    col_nome = _pick_col(comp, ["Produto","Nome"])
     col_data = "Data" if "Data" in comp.columns else None
 
     df = comp.copy()
@@ -401,7 +409,6 @@ def _ultima_compra(pid: str, nome: str):
         "total": row.get("Total","")
     }
 
-# carregar produtos
 try:
     produtos = _load_df(PRODUTOS_ABA, BUMP)
 except Exception:
@@ -515,7 +522,6 @@ else:
                 })
                 linhas.append(f"• {_nz(r2.get(COL_NOME,''))}: <b>{qtd_2}</b> un ({_fmt_num(vol_2_l)} L/frasco)")
 
-            # ---- Telegram do fracionamento ----
             saldo_depois = (estoque_g - total_litros) if isinstance(estoque_g, (int,float)) else None
             msg = (
                 "🧪 <b>Fracionamento registrado</b>\n"
@@ -536,16 +542,13 @@ else:
 st.divider()
 st.subheader("✏️ Editar / 🗑️ Apagar registros")
 
-# ------- Helpers locais para edição/remoção -------
 def _load_with_rownums(aba: str, headers: list[str]):
     ws = _ensure_ws(aba, headers)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     if df.empty:
         df = pd.DataFrame(columns=headers)
     df = df.fillna("")
-    # __Linha = linha real da planilha (1 = cabeçalho); dados começam na 2
-    df["__Linha"] = (df.index + 2).astype(int)
-    # Garante todas as colunas pedidas
+    df["__Linha"] = (df.index + 2).astype(int)  # cabeçalho = 1
     for h in headers:
         if h not in df.columns:
             df[h] = ""
@@ -553,7 +556,6 @@ def _load_with_rownums(aba: str, headers: list[str]):
     return df[cols].copy(), ws
 
 def _save_df_over(ws, df: pd.DataFrame):
-    # remove coluna técnica antes de gravar
     df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
     ws.clear()
     set_with_dataframe(ws, df2.fillna(""), include_index=False, include_column_header=True, resize=True)
@@ -564,7 +566,6 @@ def _contains(series: pd.Series, text: str) -> pd.Series:
     t = str(text).strip().lower()
     return s.str.contains(re.escape(t), na=False)
 
-# ----------------- UI: abas de edição -----------------
 tab_edit_comp, tab_edit_mov = st.tabs(["Editar Compras", "Editar Movimentos"])
 
 with tab_edit_comp:
@@ -590,7 +591,6 @@ with tab_edit_comp:
         st.markdown("**Registro selecionado:**")
         st.json(rec)
 
-        # Form de edição
         with st.form(f"form_edit_comp_{BUMP}"):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -612,11 +612,9 @@ with tab_edit_comp:
             with col_s2:
                 apagar = st.form_submit_button("🗑️ Apagar registro", use_container_width=True)
 
-        # Ações
         if salvar or apagar:
-            # Localiza a linha real na base completa
             linha_real = int(rec["__Linha"])
-            base = df.copy()  # com __Linha
+            base = df.copy()
             pos = base.index[base["__Linha"] == linha_real]
             if len(pos) != 1:
                 st.error("Não foi possível localizar a linha na planilha.")
@@ -628,7 +626,6 @@ with tab_edit_comp:
                     st.success(f"Registro da linha {linha_real} apagado.")
                     _refresh_now()
                 else:
-                    # Atualiza campos editáveis
                     base.at[base_idx, "Data"] = e_data
                     base.at[base_idx, "Produto"] = e_prod
                     base.at[base_idx, "Unidade"] = e_unid
