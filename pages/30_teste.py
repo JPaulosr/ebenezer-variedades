@@ -821,178 +821,186 @@ else:
         b4.markdown(f"<div style='padding:4px 8px;border-radius:8px;background:#111;border:1px solid #333;display:inline-block'>{_fmt_brl_num(total)}</div>", unsafe_allow_html=True)
         cancelado = str(row.get("Obs","")).upper().startswith("ESTORNO DE") or str(row["VendaID"]).startswith("CN-")
 
-        c1, c2, c3 = st.columns([0.9, 0.9, 4])
+# 4 colunas: Duplicar | Cancelar | Reenviar | Obs
+c1, c2, c3, c4 = st.columns([0.9, 0.9, 0.9, 4])
 
-        def _carrega_carrinho(venda_id):
-            linhas = vend[vend[col_venda]==venda_id].copy()
-            cart = []
-            for _, r in linhas.iterrows():
-                pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
-                cart.append({
-                    "id": pid,
-                    "nome": id_to_name.get(pid, ""),
-                    "unid": "un",
-                    "foto": id_to_img.get(pid, ""),
-                    "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
-                    "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
-                })
-            st.session_state["cart"] = cart
-            st.session_state["forma"] = row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro"
-            st.session_state["obs"] = ""
-            st.session_state["data_venda"] = date.today()
-            st.session_state["desc"] = float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
-            st.experimental_rerun()
+def _carrega_carrinho(venda_id: str):
+    linhas = vend[vend[col_venda] == venda_id].copy()
+    cart = []
+    for _, r in linhas.iterrows():
+        pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
+        cart.append({
+            "id": pid,
+            "nome": id_to_name.get(pid, ""),
+            "unid": "un",
+            "foto": id_to_img.get(pid, ""),  # pode ser inválida; exibição valida com resolve_image_url/_is_http_url
+            "qtd": int(_to_num(r[col_qtd])) if col_qtd else 1,
+            "preco": float(_to_num(r[col_preco])) if col_preco else 0.0
+        })
+    st.session_state["cart"] = cart
+    st.session_state["forma"] = row["Forma"] if pd.notna(row["Forma"]) else "Dinheiro"
+    st.session_state["obs"] = ""
+    st.session_state["data_venda"] = date.today()
+    st.session_state["desc"] = float(row["_Desc"]) if pd.notna(row["_Desc"]) else 0.0
+    st.experimental_rerun()
 
-        def _cancelar_cupom(venda_id):
-            if str(venda_id).startswith("CN-"):
-                st.warning("Esse cupom já é um estorno."); return
-            if any(str(x).startswith(f"CN-{venda_id}") for x in vend[col_venda].unique()):
-                st.warning("Estorno já registrado para esse cupom."); return
+def _cancelar_cupom(venda_id: str):
+    if str(venda_id).startswith("CN-"):
+        st.warning("Esse cupom já é um estorno.")
+        return
+    if any(str(x).startswith(f"CN-{venda_id}") for x in vend[col_venda].unique()):
+        st.warning("Estorno já registrado para esse cupom.")
+        return
 
-        def _reenviar_cupom(venda_id):
-            linhas = vend[vend[col_venda] == venda_id].copy()
-            if linhas.empty:
-                st.warning("Cupom não encontrado.")
-                return
+    linhas = vend[vend[col_venda] == venda_id].copy()
+    if linhas.empty:
+        st.warning("Cupom não encontrado.")
+        return
 
-            data_str = str(row["Data"])
-            forma = str(row["Forma"] or "—")
-            cliente_est = str(linhas["Cliente"].dropna().iloc[0]) if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty else ""
+    sh = conectar_sheets()
+    ws = sh.worksheet(ABA_VEND)
+    dfv2 = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
+    dfv2.columns = [c.strip() for c in dfv2.columns]
+    for c in ["Desconto", "TotalCupom", "CupomStatus", "Cliente", "FiadoID"]:
+        if c not in dfv2.columns:
+            dfv2[c] = None
 
-            # monta os itens
-            stock_dummy = {}
-            itens_txt = "\n".join(
-                _render_item_line_universal(
-                    {
-                        "IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
-                        "Qtd": str(_to_num(r.get(col_qtd))) if col_qtd else "1",
-                        "PrecoUnit": str(_to_num(r.get(col_preco))) if col_preco else "0",
-                    },
-                    id_to_name,
-                    stock_dummy,
-                )
-                for _, r in linhas.iterrows()
-            )
+    cn_id = f"CN-{venda_id}"
+    data_str = date.today().strftime("%d/%m/%Y")
+    novas = []
+    total_estorno = 0.0
+    for _, r in linhas.iterrows():
+        pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
+        qtd = -abs(_to_num(r[col_qtd])) if col_qtd else -1
+        preco = _to_num(r[col_preco]) if col_preco else 0.0
+        total_linha = qtd * preco
+        total_estorno += total_linha
+        novas.append({
+            "Data": data_str,
+            "VendaID": cn_id,
+            "IDProduto": pid,
+            "Qtd": str(int(qtd)),
+            "PrecoUnit": f"{preco:.2f}".replace(".", ","),
+            "TotalLinha": f"{total_linha:.2f}".replace(".", ","),
+            "FormaPagto": f"Estorno - {str(r.get('FormaPagto') or row['Forma'] or 'Dinheiro')}",
+            "Obs": f"ESTORNO DE {venda_id}",
+            "Desconto": "0,00",
+            "TotalCupom": "0,00",
+            "CupomStatus": "ESTORNO",
+            "Cliente": str(r.get("Cliente") or ""),
+            "FiadoID": ""
+        })
 
-            # total
-            total_cupom = row["_TotalC"]
-            desconto = row["_Desc"]
+    df_novo2 = pd.concat([dfv2, pd.DataFrame(novas)], ignore_index=True)
+    ws.clear()
+    set_with_dataframe(ws, df_novo2)
+    st.cache_data.clear()
+    st.session_state["_force_refresh"] = True
 
-            # texto final
-            cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
-            msg = (
-                f"🧾 <b>Cupom reenviado</b>\n"
-                f"{data_str}\n"
-                f"Forma: <b>{forma}</b>"
-                f"{cliente_linha}\n"
-                f"{'-'*24}\n"
-                f"{itens_txt}\n"
-                f"{'-'*24}\n"
-                f"{'Desconto: ' + _fmt_brl_num(desconto) + '\\n' if desconto>0 else ''}"
-                f"Total: <b>{_fmt_brl_num(total_cupom)}</b>"
-            )
-            _tg_send(msg)
-            st.success("Cupom reenviado no Telegram.")
+    # Movimentos: estorno = entrada
+    try:
+        ws_m = sh.worksheet(ABA_MOVS)
+    except Exception:
+        ws_m = _garantir_aba(sh, ABA_MOVS, ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"])
+    movs = []
+    for _, r in linhas.iterrows():
+        pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
+        nome_prod = id_to_name.get(pid, pid)
+        qtd = int(abs(_to_num(r[col_qtd]))) if col_qtd else 1
+        bef = id_to_stock.get(pid, 0.0)
+        aft = bef + qtd
+        id_to_stock[pid] = aft
+        movs.append({
+            "Data": data_str,
+            "IDProduto": pid,
+            "Produto": nome_prod,
+            "Tipo": "B entrada",
+            "Qtd": str(qtd),
+            "Obs": f"ESTORNO DE {venda_id}",
+            "ID": cn_id,
+            "Documento/NF": "",
+            "Origem": "Vendas rápidas",
+            "SaldoApós": str(int(aft))
+        })
+    _append_rows(ws_m, movs)
 
-        # botão reenviar
-        c3.button("📲 Reenviar", key=f"reenv_{i}", on_click=_reenviar_cupom, args=(row["VendaID"],))
-            
+    # Telegram (enxuto)
+    itens_txt_estorno = "\n".join(
+        _render_item_line_universal(
+            {
+                "IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
+                "Qtd": str(int(abs(_to_num(r[col_qtd])) if col_qtd else 1)),
+                "PrecoUnit": str(_to_num(r[col_preco])),
+            },
+            id_to_name,
+            {},
+        )
+        for _, r in linhas.iterrows()
+    )
+    cliente_est = ""
+    if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty:
+        cliente_est = str(linhas["Cliente"].dropna().iloc[0])
+    cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
+    msg = (
+        f"⛔ <b>Estorno lançado</b>\n"
+        f"{data_str}\n"
+        f"Valor estorno (linhas): <b>{_fmt_brl_num(abs(total_estorno))}</b>"
+        f"{cliente_linha}\n"
+        f"{'-'*24}\n"
+        f"{itens_txt_estorno}"
+    )
+    _tg_send(msg)
+    st.success("Estorno lançado.")
 
-            linhas = vend[vend[col_venda]==venda_id].copy()
-            if linhas.empty:
-                st.warning("Cupom não encontrado."); return
+def _reenviar_cupom(venda_id: str):
+    linhas = vend[vend[col_venda] == venda_id].copy()
+    if linhas.empty:
+        st.warning("Cupom não encontrado.")
+        return
 
-            sh = conectar_sheets()
-            ws = sh.worksheet(ABA_VEND)
-            dfv2 = get_as_dataframe(ws, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
-            dfv2.columns = [c.strip() for c in dfv2.columns]
-            for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
-                if c not in dfv2.columns: dfv2[c] = None
+    data_str = str(row["Data"])
+    forma = str(row["Forma"] or "—")
+    cliente_est = (
+        str(linhas["Cliente"].dropna().iloc[0])
+        if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty
+        else ""
+    )
 
-            cn_id = f"CN-{venda_id}"
-            data_str = date.today().strftime("%d/%m/%Y")
-            novas = []
-            total_estorno = 0.0
-            for _, r in linhas.iterrows():
-                pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
-                qtd = -abs(_to_num(r[col_qtd])) if col_qtd else -1
-                preco = _to_num(r[col_preco]) if col_preco else 0.0
-                total_linha = qtd * preco
-                total_estorno += total_linha
-                novas.append({
-                    "Data": data_str,
-                    "VendaID": cn_id,
-                    "IDProduto": pid,
-                    "Qtd": str(int(qtd)),
-                    "PrecoUnit": f"{preco:.2f}".replace(".", ","),
-                    "TotalLinha": f"{total_linha:.2f}".replace(".", ","),
-                    "FormaPagto": f"Estorno - {str(r.get('FormaPagto') or row['Forma'] or 'Dinheiro')}",
-                    "Obs": f"ESTORNO DE {venda_id}",
-                    "Desconto": "0,00",
-                    "TotalCupom": "0,00",
-                    "CupomStatus": "ESTORNO",
-                    "Cliente": str(r.get("Cliente") or ""),
-                    "FiadoID": ""
-                })
+    # Itens (texto)
+    itens_txt = "\n".join(
+        _render_item_line_universal(
+            {
+                "IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
+                "Qtd": str(int(abs(_to_num(r.get(col_qtd)))) if col_qtd else "1"),
+                "PrecoUnit": str(_to_num(r.get(col_preco)) if col_preco else 0.0),
+            },
+            id_to_name,
+            {},
+        )
+        for _, r in linhas.iterrows()
+    )
 
-            df_novo2 = pd.concat([dfv2, pd.DataFrame(novas)], ignore_index=True)
-            ws.clear()
-            set_with_dataframe(ws, df_novo2)
-            st.cache_data.clear()
-            st.session_state["_force_refresh"] = True
+    total_cupom = float(row["_TotalC"])
+    desconto = float(row["_Desc"])
 
-            # Movimentos: estorno = entrada
-            try:
-                ws_m = sh.worksheet(ABA_MOVS)
-            except Exception:
-                ws_m = _garantir_aba(sh, ABA_MOVS, ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"])
-            movs = []
-            for _, r in linhas.iterrows():
-                pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID"))
-                nome_prod = id_to_name.get(pid, pid)
-                qtd = int(abs(_to_num(r[col_qtd]))) if col_qtd else 1
-                bef = id_to_stock.get(pid, 0.0)
-                aft = bef + qtd
-                id_to_stock[pid] = aft
-                movs.append({
-                    "Data": data_str,
-                    "IDProduto": pid,
-                    "Produto": nome_prod,
-                    "Tipo": "B entrada",
-                    "Qtd": str(qtd),
-                    "Obs": f"ESTORNO DE {venda_id}",
-                    "ID": cn_id,
-                    "Documento/NF": "",
-                    "Origem": "Vendas rápidas",
-                    "SaldoApós": str(int(aft))
-                })
-            _append_rows(ws_m, movs)
+    cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
+    msg = (
+        f"🧾 <b>Cupom reenviado</b>\n"
+        f"{data_str}\n"
+        f"Forma: <b>{forma}</b>"
+        f"{cliente_linha}\n"
+        f"{'-'*24}\n"
+        f"{itens_txt}\n"
+        f"{'-'*24}\n"
+        f"{'Desconto: ' + _fmt_brl_num(desconto) + '\\n' if desconto > 0 else ''}"
+        f"Total: <b>{_fmt_brl_num(total_cupom)}</b>"
+    )
+    _tg_send(msg)
+    st.success("Cupom reenviado no Telegram.")
 
-            # Telegram (enxuto)
-            itens_txt_estorno = "\n".join(
-                _render_item_line_universal(
-                    {"IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),"Qtd": str(int(abs(_to_num(r[col_qtd])) if col_qtd else 1)),"PrecoUnit": str(_to_num(r[col_preco]))},
-                    id_to_name, {}
-                )
-                for _, r in linhas.iterrows()
-            )
-            cliente_est = ""
-            if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty:
-                cliente_est = str(linhas["Cliente"].dropna().iloc[0])
-            cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
-            msg = (
-                f"⛔ <b>Estorno lançado</b>\n"
-                f"{data_str}\n"
-                f"Valor estorno (linhas): <b>{_fmt_brl_num(abs(total_estorno))}</b>"
-                f"{cliente_linha}\n"
-                f"{'-'*24}\n"
-                f"{itens_txt_estorno}"
-            )
-            _tg_send(msg)
-
-            st.success("Estorno lançado.")
-
-        c1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_carrega_carrinho, args=(row["VendaID"],))
-        c2.button("⛔ Cancelar", key=f"cn_{i}", disabled=cancelado, on_click=_cancelar_cupom, args=(row["VendaID"],))
-        c3.caption(row.get("Obs","") if isinstance(row.get("Obs",""), str) else "")
-        st.markdown("---")
+# Botões
+c1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_carrega_carrinho, args=(row["VendaID"],))
+c2.button("⛔ Cancelar", key=f"cn_{i}", disabled=cancelado, on_click=_cancelar_cupom, args=(row["VendaID"],))
+c3.button("📲 Reenviar", key=f"reenv_{i}", on_click=_reenviar_cupom, args=(row["VendaID"],))
+c4.caption(row.get("Obs","") if isinstance(row.get("Obs",""), str) else "")
+st.markdown("---")
