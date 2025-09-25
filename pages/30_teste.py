@@ -849,6 +849,55 @@ else:
             if any(str(x).startswith(f"CN-{venda_id}") for x in vend[col_venda].unique()):
                 st.warning("Estorno já registrado para esse cupom."); return
 
+        def _reenviar_cupom(venda_id):
+            linhas = vend[vend[col_venda] == venda_id].copy()
+            if linhas.empty:
+                st.warning("Cupom não encontrado.")
+                return
+
+            data_str = str(row["Data"])
+            forma = str(row["Forma"] or "—")
+            cliente_est = str(linhas["Cliente"].dropna().iloc[0]) if "Cliente" in linhas.columns and not linhas["Cliente"].dropna().empty else ""
+
+            # monta os itens
+            stock_dummy = {}
+            itens_txt = "\n".join(
+                _render_item_line_universal(
+                    {
+                        "IDProduto": str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID")),
+                        "Qtd": str(_to_num(r.get(col_qtd))) if col_qtd else "1",
+                        "PrecoUnit": str(_to_num(r.get(col_preco))) if col_preco else "0",
+                    },
+                    id_to_name,
+                    stock_dummy,
+                )
+                for _, r in linhas.iterrows()
+            )
+
+            # total
+            total_cupom = row["_TotalC"]
+            desconto = row["_Desc"]
+
+            # texto final
+            cliente_linha = f"\n👤 Cliente: <b>{cliente_est}</b>" if cliente_est else ""
+            msg = (
+                f"🧾 <b>Cupom reenviado</b>\n"
+                f"{data_str}\n"
+                f"Forma: <b>{forma}</b>"
+                f"{cliente_linha}\n"
+                f"{'-'*24}\n"
+                f"{itens_txt}\n"
+                f"{'-'*24}\n"
+                f"{'Desconto: ' + _fmt_brl_num(desconto) + '\\n' if desconto>0 else ''}"
+                f"Total: <b>{_fmt_brl_num(total_cupom)}</b>"
+            )
+            _tg_send(msg)
+            st.success("Cupom reenviado no Telegram.")
+
+        # botão reenviar
+        c3.button("📲 Reenviar", key=f"reenv_{i}", on_click=_reenviar_cupom, args=(row["VendaID"],))
+            
+
             linhas = vend[vend[col_venda]==venda_id].copy()
             if linhas.empty:
                 st.warning("Cupom não encontrado."); return
