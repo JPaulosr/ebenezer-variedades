@@ -660,8 +660,48 @@ else:
     rec = df_view.iloc[int(escolha)].to_dict()
     linha_real = int(rec["__Linha"])
 
-    st.markdown("**Lançamento selecionado:**")
-    st.json({k:v for k,v in rec.items() if k != "__Linha"})
+# --- Cartão-resumo amigável ---
+data   = _nz(rec.get("Data",""))
+prod   = _nz(rec.get("Produto",""))
+tipo   = _nz(rec.get("Tipo",""))
+qtd    = _nz(rec.get("Qtd",""))
+idp    = _nz(rec.get("IDProduto",""))
+origem = _nz(rec.get("Origem",""))
+obs    = _nz(rec.get("Obs",""))
+
+# Escolhe ícone conforme o tipo
+tipo_lower = tipo.lower()
+if "+" in tipo_lower or tipo_lower.startswith(("b ", "b entrada")):
+    ico = "➕"
+elif "-" in tipo_lower or tipo_lower.startswith(("v ", "v venda")):
+    ico = "➖"
+else:
+    ico = "🔧"
+
+st.markdown(
+    f"""
+<div style="
+  border:1px solid rgba(255,255,255,.15);
+  border-radius:14px;padding:.9rem 1rem;margin:.25rem 0;
+  background:rgba(255,255,255,.04);
+">
+  <div style="display:flex;gap:.6rem;align-items:center;">
+    <div style="font-size:1.35rem">{ico}</div>
+    <div>
+      <div style="font-weight:700">{prod}</div>
+      <div style="opacity:.8">{tipo} • Qtd: <b>{qtd or "—"}</b></div>
+      <div style="opacity:.7;font-size:.9rem">Data: {data} • IDProduto: {idp or "—"} • Origem: {origem or "—"}</div>
+      {"<div style='opacity:.8;margin-top:.35rem'>Obs.: " + obs + "</div>" if obs else ""}
+    </div>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# (Opcional) detalhes técnicos para quem quiser ver
+with st.expander("Detalhes (opcional)"):
+    st.json({k: v for k, v in rec.items() if k != "__Linha"})
 
     st.markdown("### Editar campos")
     # Campos básicos por tipo
