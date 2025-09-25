@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pages/03_Compras_Produtos_Entradas.py — Compras/entradas de estoque + Telegram + Fracionamento + Edição/Exclusão
+# pages/03_Compras_Produtos_Entradas.py — Compras/entradas + Telegram + Fracionamento + Edição/Exclusão (modo simples)
 from __future__ import annotations
 
 import json, unicodedata, re, time
@@ -8,7 +8,7 @@ import pandas as pd
 import gspread
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import date, datetime
+from datetime import date
 from typing import Iterable
 
 st.set_page_config(page_title="Compras / Entradas", page_icon="🧾", layout="wide")
@@ -67,12 +67,13 @@ def _load_df(aba: str, _bump: float | None = None) -> pd.DataFrame:
     df.columns = [c.strip() for c in df.columns]
     return df.fillna("")
 
-def _ensure_ws(name: str, headers: list[str]):
+def _ensure_ws(name: str, headers: list[str] | None = None):
+    headers = headers or []
     sh = _sheet()
     try:
         ws = sh.worksheet(name)
         cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
+        if headers and (cur.empty or any(h not in cur.columns for h in headers)):
             cols = list(dict.fromkeys(headers + cur.columns.tolist()))
             df_head = pd.DataFrame(columns=cols)
             ws.clear()
@@ -80,8 +81,9 @@ def _ensure_ws(name: str, headers: list[str]):
         return ws
     except Exception:
         ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        if headers:
+            df_head = pd.DataFrame(columns=headers)
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
         return ws
 
 def _append_row(ws, row: dict):
@@ -164,57 +166,41 @@ COL = {
     "unid": _pick_col(prod_df, ["Unidade","Unid","Und"]),
 }
 
-# ======== ESTOQUE ATUAL — PADRÃO ÚNICO: MovimentosEstoque ========
+# ======== ESTOQUE ATUAL — fonte única: MovimentosEstoque ========
 def _estoque_atual(pid: str = "", nome: str = "") -> float:
-    """
-    Calcula estoque atual SOMENTE a partir da aba MovimentosEstoque,
-    para ficar consistente com a página 'Estoque' e refletir fracionamentos.
-    """
     pid = (pid or "").strip()
     nome = (nome or "").strip()
-
     try:
         mov = _load_df(MOVS_ABA, BUMP)
     except Exception:
         mov = pd.DataFrame()
-
-    if mov.empty:
-        return 0.0
+    if mov.empty: return 0.0
 
     col_id   = _pick_col(mov, ["IDProduto", "ProdutoID", "ID"])
     col_nome = _pick_col(mov, ["Produto", "Nome"])
     col_qtd  = _pick_col(mov, ["Qtd", "Quantidade", "Qtde"])
     col_tipo = _pick_col(mov, ["Tipo"])
-
-    if not col_qtd or not col_tipo:
-        return 0.0
+    if not col_qtd or not col_tipo: return 0.0
 
     df = mov.copy()
     if pid and col_id:
         df = df[df[col_id].astype(str).str.strip() == pid]
     elif nome and col_nome:
         df = df[df[col_nome].astype(str).str.strip() == nome]
-
-    if df.empty:
-        return 0.0
+    if df.empty: return 0.0
 
     def _num(x: str) -> float:
-        s = str(x or "").strip().replace(" ", "")
-        s = s.replace(".", "").replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+        s = str(x or "").strip().replace(" ", "").replace(".", "").replace(",", ".")
+        try: return float(s)
+        except Exception: return 0.0
 
     def _sign(tipo: str) -> int:
         t = (tipo or "").lower()
         if "+" in t: return +1
         if "-" in t: return -1
-        if t.startswith("b"):  # B entrada
-            return +1
-        if t.startswith("v"):  # V venda
-            return -1
-        if t.startswith("a"):  # A ajuste (+/- no texto)
+        if t.startswith("b"): return +1   # B entrada
+        if t.startswith("v"): return -1   # V venda
+        if t.startswith("a"):             # A ajuste (+/- no texto)
             if "-" in t: return -1
             if "+" in t: return +1
             return 0
@@ -223,7 +209,6 @@ def _estoque_atual(pid: str = "", nome: str = "") -> float:
     qtd = 0.0
     for _, r in df.iterrows():
         qtd += _num(r.get(col_qtd, 0)) * _sign(r.get(col_tipo, ""))
-
     return float(qtd)
 
 # =========================
@@ -338,42 +323,7 @@ if salvar:
     _refresh_now()
 
 # =========================
-# 🚪 Navegação segura (sem PageNotFound)
-# =========================
-st.divider()
-c_nav1, c_nav2 = st.columns(2)
-
-def _try_switch(candidates: list[str]) -> bool:
-    for cand in candidates:
-        try:
-            st.switch_page(cand)
-            return True
-        except Exception:
-            pass
-    return False
-
-with c_nav1:
-    if st.button("↩️ Voltar ao Cadastro/Editar", use_container_width=True, key=f"btn_voltar_{BUMP}"):
-        ok = _try_switch([
-            "pages/02_cadastrar_produto.py",
-            "pages/02_Cadastrar_Produto.py",
-            "02_cadastrar_produto.py",
-        ])
-        if not ok:
-            st.warning("Página de cadastro/edição não encontrada. Verifique o nome do arquivo em /pages.")
-
-with c_nav2:
-    if st.button("📦 Ir ao Catálogo", use_container_width=True, key=f"btn_catalogo_{BUMP}"):
-        ok = _try_switch([
-            "pages/01_produtos.py",
-            "pages/01_Produtos.py",
-            "01_produtos.py",
-        ])
-        if not ok:
-            st.warning("Página do catálogo não encontrada. Confirme o nome do arquivo em /pages.")
-
-# =========================
-# 🧪 Fracionar granel → fracionados
+# 🧪 Fracionar granel → fracionados (com custo)
 # =========================
 st.divider()
 st.subheader("🧪 Fracionar — converter GRANEL (L) em fracionados")
@@ -409,6 +359,78 @@ def _ultima_compra(pid: str, nome: str):
         "total": row.get("Total","")
     }
 
+# ---- Helpers de custo ----
+def _parse_brl_to_float(s: str) -> float | None:
+    if s is None: return None
+    t = str(s).strip().replace("R$", "").replace(" ", "")
+    t = t.replace(".", "").replace(",", ".")
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+def _custo_por_litro_granel(prod_id: str, prod_nome: str) -> float | None:
+    """Lê a última compra do SKU granel (unidade L) e devolve custo por L."""
+    try:
+        comp = _load_df(COMPRAS_ABA, BUMP)
+    except Exception:
+        return None
+    if comp.empty:
+        return None
+
+    col_id  = _pick_col(comp, ["IDProduto","ProdutoID","ID"])
+    col_nom = _pick_col(comp, ["Produto","Nome"])
+    col_dat = "Data" if "Data" in comp.columns else None
+    col_uni = _pick_col(comp, ["Unidade","Unid","Und"])
+    col_cu  = _pick_col(comp, ["Custo Unitário","Custo unitário","Custo","CustoUnit"])
+
+    df = comp.copy()
+    if prod_id and col_id:
+        df = df[df[col_id].astype(str).str.strip() == str(prod_id).strip()]
+    elif prod_nome and col_nom:
+        df = df[df[col_nom].astype(str).str.strip() == str(prod_nome).strip()]
+    if df.empty or not col_cu:
+        return None
+
+    if col_dat:
+        try:
+            df["_d"] = pd.to_datetime(df[col_dat], format="%d/%m/%Y", errors="coerce")
+            df = df.sort_values("_d", ascending=False)
+        except Exception:
+            pass
+
+    row = df.iloc[0]
+    uni = (str(row.get(col_uni,"")).strip().lower() if col_uni else "l")
+    cu  = _parse_brl_to_float(row.get(col_cu, ""))
+    if cu is None:
+        return None
+    # Considera que granel é em L -> custo unitário já é por L
+    return float(cu)
+
+def _update_custo_atual_produto(prod_id: str, novo_custo: float) -> bool:
+    """Escreve Produtos.CustoAtual do SKU informado. Cria a coluna se não existir."""
+    try:
+        ws = _ensure_ws(PRODUTOS_ABA)
+        df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).fillna("")
+        if df.empty:
+            return False
+        col_id = _pick_col(df, ["ID","Id","id","Codigo","Código","SKU","IDProduto"])
+        if not col_id:
+            return False
+        if "CustoAtual" not in df.columns:
+            df["CustoAtual"] = ""
+        m = df[col_id].astype(str).str.strip() == str(prod_id).strip()
+        if not m.any():
+            return False
+        idx = df.index[m][0]
+        df.at[idx, "CustoAtual"] = f"{novo_custo:.2f}".replace(".", ",")
+        ws.clear()
+        set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
+        return True
+    except Exception:
+        return False
+
+# carregar produtos
 try:
     produtos = _load_df(PRODUTOS_ABA, BUMP)
 except Exception:
@@ -462,6 +484,23 @@ else:
         total_litros = (qtd_1 * vol_1_l) + (qtd_2 * vol_2_l)
         st.write(f"🔁 Litros a baixar do granel: **{_fmt_num(total_litros)} L**")
 
+        # ---- custos estimados ----
+        custo_L = _custo_por_litro_granel(gid, gnome) or 0.0
+        c1a, c2a = st.columns(2)
+        with c1a:
+            custo_emb_a = st.number_input("Custo embalagem A (opcional)", min_value=0.0, step=0.05, value=0.0, format="%.2f", key=f"embA_{BUMP}")
+        with c2a:
+            custo_emb_b = st.number_input("Custo embalagem B (opcional)", min_value=0.0, step=0.05, value=0.0, format="%.2f", key=f"embB_{BUMP}")
+        custo_a = round(custo_L * float(vol_1_l) + float(custo_emb_a), 2) if qtd_1 > 0 else 0.0
+        custo_b = round(custo_L * float(vol_2_l) + float(custo_emb_b), 2) if qtd_2 > 0 else 0.0
+
+        if custo_L > 0:
+            st.caption(f"💰 Custo do granel (L): R$ {custo_L:.2f}")
+        if qtd_1 > 0:
+            st.caption(f"• Custo estimado frasco A: R$ {custo_a:.2f}")
+        if qtd_2 > 0:
+            st.caption(f"• Custo estimado frasco B: R$ {custo_b:.2f}")
+
         confirmar = st.button("Registrar fracionamento", use_container_width=True, key=f"btn_frac_{BUMP}")
 
         if confirmar:
@@ -488,13 +527,17 @@ else:
             })
 
             linhas = []
+            id_a = id_b = ""
+
             # entrada fracionado A (unidades)
             if qtd_1 > 0:
                 r1 = df_un.iloc[idx_1]
+                id_a = _nz(r1.get(COL_ID,""))
+                nome_a = _nz(r1.get(COL_NOME,""))
                 _append_row(ws_mov, {
                     "Data": data_str,
-                    "IDProduto": _nz(r1.get(COL_ID,"")),
-                    "Produto": _nz(r1.get(COL_NOME,"")),
+                    "IDProduto": id_a,
+                    "Produto": nome_a,
                     "Tipo": "C fracionamento +",
                     "Qtd": str(qtd_1),
                     "Obs": f"Fracionamento: {_fmt_num(vol_1_l)} L/frasco",
@@ -503,15 +546,17 @@ else:
                     "Origem": "Fracionamento",
                     "SaldoApós": ""
                 })
-                linhas.append(f"• {_nz(r1.get(COL_NOME,''))}: <b>{qtd_1}</b> un ({_fmt_num(vol_1_l)} L/frasco)")
+                linhas.append(f"• {nome_a}: <b>{qtd_1}</b> un ({_fmt_num(vol_1_l)} L/frasco)")
 
             # entrada fracionado B (unidades)
             if qtd_2 > 0:
                 r2 = df_un.iloc[idx_2]
+                id_b = _nz(r2.get(COL_ID,""))
+                nome_b = _nz(r2.get(COL_NOME,""))
                 _append_row(ws_mov, {
                     "Data": data_str,
-                    "IDProduto": _nz(r2.get(COL_ID,"")),
-                    "Produto": _nz(r2.get(COL_NOME,"")),
+                    "IDProduto": id_b,
+                    "Produto": nome_b,
                     "Tipo": "C fracionamento +",
                     "Qtd": str(qtd_2),
                     "Obs": f"Fracionamento: {_fmt_num(vol_2_l)} L/frasco",
@@ -520,68 +565,32 @@ else:
                     "Origem": "Fracionamento",
                     "SaldoApós": ""
                 })
-                linhas.append(f"• {_nz(r2.get(COL_NOME,''))}: <b>{qtd_2}</b> un ({_fmt_num(vol_2_l)} L/frasco)")
+                linhas.append(f"• {nome_b}: <b>{qtd_2}</b> un ({_fmt_num(vol_2_l)} L/frasco)")
 
+            # Atualiza custo atual dos SKUs fracionados
+            try:
+                if id_a and custo_a > 0:
+                    _update_custo_atual_produto(id_a, custo_a)
+                if id_b and custo_b > 0:
+                    _update_custo_atual_produto(id_b, custo_b)
+            except Exception:
+                pass
+
+            # ---- Telegram do fracionamento ----
             saldo_depois = (estoque_g - total_litros) if isinstance(estoque_g, (int,float)) else None
             msg = (
                 "🧪 <b>Fracionamento registrado</b>\n"
                 f"{data_str}\n"
                 f"Granel: <b>{gnome}</b>  ↓ <b>{_fmt_num(total_litros)} L</b>\n"
                 + ("\n".join(linhas) + "\n" if linhas else "")
+                + (f"💰 Custo A: R$ {custo_a:.2f} | Custo B: R$ {custo_b:.2f}\n" if (custo_a or custo_b) else "")
                 + (f"📦 Granel: {_fmt_num(estoque_g)} → <b>{_fmt_num(saldo_depois)}</b> L" if saldo_depois is not None else "")
             )
             _tg_send(msg)
 
             st.success("Fracionamento registrado com sucesso! ✅")
-            st.toast("Movimentos de fracionamento lançados", icon="✅")
+            st.toast("Movimentos e custos atualizados", icon="✅")
             _refresh_now()
-
-# --- imports necessários ---
-import pandas as pd
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
-
-# --- depende do seu _sheet() já existente ---
-def _ensure_ws(name: str, headers: list[str]):
-    """Garante que a worksheet existe e tem pelo menos as colunas pedidas."""
-    sh = _sheet()  # usa a função que você já tem
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            df_head = pd.DataFrame(columns=cols)
-            ws.clear()
-            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-    except Exception:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-
-def _load_with_rownums(aba: str, headers: list[str]):
-    """
-    Lê a aba e adiciona a coluna técnica '__Linha' com o número real da linha na planilha (dados começam na 2).
-    Retorna (dataframe, worksheet).
-    """
-    ws = _ensure_ws(aba, headers)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    if df.empty:
-        df = pd.DataFrame(columns=headers)
-    df = df.fillna("")
-    df["__Linha"] = (df.index + 2).astype(int)
-    for h in headers:
-        if h not in df.columns:
-            df[h] = ""
-    cols = ["__Linha"] + [c for c in df.columns if c != "__Linha"]
-    return df[cols].copy(), ws
-
-def _save_df_over(ws, df: pd.DataFrame):
-    """Grava o dataframe inteiro por cima, removendo a coluna técnica '__Linha' antes."""
-    df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
-    ws.clear()
-    set_with_dataframe(ws, df2.fillna(""), include_index=False, include_column_header=True, resize=True)
-
 
 # =========================================================
 # 🛠️ Modo Simples — Corrigir lançamento (Editar / Apagar)
@@ -601,6 +610,24 @@ if "Compra" in TIPO_OP:
     BASE_ABA, BASE_HEADERS = COMPRAS_ABA, COMPRAS_HEADERS
 else:
     BASE_ABA, BASE_HEADERS = MOVS_ABA, MOV_HEADERS
+
+def _load_with_rownums(aba: str, headers: list[str]):
+    ws = _ensure_ws(aba, headers)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    if df.empty:
+        df = pd.DataFrame(columns=headers)
+    df = df.fillna("")
+    df["__Linha"] = (df.index + 2).astype(int)  # cabeçalho = 1
+    for h in headers:
+        if h not in df.columns:
+            df[h] = ""
+    cols = ["__Linha"] + [c for c in df.columns if c != "__Linha"]
+    return df[cols].copy(), ws
+
+def _save_df_over(ws, df: pd.DataFrame):
+    df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
+    ws.clear()
+    set_with_dataframe(ws, df2.fillna(""), include_index=False, include_column_header=True, resize=True)
 
 df_base, ws_base = _load_with_rownums(BASE_ABA, BASE_HEADERS)
 
@@ -660,26 +687,25 @@ else:
     rec = df_view.iloc[int(escolha)].to_dict()
     linha_real = int(rec["__Linha"])
 
-# --- Cartão-resumo amigável ---
-data   = _nz(rec.get("Data",""))
-prod   = _nz(rec.get("Produto",""))
-tipo   = _nz(rec.get("Tipo",""))
-qtd    = _nz(rec.get("Qtd",""))
-idp    = _nz(rec.get("IDProduto",""))
-origem = _nz(rec.get("Origem",""))
-obs    = _nz(rec.get("Obs",""))
+    # --- Cartão-resumo amigável ---
+    data   = _nz(rec.get("Data",""))
+    prod   = _nz(rec.get("Produto",""))
+    tipo   = _nz(rec.get("Tipo",""))
+    qtd    = _nz(rec.get("Qtd",""))
+    idp    = _nz(rec.get("IDProduto",""))
+    origem = _nz(rec.get("Origem",""))
+    obs    = _nz(rec.get("Obs",""))
 
-# Escolhe ícone conforme o tipo
-tipo_lower = tipo.lower()
-if "+" in tipo_lower or tipo_lower.startswith(("b ", "b entrada")):
-    ico = "➕"
-elif "-" in tipo_lower or tipo_lower.startswith(("v ", "v venda")):
-    ico = "➖"
-else:
-    ico = "🔧"
+    tipo_lower = tipo.lower()
+    if "+" in tipo_lower or tipo_lower.startswith(("b ", "b entrada")):
+        ico = "➕"
+    elif "-" in tipo_lower or tipo_lower.startswith(("v ", "v venda")):
+        ico = "➖"
+    else:
+        ico = "🔧"
 
-st.markdown(
-    f"""
+    st.markdown(
+        f"""
 <div style="
   border:1px solid rgba(255,255,255,.15);
   border-radius:14px;padding:.9rem 1rem;margin:.25rem 0;
@@ -696,12 +722,11 @@ st.markdown(
   </div>
 </div>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
-# (Opcional) detalhes técnicos para quem quiser ver
-with st.expander("Detalhes (opcional)"):
-    st.json({k: v for k, v in rec.items() if k != "__Linha"})
+    with st.expander("Detalhes (opcional)"):
+        st.json({k: v for k, v in rec.items() if k != "__Linha"})
 
     st.markdown("### Editar campos")
     # Campos básicos por tipo
