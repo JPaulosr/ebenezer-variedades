@@ -360,12 +360,32 @@ def _ultima_compra(pid: str, nome: str):
     }
 
 # ---- Helpers de custo ----
-def _parse_brl_to_float(s: str) -> float | None:
-    if s is None: return None
-    t = str(s).strip().replace("R$", "").replace(" ", "")
-    t = t.replace(".", "").replace(",", ".")
+def _parse_brl_to_float(s: str | float | int) -> float | None:
+    """Converte valores tipo '4,49', '4.49', 'R$ 4,49', 4.49 etc. para float."""
+    import pandas as pd, re
+    if s is None: 
+        return None
+    if isinstance(s, (int, float)) and not pd.isna(s):
+        return float(s)
+
+    t = str(s).strip()
+    if t == "" or t.lower() in ("nan", "none"):
+        return None
+
+    t = t.replace("R$", "").replace(" ", "").replace("−", "-")
+    neg_paren = t.startswith("(") and t.endswith(")")
+    if neg_paren:
+        t = t[1:-1]
+
+    if "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    t = re.sub(r"(?<!^)-", "", t)
+    t = re.sub(r"[^0-9.\-]", "", t)
     try:
-        return float(t)
+        v = float(t)
+        if neg_paren:
+            v = -abs(v)
+        return v
     except Exception:
         return None
 
