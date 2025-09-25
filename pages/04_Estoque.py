@@ -23,7 +23,6 @@ st.markdown("""
   --bg2: rgba(255,255,255,.06);
   --borda: rgba(255,255,255,.12);
   --muted: rgba(255,255,255,.65);
-  --ok: #22c55e; --warn:#f59e0b; --err:#ef4444; --info:#3b82f6;
 }
 .block-container { padding-top: 1.2rem; }
 .kpi{border:1px solid var(--borda); background:var(--bg); padding:1rem 1.1rem; border-radius:16px;}
@@ -71,7 +70,6 @@ def _client():
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
     return gspread.authorize(creds)
 
-# ---- PATCH: abrir planilha com mensagens claras (URL/Permissão) ----
 @st.cache_resource
 def _sheet():
     gc = _client()
@@ -88,7 +86,7 @@ def _sheet():
     except gspread.exceptions.APIError as e:
         svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
         client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
-        st.error(f"🛑 Sem acesso à planilha (provável 403). Compartilhe a planilha com: **{client_email}** (Editor).")
+        st.error(f"🛑 Sem acesso à planilha (403). Compartilhe com: **{client_email}** (Editor).")
         st.caption(f"Detalhe técnico: {e}")
         st.stop()
 
@@ -97,11 +95,10 @@ def _sheet_titles() -> set[str]:
     try:
         return {ws.title for ws in _sheet().worksheets()}
     except gspread.exceptions.APIError as e:
-        st.error("Falha ao listar abas da planilha. Verifique permissões.")
+        st.error("Falha ao listar abas.")
         st.caption(f"Detalhe técnico: {e}")
         return set()
 
-# ---- PATCH: carregamento de aba à prova de erro ----
 @st.cache_data(ttl=1, show_spinner=False)
 def _load_df(aba: str) -> pd.DataFrame:
     """Carrega uma aba e devolve DataFrame; se não existir, devolve vazio sem quebrar o app."""
@@ -115,7 +112,7 @@ def _load_df(aba: str) -> pd.DataFrame:
     except gspread.exceptions.APIError as e:
         svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
         client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
-        st.error(f"🛑 Erro de acesso ao Sheets. Compartilhe a planilha com **{client_email}** e confira PLANILHA_URL.")
+        st.error(f"🛑 Erro de acesso ao Sheets. Compartilhe com **{client_email}** e confira PLANILHA_URL.")
         st.caption(f"Aba pedida: {aba} • Detalhe técnico: {e}")
         st.stop()
 
@@ -148,7 +145,7 @@ def _append_row(ws, row: dict):
 # Utilidades
 # =========================
 def _to_num(x) -> float:
-    """Converte para float preservando negativos; aceita vírgula, R$, (6) etc."""
+    """Converte para float preservando negativos; aceita vírgula, R$, parênteses."""
     if x is None: return 0.0
     s = str(x).strip()
     if s == "" or s.lower() in ("nan","none"): return 0.0
@@ -157,7 +154,7 @@ def _to_num(x) -> float:
     if neg_paren: s = s[1:-1]
     s = s.replace("R$","").replace(" ","")
     if "," in s: s = s.replace(".","").replace(",",".")
-    s = re.sub(r"(?<!^)-","",s)
+    s = re.sub(r"(?<!^)-","",s)        # remove traços extras
     s = re.sub(r"[^0-9.\-]","",s)
     try: v=float(s)
     except: v=0.0
@@ -197,7 +194,7 @@ def _prod_key_from(prod_id, prod_nome):
 # Abas & Headers
 # =========================
 ABA_PRODUTOS="Produtos"
-ABA_COMPRAS="Compras"             # só para custo
+ABA_COMPRAS="Compras"             # somente para custo (fallback)
 ABA_MOV="MovimentosEstoque"       # FONTE ÚNICA de quantidades
 ABA_VENDAS="Vendas"
 
@@ -216,7 +213,7 @@ mov_df=_load_df(ABA_MOV) if ABA_MOV in titles else pd.DataFrame(columns=MOV_HEAD
 # Normalizações
 # =========================
 COLP={
-    "id":   next((c for c in ["ID","Id","id","Codigo","Código","SKU"] if c in prod_df.columns),None),
+    "id":   next((c for c in ["ID","Id","id","Codigo","Código","SKU","IDProduto","ProdutoID"] if c in prod_df.columns),None),
     "nome": next((c for c in ["Nome","Produto","Descrição","Descricao"] if c in prod_df.columns),None),
 }
 if COLP["nome"] is None:
@@ -228,18 +225,31 @@ base["__key"]=base.apply(lambda r:_prod_key_from(r.get(COLP["id"],""), r.get(COL
 base["Produto"]=base[COLP["nome"]]
 base["IDProduto"]=base[COLP["id"]] if COLP["id"] else ""
 
-# custo atual (última compra por chave)
-for c in COMPRAS_HEADERS:
-    if c not in compras_df.columns: compras_df[c]=""
+# ---------- Custos ----------
+# 1) Produtos.CustoAtual (prioridade)
+custo_produto_map = {}
+if "CustoAtual" in prod_df.columns:
+    tmp = prod_df.copy()
+    tmp["__key"] = tmp.apply(lambda r:_prod_key_from(r.get(COLP["id"],""), r.get(COLP["nome"],"")), axis=1)
+    tmp["CustoAtual_num"] = tmp["CustoAtual"].apply(_to_num)
+    custo_produto_map = dict(zip(tmp["__key"], tmp["CustoAtual_num"]))
+
+# 2) Última compra (fallback)
+custo_compra_map = {}
 if not compras_df.empty:
     compras_df["__key"]=compras_df.apply(lambda r:_prod_key_from(r.get("IDProduto",""), r.get("Produto","")),axis=1)
     compras_df["Custo_num"]=compras_df["Custo Unitário"].apply(_to_num)
     last_cost=compras_df.groupby("__key",as_index=False).tail(1)
-    custo_atual_map=dict(zip(last_cost["__key"], last_cost["Custo_num"]))
-else:
-    custo_atual_map={}
+    custo_compra_map=dict(zip(last_cost["__key"], last_cost["Custo_num"]))
 
-# movimentos
+# 3) Escolha final de custo
+def _custo_atual(key: str) -> float:
+    v_prod = float(custo_produto_map.get(key, 0.0))
+    if v_prod > 0:
+        return v_prod
+    return float(custo_compra_map.get(key, 0.0))
+
+# ---------- Movimentos ----------
 for c in MOV_HEADERS:
     if c not in mov_df.columns: mov_df[c]=""
 if not mov_df.empty:
@@ -262,7 +272,7 @@ df["Entradas"]=df["__key"].apply(lambda k:_get(entradas_mov,k))
 df["Saidas"]=df["__key"].apply(lambda k:_get(saidas_mov,k))
 df["Ajustes"]=df["__key"].apply(lambda k:_get(ajustes_mov,k))
 df["EstoqueAtual"]=df["Entradas"]-df["Saidas"]+df["Ajustes"]
-df["CustoAtual"]=df["__key"].apply(lambda k:float(custo_atual_map.get(k,0.0)))
+df["CustoAtual"]=df["__key"].apply(_custo_atual)
 df["ValorTotal"]=(df["EstoqueAtual"].astype(float)*df["CustoAtual"].astype(float)).round(2)
 
 # =========================
@@ -271,17 +281,17 @@ df["ValorTotal"]=(df["EstoqueAtual"].astype(float)*df["CustoAtual"].astype(float
 left,right=st.columns([0.7,0.3])
 with left:
     st.markdown("<h1>📦 Estoque — Movimentos & Ajustes</h1>",unsafe_allow_html=True)
-    st.markdown(f"<div class='small'>Fonte única: <b>{ABA_MOV}</b> • Atualizado: <code>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</code></div>",unsafe_allow_html=True)
+    st.markdown(f"<div class='small'>Fonte de quantidade: <b>{ABA_MOV}</b> • Atualizado: <code>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</code></div>",unsafe_allow_html=True)
 with right:
     if Path("pages/03_Compras_Produtos_Entradas.py").exists():
-        st.page_link("pages/03_Compras_Produtos_Entradas.py", label="🧾 Registrar Compras / Entradas", icon="🧾")
+        st.page_link("pages/03_Compras_Produtos_Entradas.py", label="🧾 Compras / Entradas", icon="🧾")
     if Path("pages/01_Produtos.py").exists():
-        st.page_link("pages/01_Produtos.py", label="📦 Ir ao Catálogo", icon="📦")
+        st.page_link("pages/01_Produtos.py", label="📦 Catálogo", icon="📦")
 
-st.markdown("<div class='badge'>Consolidação por movimentos (Entradas - Saídas + Ajustes)</div>", unsafe_allow_html=True)
+st.markdown("<div class='badge'>Quantidade = Entradas − Saídas + Ajustes • Custo: Produtos.CustoAtual ➜ Última Compra</div>", unsafe_allow_html=True)
 st.markdown("<hr/>", unsafe_allow_html=True)
 
-# ------ Painel de diagnóstico (ajuda a resolver 403/URL) ------
+# ------ Diagnóstico (útil p/ permissões/URL) ------
 with st.expander("🧩 Diagnóstico de Conexão com Google Sheets"):
     try:
         svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
