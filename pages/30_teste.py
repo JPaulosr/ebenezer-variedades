@@ -321,6 +321,17 @@ if "desc" not in st.session_state:  st.session_state["desc"] = 0.0
 if "cliente" not in st.session_state: st.session_state["cliente"] = ""
 if "venc_fiado" not in st.session_state: st.session_state["venc_fiado"] = date.today() + timedelta(days=30)
 
+# ================= Helper rerun =================
+def _rerun():
+    """Compatível com versões novas e antigas do Streamlit"""
+    try:
+        st.rerun()
+    except AttributeError:
+        try:
+            st.experimental_rerun()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
 # ================= Carrinho =================
 st.subheader("Nova venda / cupom")
 
@@ -349,14 +360,11 @@ if add:
         st.warning("Selecione um produto.")
     else:
         info = cat_map[sel]
-        # coluna de foto e validação de URL
-        foto_col = _first_col(dfp, ["Foto","Imagem","Image","Photo","FotoURL","ImagemURL"])
-        foto_val = str(info.get(foto_col, "") or "").strip()
         st.session_state["cart"].append({
             "id": str(info[col_id]),
             "nome": str(info[col_nome]),
             "unid": str(info.get(col_unid, "un")),
-            "foto": (foto_val if _is_http_url(foto_val) else ""),
+            "foto": str(info.get(col_foto := _first_col(dfp, ["Foto","Imagem","Image","Photo","FotoURL","ImagemURL"])) or ""),
             "qtd": int(qtd),
             "preco": float(preco)
         })
@@ -369,23 +377,24 @@ if not st.session_state["cart"]:
 else:
     for idx, it in enumerate(st.session_state["cart"]):
         c0, c1, c2, c3, c4, c5 = st.columns([1, 2.6, 1, 1.6, 1.8, 0.8])
-        foto = it.get("foto","")
-        if _is_http_url(foto):
-            try:
-                c0.image(foto, width=54)
-            except Exception:
-                c0.write("—")
+        if it.get("foto"):
+            c0.image(it["foto"], width=54)
         else:
             c0.write("—")
         c1.write(f"**{it['nome']}**")
         c2.caption(f"Estoque: {int(id_to_stock.get(it['id'], 0))}")
         with c3:
-            st.session_state["cart"][idx]["qtd"] = st.number_input("Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"]))
+            st.session_state["cart"][idx]["qtd"] = st.number_input(
+                "Qtd", key=f"q_{idx}", min_value=1, step=1, value=int(it["qtd"])
+            )
         with c4:
-            st.session_state["cart"][idx]["preco"] = st.number_input("Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1, value=float(it["preco"]), format="%.2f")
+            st.session_state["cart"][idx]["preco"] = st.number_input(
+                "Preço (R$)", key=f"p_{idx}", min_value=0.0, step=0.1,
+                value=float(it["preco"]), format="%.2f"
+            )
         if c5.button("🗑️", key=f"rm_{idx}"):
             st.session_state["cart"].pop(idx)
-            st.experimental_rerun()
+            _rerun()  # <-- corrigido aqui
 
     st.markdown("---")
     total_itens = sum(i["qtd"] for i in st.session_state["cart"])
@@ -417,7 +426,10 @@ else:
 
         st.session_state["obs"] = st.text_input("Observações (opcional)", value=st.session_state["obs"])
     with cR:
-        st.session_state["desc"]  = st.number_input("Desconto (R$)", min_value=0.0, value=float(st.session_state["desc"]), step=0.5, format="%.2f")
+        st.session_state["desc"]  = st.number_input(
+            "Desconto (R$)", min_value=0.0, value=float(st.session_state["desc"]),
+            step=0.5, format="%.2f"
+        )
         total_liq = max(0.0, total_bruto - float(st.session_state["desc"]))
         st.metric("Total itens", total_itens)
         st.metric("Total bruto", _fmt_brl_num(total_bruto))
