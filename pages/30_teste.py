@@ -536,6 +536,53 @@ else:
             st.toast("Movimentos de fracionamento lançados", icon="✅")
             _refresh_now()
 
+# --- imports necessários ---
+import pandas as pd
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+
+# --- depende do seu _sheet() já existente ---
+def _ensure_ws(name: str, headers: list[str]):
+    """Garante que a worksheet existe e tem pelo menos as colunas pedidas."""
+    sh = _sheet()  # usa a função que você já tem
+    try:
+        ws = sh.worksheet(name)
+        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
+        if cur.empty or any(h not in cur.columns for h in headers):
+            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
+            df_head = pd.DataFrame(columns=cols)
+            ws.clear()
+            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+    except Exception:
+        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
+        df_head = pd.DataFrame(columns=headers)
+        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        return ws
+
+def _load_with_rownums(aba: str, headers: list[str]):
+    """
+    Lê a aba e adiciona a coluna técnica '__Linha' com o número real da linha na planilha (dados começam na 2).
+    Retorna (dataframe, worksheet).
+    """
+    ws = _ensure_ws(aba, headers)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    if df.empty:
+        df = pd.DataFrame(columns=headers)
+    df = df.fillna("")
+    df["__Linha"] = (df.index + 2).astype(int)
+    for h in headers:
+        if h not in df.columns:
+            df[h] = ""
+    cols = ["__Linha"] + [c for c in df.columns if c != "__Linha"]
+    return df[cols].copy(), ws
+
+def _save_df_over(ws, df: pd.DataFrame):
+    """Grava o dataframe inteiro por cima, removendo a coluna técnica '__Linha' antes."""
+    df2 = df.drop(columns=[c for c in df.columns if c == "__Linha"], errors="ignore")
+    ws.clear()
+    set_with_dataframe(ws, df2.fillna(""), include_index=False, include_column_header=True, resize=True)
+
+
 # =========================================================
 # 🛠️ Modo Simples — Corrigir lançamento (Editar / Apagar)
 # =========================================================
