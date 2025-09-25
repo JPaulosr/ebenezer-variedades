@@ -388,7 +388,44 @@ if st.button("🔄 Atualizar Estoque", key="btn_atualizar_fracionamento"):
 
 # helper: última compra do granel (info rápida)
 def _ultima_compra(pid: str, nome: str):
-    # ... (mantenha o código existente) ...
+    try: 
+        comp = _load_df(COMPRAS_ABA, BUMP)
+    except Exception: 
+        return None
+    if comp.empty: 
+        return None
+
+    col_id = None
+    for c in ["IDProduto","ProdutoID","ID"]:
+        if c in comp.columns:
+            col_id = c
+            break
+    col_nome = "Produto" if "Produto" in comp.columns else None
+    col_data = "Data" if "Data" in comp.columns else None
+
+    df = comp.copy()
+    if col_id:
+        df = df[_eq(df[col_id], pid)]
+    elif col_nome:
+        df = df[_eq(df[col_nome], nome)]
+
+    if df.empty: 
+        return None
+    if col_data and col_data in df.columns:
+        try:
+            df["_d"] = pd.to_datetime(df[col_data], format="%d/%m/%Y", errors="coerce")
+            df = df.sort_values("_d", ascending=False)
+        except Exception: 
+            pass
+
+    row = df.iloc[0].to_dict()
+    return {
+        "data": row.get("Data",""),
+        "qtd": row.get("Qtd",""),
+        "unid": row.get("Unidade",""),
+        "custo_unit": row.get("Custo Unitário",""),
+        "total": row.get("Total","")
+    }
 
 # carregar produtos
 try:
@@ -443,7 +480,8 @@ else:
             a_qtd = _pick_col(ajus, ["Qtd","Quantidade","Qtde"])
 
             def _sum(df, col_q, filtro):
-                if df.empty or not col_q: return 0.0
+                if df.empty or not col_q: 
+                    return 0.0
                 sub = df[filtro].copy()
                 return pd.to_numeric(
                     sub[col_q].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
@@ -487,9 +525,11 @@ else:
 
         if confirmar:
             if total_litros <= 0:
-                st.error("Informe quantidades > 0 para fracionar."); st.stop()
+                st.error("Informe quantidades > 0 para fracionar.")
+                st.stop()
             if isinstance(estoque_g, (int, float)) and estoque_g < total_litros - 1e-9:
-                st.error("Estoque do granel insuficiente para este fracionamento."); st.stop()
+                st.error("Estoque do granel insuficiente para este fracionamento.")
+                st.stop()
 
             # custo por litro a partir da última compra do granel
             info = _ultima_compra(gid, gnome) or {}
@@ -548,7 +588,8 @@ else:
             # ----- ENTRADAS dos fracionados (gera custo médio) -----
             if qtd_1 > 0:
                 r1 = df_un.iloc[idx_1]
-                id1 = _nz(r1.get(COL_ID,"")); nm1 = _nz(r1.get(COL_NOME,""))
+                id1 = _nz(r1.get(COL_ID,""))
+                nm1 = _nz(r1.get(COL_NOME,""))
                 custo_unit_1 = round(custo_litro * float(vol_1_l), 4)
                 total_1 = round(custo_unit_1 * int(qtd_1), 2)
                 _append_row(ws_com, {
@@ -578,7 +619,8 @@ else:
 
             if qtd_2 > 0:
                 r2 = df_un.iloc[idx_2]
-                id2 = _nz(r2.get(COL_ID,"")); nm2 = _nz(r2.get(COL_NOME,""))
+                id2 = _nz(r2.get(COL_ID,""))
+                nm2 = _nz(r2.get(COL_NOME,""))
                 custo_unit_2 = round(custo_litro * float(vol_2_l), 4)
                 total_2 = round(custo_unit_2 * int(qtd_2), 2)
                 _append_row(ws_com, {
