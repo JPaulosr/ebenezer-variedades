@@ -556,4 +556,5 @@ else:
         # remover item
         if c5.button("🗑️", key=f"rm_{idx}"):
             st.session_state["cart"].pop(idx)
-            _rerun()
+            _rerun()  # força refresh imediato
+
