@@ -10,7 +10,6 @@ import plotly.express as px
 import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
-from gspread.utils import rowcol_to_a1
 
 st.set_page_config(page_title="Ebenezér Variedades — Dashboard", page_icon="🧮", layout="wide")
 st.title("🧮 Dashboard — Ebenezér Variedades")
@@ -263,18 +262,16 @@ def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _normalize_compras_all(c: pd.DataFrame) -> pd.DataFrame:
-    if c.empty: return pd.DataFrame(columns=["KeyID","QtdNum","CustoNum","Data_d"])
+    if c.empty: return pd.DataFrame(columns=["KeyID","QtdNum","CustoNum"])
     c = c.copy(); c.columns = [x.strip() for x in c.columns]
     col_idp = _first_col(c, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
     col_qtd = _first_col(c, ["Qtd","Quantidade","Qtde","Qde","QTD"])
     col_cu  = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit",
                              "Custo","Preço de Custo","PrecoCusto","Preço Custo"])
-    col_dt  = _first_col(c, ["Data"])
     out = pd.DataFrame({
         "KeyID": c[col_idp].apply(_canon_id) if col_idp else "",
         "QtdNum": c[col_qtd].apply(_to_float) if col_qtd else 0.0,
         "CustoNum": c[col_cu].apply(_to_float) if col_cu else 0.0,
-        "Data_d": c[col_dt].apply(_parse_date_any) if col_dt else None,
     })
     out = out[out["KeyID"]!=""]
     return out
@@ -315,12 +312,6 @@ if not c_all.empty:
 else:
     custo_medio = pd.Series(dtype=float)
 
-# último custo de compra (mais recente por Data)
-if not c_all.empty:
-    last_cost = c_all.sort_values("Data_d").groupby("KeyID")["CustoNum"].last().fillna(0.0)
-else:
-    last_cost = pd.Series(dtype=float)
-
 calc["CustoMedio"] = custo_medio
 calc = calc.reset_index().rename(columns={"index":"KeyID"})
 
@@ -330,6 +321,7 @@ calc = calc.reset_index().rename(columns={"index":"KeyID"})
 prod_calc = prod.copy() if not prod.empty else pd.DataFrame()
 if not prod_calc.empty and "KeyID" in prod_calc.columns:
     prod_calc = prod_calc.merge(calc, how="left", on="KeyID", suffixes=("_orig", ""))
+    # limpa colunas antigas duplicadas
     for col in ["EstoqueCalc", "CustoMedio", "Entradas", "Saidas", "Ajustes"]:
         col_old = f"{col}_orig"
         if col_old in prod_calc.columns:
@@ -351,9 +343,17 @@ if not vendas.empty:
 else:
     faturamento = 0.0; num_cupons = 0; itens_vendidos = 0.0
 
+
 # =========================
 # COGS + lucro, margem, ticket, caixa
 # =========================
+# Seleção da fonte de custo usada no COGS
+fonte_custo = st.sidebar.selectbox(
+    "Fonte do custo (COGS)",
+    ["Automático (preferir CustoMedio)", "Sempre CustoAtual", "Sempre CustoMedio"],
+    index=0
+)
+
 if not prod_calc.empty:
     _cm = prod_calc.set_index("KeyID")["CustoMedio"] if "CustoMedio" in prod_calc.columns else pd.Series(dtype=float)
     _ca = prod_calc.set_index("KeyID")["CustoAtual"] if "CustoAtual" in prod_calc.columns else pd.Series(dtype=float)
@@ -362,7 +362,12 @@ if not prod_calc.empty:
     for _pid in ids_all:
         v_cm = float((_cm.get(_pid, 0) or 0))
         v_ca = float((_ca.get(_pid, 0) or 0))
-        custo_ref[str(_pid)] = v_cm if v_cm > 0 else v_ca
+        if fonte_custo == "Sempre CustoAtual":
+            custo_ref[str(_pid)] = v_ca
+        elif fonte_custo == "Sempre CustoMedio":
+            custo_ref[str(_pid)] = v_cm
+        else:  # Automático
+            custo_ref[str(_pid)] = v_cm if v_cm > 0 else v_ca
 else:
     custo_ref = {}
 
@@ -370,17 +375,32 @@ if not vendas.empty:
     vv = vendas.copy()
     vv["KeyID"] = vv["KeyID"].astype(str)
     vv = vv[vv["KeyID"] != ""]
-    vv["_CustoLinha"] = vv["QtdNum"] * vv["KeyID"].map(lambda k: float(custo_ref.get(str(k), 0.0) or 0.0))
+    vv["CustoUnitUsado"] = vv["KeyID"].map(lambda k: float(custo_ref.get(str(k), 0.0) or 0.0))
+    vv["_CustoLinha"] = vv["QtdNum"] * vv["CustoUnitUsado"]
     cogs = float(vv["_CustoLinha"].sum())
 else:
     cogs = 0.0
 
-lucro_bruto   = max(0.0, faturamento - cogs)
+# NÃO trave o lucro em zero — deixe negativo para diagnosticar margem errada
+lucro_bruto   = faturamento - cogs
 margem_bruta  = (lucro_bruto / faturamento * 100) if faturamento > 0 else 0.0
 ticket_medio  = (faturamento / num_cupons) if num_cupons > 0 else 0.0
 compras_total = compras["TotalNum"].sum() if not compras.empty else 0.0
 caixa_periodo = faturamento - compras_total
 
+# Diagnóstico do COGS
+with st.expander("🔍 Diagnóstico do lucro bruto / COGS"):
+    if not vendas.empty:
+        dbg = vv[["KeyID","QtdNum","PrecoNum","TotalNum","CustoUnitUsado","_CustoLinha"]].copy()
+        if not prod_calc.empty and "Nome" in prod_calc.columns:
+            dbg = dbg.merge(prod_calc[["KeyID","Nome"]], how="left", on="KeyID")
+            dbg.rename(columns={"Nome":"Produto"}, inplace=True)
+        st.dataframe(dbg, use_container_width=True, hide_index=True)
+        st.caption(f"COGS calculado: {_fmt_brl(cogs)} • Faturamento: {_fmt_brl(faturamento)} • Lucro bruto: {_fmt_brl(lucro_bruto)}")
+        suspeitos = dbg[(dbg["CustoUnitUsado"] <= 0) | (dbg["CustoUnitUsado"] >= dbg["PrecoNum"])]
+        if not suspeitos.empty:
+            st.warning("Linhas suspeitas (custo <= 0 ou custo >= preço de venda):")
+            st.dataframe(suspeitos[["KeyID","Produto","QtdNum","PrecoNum","CustoUnitUsado"]], use_container_width=True, hide_index=True)
 # =========================
 # KPIs (cards principais)
 # =========================
@@ -391,6 +411,8 @@ k3.metric("📦 Itens vendidos", f"{itens_vendidos:.0f}")
 k4.metric("📈 Lucro bruto (aprox.)", _fmt_brl(lucro_bruto), f"{margem_bruta:.1f}% margem")
 k5.metric("🧮 Caixa (Vendas - Compras)", _fmt_brl(caixa_periodo))
 st.caption(f"Período: {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}  •  Estornos {'INCLUÍDOS' if inclui_estornos else 'EXCLUÍDOS'}")
+
+
 
 # =========================
 # Vendas vs Compras por dia
@@ -532,100 +554,3 @@ else:
         }) if cols_show else dfv,
         use_container_width=True, hide_index=True
     )
-
-# =========================
-# ▶️ Sincronizar custos (escrever CustoAtual na aba Produtos)
-# =========================
-st.divider()
-st.subheader("🔄 Sincronizar custos em **Produtos → CustoAtual**")
-
-def _build_cost_maps():
-    """Retorna (map_custo_medio, map_ultimo_custo) por KeyID (string)."""
-    map_avg  = {}
-    map_last = {}
-    if not custo_medio.empty:
-        for k, v in custo_medio.items():
-            map_avg[str(k)] = float(v or 0.0)
-    if not last_cost.empty:
-        for k, v in last_cost.items():
-            map_last[str(k)] = float(v or 0.0)
-    return map_avg, map_last
-
-def _sync_custo_atual(usar: str, apenas_vazios: bool) -> tuple[int,int]:
-    """
-    Escreve na aba Produtos:
-      usar = 'ultimo'  → último custo de compra
-      usar = 'medio'   → custo médio calculado
-    apenas_vazios = True → só preenche onde CustoAtual está vazio
-    Retorna (atualizados, total_elegiveis)
-    """
-    wb = conectar_sheets()
-    ws = wb.worksheet(ABA_PROD)
-    valores = ws.get_all_values()   # inclui header
-    if not valores:
-        return 0, 0
-    header = [h.strip() for h in valores[0]]
-    rows   = valores[1:]
-
-    # colunas
-    def _col_idx(nome, *alts):
-        for c in (nome, *alts):
-            if c in header: return header.index(c)
-        # procura case-insensitive
-        low = {h.lower(): i for i, h in enumerate(header)}
-        for c in (nome, *alts):
-            if c.lower() in low: return low[c.lower()]
-        return None
-
-    col_id   = _col_idx("ID")
-    col_cust = _col_idx("CustoAtual","Custo Atual")
-    if col_id is None or col_cust is None:
-        st.error("Colunas 'ID' e/ou 'CustoAtual' não encontradas em Produtos.")
-        return 0, 0
-
-    map_avg, map_last = _build_cost_maps()
-    source_map = map_last if usar == "ultimo" else map_avg
-
-    updates = []
-    total_elig = 0
-    for i, r in enumerate(rows, start=2):  # linha 2 na planilha
-        raw_id   = r[col_id] if col_id < len(r) else ""
-        key      = _canon_id(raw_id)
-        if not key: 
-            continue
-        novo_val = source_map.get(str(key), 0.0)
-        if novo_val and novo_val > 0:
-            atual = r[col_cust] if col_cust < len(r) else ""
-            is_vazio = (str(atual).strip() == "" or str(atual).strip().lower() in ("nan","none"))
-            if (apenas_vazios and is_vazio) or (not apenas_vazios):
-                total_elig += 1
-                a1 = rowcol_to_a1(i, col_cust+1)
-                updates.append({
-                    "range": a1,
-                    "values": [[float(f"{novo_val:.6f}")]]
-                })
-
-    if not updates:
-        return 0, total_elig
-
-    # batch_update por performance
-    ws.batch_update(updates, value_input_option="USER_ENTERED")
-    st.cache_data.clear()  # recarrega no próximo ciclo
-    return len(updates), total_elig
-
-with st.expander("Configurar sincronização"):
-    modo = st.radio(
-        "Fonte do custo a gravar em **CustoAtual**:",
-        options=("Último custo de compra (mais recente)","Custo médio calculado"),
-        index=0,
-    )
-    usar = "ultimo" if modo.startswith("Último") else "medio"
-    apenas_vazios = st.checkbox("Somente preencher onde CustoAtual está vazio", value=True)
-    if st.button("Aplicar sincronização", type="primary"):
-        try:
-            qtd, total = _sync_custo_atual(usar=usar, apenas_vazios=apenas_vazios)
-            st.success(f"Sincronização concluída: {qtd} linhas atualizadas (de {total} elegíveis).")
-            st.info("Altere o filtro de período ou recarregue a página para ver os efeitos nos KPIs.")
-        except Exception as e:
-            st.error(f"Falha ao sincronizar custos: {e}")
-
