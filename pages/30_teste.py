@@ -230,49 +230,78 @@ vendas, cupom_grp = _normalize_vendas_period(vend_raw)
 # Compras (histórico) — SOMENTE Custo Unitário
 # =========================
 def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
-    """Retorna KeyID, QtdNum, CustoNum (Custo Unitário puro) e Data_d."""
-    if c.empty:
-        return pd.DataFrame(columns=["KeyID","QtdNum","CustoNum","Data_d"])
-    d = c.copy(); d.columns = [x.strip() for x in d.columns]
-    col_idp = _first_col(d, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(d, ["Qtd","Quantidade","Qtde","Qde","QTD"])
-    col_cu  = _first_col(d, ["Custo Unitário","CustoUnitário","Custo Unit","Preço de Custo","PrecoCusto","Preço Custo","Custo"])
-    col_dat = _first_col(d, ["Data"])
+    """
+    Retorna KeyID, QtdNum, CustoNum (custo unitário efetivo) e Data_d.
+    - Aceita cabeçalhos variados (IDProduto/ID/Código/SKU; Custo Unitário/CustoUnit/PrecoCusto/etc).
+    - Limpa "R$" e formata número pt-BR.
+    - Se não houver custo unitário, usa Total/Qtd.
+    - Se houver FreteRateado (ou Frete), adiciona ao custo unitário.
+    - Ignora linhas com Qtd <= 0 ou ID vazio.
+    """
+    if c is None or c.empty:
+        return pd.DataFrame(columns=["KeyID", "QtdNum", "CustoNum", "Data_d"])
+
+    d = c.copy()
+    d.columns = [str(x).strip() for x in d.columns]
+
+    def _norm(s: str) -> str:
+        import unicodedata, re
+        s = unicodedata.normalize("NFKD", str(s))
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower().strip()
+        s = re.sub(r"[\s_]+", "", s)
+        return s
+
+    # mapa normalizado -> coluna original
+    norm2orig = {_norm(col): col for col in d.columns}
+
+    def _pick(*aliases):
+        for a in aliases:
+            col = norm2orig.get(_norm(a))
+            if col:
+                return col
+        return None
+
+    # Colunas possíveis
+    col_idp = _pick("IDProduto", "ID do Produto", "ProdutoID", "Produto Id", "SKU", "COD", "Código", "Codigo", "ID")
+    col_qtd = _pick("Qtd", "Quantidade", "Qtde", "Qde", "QTD")
+    col_cu  = _pick("Custo Unitário", "CustoUnitário", "Custo Unit", "CustoUnit",
+                    "Preço de Custo", "PrecoCusto", "Preço Custo", "Custo")
+    col_tot = _pick("Total", "Total da Linha", "TotalLinha", "Valor Total")
+    col_dat = _pick("Data", "Emissao", "Emissão")
+    col_fre = _pick("FreteRateado", "Frete Rateado", "Frete")
+
+    # Helpers (usa sua _to_float e _parse_date_any)
+    def to_f(x): 
+        return _to_float(x, default=0.0)
+
     out = pd.DataFrame({
-        "KeyID":   d[col_idp].apply(_canon_id) if col_idp else "",
-        "QtdNum":  d[col_qtd].apply(_to_float) if col_qtd else 0.0,
-        "CustoNum":d[col_cu].apply(_to_float)  if col_cu  else 0.0,
-        "Data_d":  d[col_dat].apply(_parse_date_any) if col_dat else None
+        "KeyID":   d[col_idp].apply(_canon_id) if col_idp in d else "",
+        "QtdNum":  d[col_qtd].apply(to_f)      if col_qtd in d else 0.0,
+        "Data_d":  d[col_dat].apply(_parse_date_any) if col_dat in d else None,
     })
-    out = out[out["KeyID"] != ""]
-    return out
 
-def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
-    if a is None or a.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
-    a = a.copy(); a.columns = [x.strip() for x in a.columns]
-    col_idp = _first_col(a, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(a, ["Qtd","Quantidade","Qtde","Qde","Ajuste"])
-    if not col_idp or not col_qtd:
-        return pd.DataFrame(columns=["KeyID","QtdNum"])
-    out = pd.DataFrame({"KeyID": a[col_idp].apply(_canon_id), "QtdNum": a[col_qtd].apply(_to_float)})
-    out = out[out["KeyID"]!=""]
-    return out
+    # custo unitário direto
+    if col_cu in d:
+        out["CustoNum"] = d[col_cu].apply(to_f)
+    else:
+        out["CustoNum"] = 0.0
 
-try: aj_raw = carregar_aba("Ajustes")
-except Exception: aj_raw = pd.DataFrame()
+    # fallback: Total / Qtd
+    if col_tot in d:
+        total_num = d[col_tot].apply(to_f)
+        mask_fb = (out["CustoNum"] <= 0) & (out["QtdNum"] > 0)
+        out.loc[mask_fb, "CustoNum"] = (total_num[mask_fb] / out.loc[mask_fb, "QtdNum"]).astype(float)
 
-c_all = _normalize_compras_all_with_date(comp_raw)
+    # frete rateado por item (se existir)
+    if col_fre in d:
+        frete = d[col_fre].apply(to_f)
+        out["CustoNum"] = (out["CustoNum"].fillna(0.0) + frete.fillna(0.0)).astype(float)
 
-def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
-    if v.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
-    v = v.copy(); v.columns = [c.strip() for c in v.columns]
-    col_idp = _first_col(v, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(v, ["Qtd","Quantidade","Qtde","Qde","QTD"])
-    out = pd.DataFrame({"KeyID": v[col_idp].apply(_canon_id) if col_idp else "", "QtdNum": v[col_qtd].apply(_to_float) if col_qtd else 0.0})
-    out = out[out["KeyID"]!=""]; return out
-
-v_all = _normalize_vendas_all(vend_raw)
-a_all = _normalize_ajustes_all(aj_raw)
+    # filtros finais
+    out = out[(out["KeyID"] != "") & (out["QtdNum"] > 0)]
+    out.loc[abs(out["CustoNum"]) > 1e6, "CustoNum"] = 0.0
+    return out[["KeyID", "QtdNum", "CustoNum", "Data_d"]]
 
 # =========================
 # Contagem/Estoque Inicial (opcional)
