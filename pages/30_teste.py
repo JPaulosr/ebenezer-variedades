@@ -105,7 +105,7 @@ def _fmt_brl(v):
 
 def _lower(s): return str(s or "").strip().lower()
 
-# 🔑 ID canônico (resolve P-xxxxx vs p_xxxxx vs números)
+# 🔑 ID canônico
 def _canon_id(x):
     s = re.sub(r"[^0-9]", "", str(x or ""))
     return s
@@ -123,7 +123,7 @@ try:    comp_raw = carregar_aba(ABA_COMP)
 except: comp_raw = pd.DataFrame()
 
 # =========================
-# Normalização de PRODUTOS (base estática)
+# Normalização de PRODUTOS
 # =========================
 if prod.empty:
     st.warning("Aba Produtos está vazia.")
@@ -132,14 +132,20 @@ else:
         "ID":"ID","Nome":"Nome","Categoria":"Categoria","Unidade":"Unidade","Fornecedor":"Fornecedor",
         "CustoAtual":"CustoAtual","PreçoVenda":"PrecoVenda","Preço Venda":"PrecoVenda","PrecoVenda":"PrecoVenda",
         "Markup %":"MarkupPct","Margem %":"MargemPct",
-        "EstoqueAtual":"EstoqueAtual","EstoqueMin":"EstoqueMin","LeadTimeDias":"LeadTimeDias","Ativo?":"Ativo"
+        "EstoqueAtual":"EstoqueAtual","EstoqueMin":"EstoqueMin","LeadTimeDias":"LeadTimeDias","Ativo?":"Ativo",
+        "FatorCusto":"FatorCusto"
     }
     for k,v in ren.items():
         if k in prod.columns and v!=k: prod.rename(columns={k:v}, inplace=True)
-    for c in ["ID","Nome","Categoria","Fornecedor","EstoqueAtual","EstoqueMin","CustoAtual","PrecoVenda","Ativo"]:
+
+    # colunas essenciais + FatorCusto (default=1)
+    for c in ["ID","Nome","Categoria","Fornecedor","EstoqueAtual","EstoqueMin","CustoAtual","PrecoVenda","Ativo","FatorCusto"]:
         if c not in prod.columns: prod[c] = None
-    for c in ["EstoqueAtual","EstoqueMin","CustoAtual","PrecoVenda"]:
+    if "FatorCusto" not in prod.columns: prod["FatorCusto"] = 1
+
+    for c in ["EstoqueAtual","EstoqueMin","CustoAtual","PrecoVenda","FatorCusto"]:
         prod[c] = pd.to_numeric(prod[c], errors="coerce")
+
     prod["KeyID"] = prod["ID"].apply(_canon_id)
     prod["ValorEstoque"] = prod["CustoAtual"].fillna(0)*prod["EstoqueAtual"].fillna(0)
 
@@ -231,57 +237,35 @@ def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
 vendas, cupom_grp = _normalize_vendas_period(vend_raw)
 
 # =========================
-# Normalização COMPRAS (período) — para KPI de caixa
+# Compras — histórico completo (CUSTO UNITÁRIO puro)
 # =========================
-def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
-    if c.empty: return pd.DataFrame(columns=["Data_d","TotalNum"])
-    c = c.copy(); c.columns = [x.strip() for x in c.columns]
-    col_data = _first_col(c, ["Data"])
-    col_tot  = _first_col(c, ["Total","TotalLinha","Total da Linha","Valor Total"])
-    out = pd.DataFrame({
-        "Data": c[col_data] if col_data else None,
-        "TotalLinha": c[col_tot] if col_tot else 0
-    })
-    out["Data_d"]   = out["Data"].apply(_parse_date_any)
-    out["TotalNum"] = out["TotalLinha"].apply(_to_float)
-    out = out[(out["Data_d"]>=dt_ini) & (out["Data_d"]<=dt_fim)]
-    return out
-
-compras = _normalize_compras_period(comp_raw)
-
-# =========================
-# Normalizações ALL (histórico inteiro p/ estoque & custos)
-# =========================
-def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
-    if v.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
-    v = v.copy(); v.columns = [c.strip() for c in v.columns]
-    col_idp = _first_col(v, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(v, ["Qtd","Quantidade","Qtde","Qde","QTD"])
-    out = pd.DataFrame({
-        "KeyID": v[col_idp].apply(_canon_id) if col_idp else "",
-        "QtdNum": v[col_qtd].apply(_to_float) if col_qtd else 0.0,
-    })
-    out = out[out["KeyID"]!=""]
-    return out
-
 def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
-    """Retorna KeyID, QtdNum, CustoNum, Data_d (histórico completo)."""
-    if c.empty: return pd.DataFrame(columns=["KeyID","QtdNum","CustoNum","Data_d"])
-    c = c.copy(); c.columns = [x.strip() for x in c.columns]
-    col_idp = _first_col(c, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(c, ["Qtd","Quantidade","Qtde","Qde","QTD"])
-    col_cu  = _first_col(c, ["Custo Unitário","CustoUnitário","CustoUnit","Custo Unit",
-                             "Custo","Preço de Custo","PrecoCusto","Preço Custo"])
-    col_dat = _first_col(c, ["Data"])
+    """
+    Retorna KeyID, QtdNum, CustoNum e Data_d,
+    usando EXCLUSIVAMENTE o 'Custo Unitário' (sem frete).
+    """
+    if c.empty:
+        return pd.DataFrame(columns=["KeyID","QtdNum","CustoNum","Data_d"])
+
+    d = c.copy()
+    d.columns = [x.strip() for x in d.columns]
+
+    col_idp = _first_col(d, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
+    col_qtd = _first_col(d, ["Qtd","Quantidade","Qtde","Qde","QTD"])
+    col_cu  = _first_col(d, ["Custo Unitário","CustoUnitário","Custo Unit",
+                             "Preço de Custo","PrecoCusto","Preço Custo","Custo"])
+    col_dat = _first_col(d, ["Data"])
+
     out = pd.DataFrame({
-        "KeyID": c[col_idp].apply(_canon_id) if col_idp else "",
-        "QtdNum": c[col_qtd].apply(_to_float) if col_qtd else 0.0,
-        "CustoNum": c[col_cu].apply(_to_float) if col_cu else 0.0,
-        "Data_d": c[col_dat].apply(_parse_date_any) if col_dat else None
+        "KeyID":  d[col_idp].apply(_canon_id) if col_idp else "",
+        "QtdNum": d[col_qtd].apply(_to_float)  if col_qtd else 0.0,
+        "CustoNum": d[col_cu].apply(_to_float) if col_cu else 0.0,
+        "Data_d": d[col_dat].apply(_parse_date_any) if col_dat else None
     })
-    out = out[out["KeyID"]!=""]
+    out = out[out["KeyID"] != ""]
     return out
 
+# Ajustes — histórico completo
 def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
     if a is None or a.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
     a = a.copy(); a.columns = [x.strip() for x in a.columns]
@@ -299,18 +283,30 @@ def _normalize_ajustes_all(a: pd.DataFrame) -> pd.DataFrame:
 try: aj_raw = carregar_aba("Ajustes")
 except Exception: aj_raw = pd.DataFrame()
 
-v_all = _normalize_vendas_all(vend_raw)
 c_all = _normalize_compras_all_with_date(comp_raw)
 a_all = _normalize_ajustes_all(aj_raw)
+
+# =========================
+# Vendas — histórico básico (para estoque)
+# =========================
+def _normalize_vendas_all(v: pd.DataFrame) -> pd.DataFrame:
+    if v.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
+    v = v.copy(); v.columns = [c.strip() for c in v.columns]
+    col_idp = _first_col(v, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
+    col_qtd = _first_col(v, ["Qtd","Quantidade","Qtde","Qde","QTD"])
+    out = pd.DataFrame({
+        "KeyID": v[col_idp].apply(_canon_id) if col_idp else "",
+        "QtdNum": v[col_qtd].apply(_to_float) if col_qtd else 0.0,
+    })
+    out = out[out["KeyID"]!=""]
+    return out
+
+v_all = _normalize_vendas_all(vend_raw)
 
 # =========================
 # Contagem/Estoque Inicial (opcional)
 # =========================
 def _normalize_contagem_inicial(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Espera uma aba com colunas tipo: IDProduto, Qtd (ou EstoqueInicial).
-    Usa o mesmo KeyID canônico.
-    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["KeyID", "SaldoInicial"])
     d = df.copy(); d.columns = [x.strip() for x in d.columns]
@@ -345,73 +341,64 @@ ajustes  = a_all.groupby("KeyID")["QtdNum"].sum() if not a_all.empty else pd.Ser
 
 calc = pd.DataFrame({"Entradas": entradas, "Saidas": saidas, "Ajustes": ajustes}).fillna(0.0)
 
-# garante que saldo_inicial sempre é DataFrame com nome de coluna
+# join do saldo inicial à prova de erro
 if not saldo_inicial.empty:
     saldo_inicial_df = saldo_inicial.to_frame("SaldoInicial")
 else:
     saldo_inicial_df = pd.DataFrame(columns=["SaldoInicial"])
-
 calc = calc.join(saldo_inicial_df, how="left")
 
-# preenche NaN com zero
 calc["SaldoInicial"] = calc["SaldoInicial"].fillna(0.0)
+calc["EstoqueCalc"]  = calc["SaldoInicial"] + calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
 
-# estoque final calculado
-calc["EstoqueCalc"] = calc["SaldoInicial"] + calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
-
-
-# custo médio (ponderado pelas compras)
-if not c_all.empty:
-    cm = c_all.assign(Parcial=c_all["QtdNum"]*c_all["CustoNum"]).groupby("KeyID")[["Parcial","QtdNum"]].sum()
-    cm["CustoMedio"] = cm["Parcial"] / cm["QtdNum"].replace(0, pd.NA)
-    custo_medio = cm["CustoMedio"].fillna(0.0)
-else:
-    custo_medio = pd.Series(dtype=float)
-
-# último custo por produto (compra mais recente)
+# =========================
+# Custos: último custo unitário + fator de fracionamento
+# =========================
 def _last_cost_per_product(comp_df: pd.DataFrame) -> pd.Series:
     if comp_df.empty:
         return pd.Series(dtype=float)
     d = comp_df.copy()
     d["_ord"] = range(len(d))
-    # mantém apenas linhas com custo > 0
     d = d[d["CustoNum"].apply(lambda x: _to_float(x) > 0)]
     if d.empty: return pd.Series(dtype=float)
-    # ordena por Data_d e ordem de aparição; pega a última de cada KeyID
     d = d.sort_values(["KeyID","Data_d","_ord"]).groupby("KeyID").tail(1)
     return d.set_index("KeyID")["CustoNum"]
 
 last_cost = _last_cost_per_product(c_all)
 
-calc["CustoMedio"] = calc["KeyID"].map(custo_medio) if "KeyID" in calc.columns else custo_medio
+calc["CustoMedio"] = 0.0  # não usado para CustoAtual nesta política, mas mantido p/ compatibilidade
 calc = calc.reset_index().rename(columns={"index":"KeyID"})
 
 # =========================
-# Merge com PRODUTOS por KeyID (prioriza valores CALCULADOS)
+# Merge com PRODUTOS
 # =========================
 prod_calc = prod.copy() if not prod.empty else pd.DataFrame()
 if not prod_calc.empty and "KeyID" in prod_calc.columns:
     prod_calc = prod_calc.merge(calc, how="left", on="KeyID", suffixes=("_orig", ""))
 
-for col in ["EstoqueCalc","CustoMedio","Entradas","Saidas","Ajustes","SaldoInicial"]:
+for col in ["EstoqueCalc","Entradas","Saidas","Ajustes","SaldoInicial","FatorCusto"]:
     if col not in prod_calc.columns:
         prod_calc[col] = 0.0
+prod_calc["FatorCusto"] = prod_calc["FatorCusto"].fillna(1.0)
 
-# Séries auxiliares para custo
-ref_custo_medio = (prod_calc.set_index("KeyID")["CustoMedio"].fillna(0.0)
-                   if "CustoMedio" in prod_calc.columns else pd.Series(dtype=float))
+# custo base = último Custo Unitário (Compras)
 ref_custo_plan  = (prod_calc.set_index("KeyID")["CustoAtual"].fillna(0.0)
                    if "CustoAtual" in prod_calc.columns else pd.Series(dtype=float))
+fator_map = (prod_calc.set_index("KeyID")["FatorCusto"].fillna(1.0)
+             if "FatorCusto" in prod_calc.columns else pd.Series(dtype=float))
 
-def _choose_cost(keyid):
+def _choose_cost_base(keyid: str) -> float:
     keyid = str(keyid)
     v_last = float(last_cost.get(keyid, 0.0) or 0.0)
-    if v_last > 0: return v_last               # 1) último custo de compra
-    v_cm = float(ref_custo_medio.get(keyid, 0.0) or 0.0)
-    if v_cm > 0:  return v_cm                  # 2) custo médio ponderado
-    return float(ref_custo_plan.get(keyid, 0.0) or 0.0)  # 3) custo anterior
+    if v_last > 0: return v_last
+    return float(ref_custo_plan.get(keyid, 0.0) or 0.0)
 
-prod_calc["CustoAtual"] = prod_calc["KeyID"].astype(str).map(_choose_cost).astype(float)
+def _choose_cost_final(keyid: str) -> float:
+    base  = _choose_cost_base(keyid)          # custo por unidade de COMPRA (unitário puro)
+    fator = float(fator_map.get(str(keyid), 1.0) or 1.0)  # fator de fracionamento p/ unidade de VENDA
+    return base * fator
+
+prod_calc["CustoAtual"] = prod_calc["KeyID"].astype(str).map(_choose_cost_final).astype(float)
 prod_calc["ValorEstoqueCalc"] = prod_calc["CustoAtual"].fillna(0)*prod_calc["EstoqueCalc"].fillna(0)
 
 # =========================
@@ -423,6 +410,25 @@ if not vendas.empty:
     itens_vendidos = vendas["QtdNum"].sum()
 else:
     faturamento = 0.0; num_cupons = 0; itens_vendidos = 0.0
+
+# =========================
+# Compras (período) para KPI de caixa
+# =========================
+def _normalize_compras_period(c: pd.DataFrame) -> pd.DataFrame:
+    if c.empty: return pd.DataFrame(columns=["Data_d","TotalNum"])
+    c = c.copy(); c.columns = [x.strip() for x in c.columns]
+    col_data = _first_col(c, ["Data"])
+    col_tot  = _first_col(c, ["Total","TotalLinha","Total da Linha","Valor Total"])
+    out = pd.DataFrame({
+        "Data": c[col_data] if col_data else None,
+        "TotalLinha": c[col_tot] if col_tot else 0
+    })
+    out["Data_d"]   = out["Data"].apply(_parse_date_any)
+    out["TotalNum"] = out["TotalLinha"].apply(_to_float)
+    out = out[(out["Data_d"]>=dt_ini) & (out["Data_d"]<=dt_fim)]
+    return out
+
+compras = _normalize_compras_period(comp_raw)
 
 # =========================
 # COGS + lucro, margem, ticket, caixa
@@ -530,66 +536,51 @@ if prod_calc.empty:
 else:
     # --- Sincronização de custos para a planilha (opcional) ---
     with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=False):
-    st.caption("Atualiza a coluna **CustoAtual** em *Produtos* com o último custo de compras (fallback: custo médio).")
-    if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
-        try:
-            from gspread.utils import rowcol_to_a1
-
-            sh = conectar_sheets()
-            ws = sh.worksheet(ABA_PROD)
-
-            # 1) Descobre as colunas pelo cabeçalho
-            header = ws.row_values(1)
+        st.caption("Atualiza a coluna **CustoAtual** em *Produtos* com o último Custo Unitário (Compras) ajustado por FatorCusto.")
+        if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
             try:
-                id_col_idx   = header.index("ID") + 1
-                custo_col_idx = header.index("CustoAtual") + 1
-            except ValueError:
-                st.error("Cabeçalho precisa ter as colunas 'ID' e 'CustoAtual' na aba Produtos.")
-                st.stop()
+                from gspread.utils import rowcol_to_a1
 
-            # 2) Lê todos os IDs existentes (ordem da planilha)
-            ids_sheet = ws.col_values(id_col_idx)[1:]  # da linha 2 pra baixo
-            start_row = 2
-            end_row   = start_row + len(ids_sheet) - 1
-            if end_row < start_row:
-                st.warning("Não há linhas de produtos para atualizar.")
-                st.stop()
+                sh = conectar_sheets()
+                ws = sh.worksheet(ABA_PROD)
 
-            # 3) Prepara um lookup KeyID -> custo (usando a mesma regra do app)
-            def _choose_cost(keyid):
-                keyid = str(keyid)
-                v_last = float(last_cost.get(keyid, 0.0) or 0.0)
-                if v_last > 0: return v_last
-                v_cm = float((prod_calc.set_index("KeyID")["CustoMedio"].get(keyid, 0.0) if "CustoMedio" in prod_calc.columns else 0.0) or 0.0)
-                if v_cm > 0:  return v_cm
-                v_old = float((prod_calc.set_index("KeyID")["CustoAtual"].get(keyid, 0.0) if "CustoAtual" in prod_calc.columns else 0.0) or 0.0)
-                return v_old
+                # 1) Cabeçalho
+                header = ws.row_values(1)
+                try:
+                    id_col_idx    = header.index("ID") + 1
+                    custo_col_idx = header.index("CustoAtual") + 1
+                except ValueError:
+                    st.error("Cabeçalho precisa ter as colunas 'ID' e 'CustoAtual' na aba Produtos.")
+                    st.stop()
 
-            # 4) Pega o range da coluna CustoAtual exatamente nas mesmas linhas dos IDs
-            cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
-            cells = ws.range(cell_range)
+                # 2) IDs na ordem das linhas
+                ids_sheet = ws.col_values(id_col_idx)[1:]  # da linha 2 pra baixo
+                start_row = 2
+                end_row   = start_row + len(ids_sheet) - 1
+                if end_row < start_row:
+                    st.warning("Não há linhas de produtos para atualizar.")
+                    st.stop()
 
-            # 5) Preenche célula a célula, batendo o custo pelo ID daquela linha
-            def _canon_id(x: str) -> str:
-                import re
-                return re.sub(r"[^0-9]", "", str(x or ""))
+                # 3) range da coluna CustoAtual
+                cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
+                cells = ws.range(cell_range)
 
-            for i, cell in enumerate(cells):
-                raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
-                keyid  = _canon_id(raw_id)
-                val    = float(_choose_cost(keyid)) if keyid else 0.0
-                cell.value = val  # grava como número (sem string formatada)
+                # 4) escreve custo linha a linha, alinhado por ID
+                for i, cell in enumerate(cells):
+                    raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
+                    keyid  = _canon_id(raw_id)
+                    val    = float(_choose_cost_final(keyid)) if keyid else 0.0
+                    cell.value = val  # grava como número
 
-            ws.update_cells(cells, value_input_option="USER_ENTERED")
-            st.success("CustoAtual sincronizado linha a linha (sem desalinhamento) ✅")
-            st.session_state["_force_refresh"] = True
-            st.rerun()
+                ws.update_cells(cells, value_input_option="USER_ENTERED")
+                st.success("CustoAtual sincronizado linha a linha (último Custo Unitário × FatorCusto) ✅")
+                st.session_state["_force_refresh"] = True
+                st.rerun()
 
-        except Exception as e:
-            st.error(f"Falha ao atualizar CustoAtual: {e}")
+            except Exception as e:
+                st.error(f"Falha ao atualizar CustoAtual: {e}")
 
-
-    # ----- Filtros adicionais -----
+    # ----- Filtros adicionais da visão -----
     m = pd.Series(True, index=prod_calc.index)
     if cat_sel and "Categoria" in prod_calc.columns:  m &= prod_calc["Categoria"].astype(str).isin(cat_sel)
     if forn_sel and "Fornecedor" in prod_calc.columns: m &= prod_calc["Fornecedor"].astype(str).isin(forn_sel)
@@ -650,7 +641,7 @@ else:
     st.divider()
 
     st.markdown("**📋 Lista de produtos (filtrada)**")
-    cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoAtual","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo"] if c in dfv.columns]
+    cols_show = [c for c in ["ID","Nome","Categoria","Fornecedor","CustoAtual","EstoqueCalc","EstoqueMin","ValorEstoqueCalc","Ativo","FatorCusto"] if c in dfv.columns]
     st.dataframe(
         dfv[cols_show].rename(columns={
             "EstoqueCalc":"EstoqueAtual",
