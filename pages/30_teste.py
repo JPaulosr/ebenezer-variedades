@@ -344,7 +344,8 @@ saidas   = v_all.groupby("KeyID")["QtdNum"].sum() if not v_all.empty else pd.Ser
 ajustes  = a_all.groupby("KeyID")["QtdNum"].sum() if not a_all.empty else pd.Series(dtype=float)
 
 calc = pd.DataFrame({"Entradas": entradas, "Saidas": saidas, "Ajustes": ajustes}).fillna(0.0)
-calc = calc.join(saldo_inicial, how="left")
+# 👇 aqui a correção: renomeia a Series antes do join
+calc = calc.join(saldo_inicial.rename("SaldoInicial"), how="left")
 calc["SaldoInicial"] = calc["SaldoInicial"].fillna(0.0)
 calc["EstoqueCalc"]  = calc["SaldoInicial"] + calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
 
