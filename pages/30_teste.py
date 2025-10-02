@@ -465,35 +465,63 @@ if prod_calc.empty:
     st.info("Sem produtos para exibir.")
 else:
     # Botão de sincronizar custo atual (linha a linha, numérico)
-    with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=False):
-        st.caption("Atualiza 'CustoAtual' com o último Custo Unitário × FatorCusto (linha a linha por ID).")
-        if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
-            try:
-                from gspread.utils import rowcol_to_a1
-                sh = conectar_sheets(); ws = sh.worksheet(ABA_PROD)
-                header = ws.row_values(1)
-                try:
-                    id_col_idx    = header.index("ID") + 1
-                    custo_col_idx = header.index("CustoAtual") + 1
-                except ValueError:
-                    st.error("Cabeçalho precisa ter as colunas 'ID' e 'CustoAtual' na aba Produtos."); st.stop()
-                ids_sheet = ws.col_values(id_col_idx)[1:]
-                start_row = 2; end_row = start_row + len(ids_sheet) - 1
-                if end_row < start_row:
-                    st.warning("Não há linhas de produtos para atualizar."); st.stop()
-                cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
-                cells = ws.range(cell_range)
-                for i, cell in enumerate(cells):
-                    raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
-                    keyid  = _canon_id(raw_id)
-                    val    = float(_choose_cost_final(keyid)) if keyid else 0.0
-                    cell.value = val
-                ws.update_cells(cells, value_input_option="USER_ENTERED")
-                st.success("CustoAtual sincronizado ✅")
-                st.session_state["_force_refresh"] = True
-                st.rerun()
-            except Exception as e:
-                st.error(f"Falha ao atualizar CustoAtual: {e}")
+with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=False):
+    st.caption("Atualiza 'CustoAtual' com o último Custo Unitário × FatorCusto (linha a linha por ID).")
+
+    import unicodedata, re
+    def _norm(s: str) -> str:
+        """Normaliza string para comparação de cabeçalho (sem acento/espaco/maiuscula)."""
+        s = unicodedata.normalize("NFKD", str(s))
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower().strip()
+        s = re.sub(r"[\s_]+", "", s)
+        return s
+
+    def _find_col_idx(header, aliases):
+        norm_map = {_norm(h): i+1 for i, h in enumerate(header)}  # 1-based index
+        for a in aliases:
+            idx = norm_map.get(_norm(a))
+            if idx:
+                return idx
+        return None
+
+    if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
+        try:
+            from gspread.utils import rowcol_to_a1
+            sh = conectar_sheets()
+            ws = sh.worksheet(ABA_PROD)
+            header = ws.row_values(1)
+
+            id_col_idx    = _find_col_idx(header, ["ID","Codigo","Código","ProdutoID","SKU"])
+            custo_col_idx = _find_col_idx(header, ["CustoAtual","Custo Atual","Custo_Atual"])
+
+            if not id_col_idx or not custo_col_idx:
+                st.error("⚠️ Cabeçalho precisa ter colunas equivalentes a 'ID' e 'CustoAtual' na aba Produtos.")
+                st.stop()
+
+            ids_sheet = ws.col_values(id_col_idx)[1:]  # pula header
+            start_row = 2
+            end_row   = start_row + len(ids_sheet) - 1
+            if end_row < start_row:
+                st.warning("Não há linhas de produtos para atualizar.")
+                st.stop()
+
+            cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
+            cells = ws.range(cell_range)
+
+            for i, cell in enumerate(cells):
+                raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
+                keyid  = _canon_id(raw_id)
+                val    = float(_choose_cost_final(keyid)) if keyid else 0.0
+                cell.value = val
+
+            ws.update_cells(cells, value_input_option="USER_ENTERED")
+            st.success("✅ CustoAtual sincronizado com sucesso")
+            st.session_state["_force_refresh"] = True
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"❌ Falha ao atualizar CustoAtual: {e}")
 
     # Filtros visuais
     m = pd.Series(True, index=prod_calc.index)
