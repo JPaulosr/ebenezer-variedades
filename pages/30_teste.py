@@ -530,37 +530,64 @@ if prod_calc.empty:
 else:
     # --- Sincronização de custos para a planilha (opcional) ---
     with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=False):
-        st.caption("Atualiza a coluna **CustoAtual** em *Produtos* com o último custo de compras (fallback: custo médio).")
-        if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
+    st.caption("Atualiza a coluna **CustoAtual** em *Produtos* com o último custo de compras (fallback: custo médio).")
+    if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
+        try:
+            from gspread.utils import rowcol_to_a1
+
+            sh = conectar_sheets()
+            ws = sh.worksheet(ABA_PROD)
+
+            # 1) Descobre as colunas pelo cabeçalho
+            header = ws.row_values(1)
             try:
-                sh = conectar_sheets()
-                ws = sh.worksheet(ABA_PROD)
-                header = ws.row_values(1)
-                try:
-                    col_idx = header.index("CustoAtual") + 1
-                except ValueError:
-                    st.error("Coluna 'CustoAtual' não encontrada na aba Produtos."); st.stop()
+                id_col_idx   = header.index("ID") + 1
+                custo_col_idx = header.index("CustoAtual") + 1
+            except ValueError:
+                st.error("Cabeçalho precisa ter as colunas 'ID' e 'CustoAtual' na aba Produtos.")
+                st.stop()
 
-                # ordem igual a 'prod' original
-                key_series = prod["ID"].apply(_canon_id) if "ID" in prod.columns else prod_calc["KeyID"]
-                new_costs = [ _choose_cost(k) for k in key_series.astype(str).tolist() ]
+            # 2) Lê todos os IDs existentes (ordem da planilha)
+            ids_sheet = ws.col_values(id_col_idx)[1:]  # da linha 2 pra baixo
+            start_row = 2
+            end_row   = start_row + len(ids_sheet) - 1
+            if end_row < start_row:
+                st.warning("Não há linhas de produtos para atualizar.")
+                st.stop()
 
-                start_row = 2
-                end_row = len(new_costs) + 1
-                from gspread.utils import rowcol_to_a1
-                cell_range = f"{rowcol_to_a1(start_row, col_idx)}:{rowcol_to_a1(end_row, col_idx)}"
-                cells = ws.range(cell_range)
-                for i, cell in enumerate(cells):
-                    val = float(new_costs[i]) if i < len(new_costs) else 0.0
-                    # grava como número (USER_ENTERED aceita ponto)
-                    cell.value = f"{val:.4f}"
-                ws.update_cells(cells, value_input_option="USER_ENTERED")
+            # 3) Prepara um lookup KeyID -> custo (usando a mesma regra do app)
+            def _choose_cost(keyid):
+                keyid = str(keyid)
+                v_last = float(last_cost.get(keyid, 0.0) or 0.0)
+                if v_last > 0: return v_last
+                v_cm = float((prod_calc.set_index("KeyID")["CustoMedio"].get(keyid, 0.0) if "CustoMedio" in prod_calc.columns else 0.0) or 0.0)
+                if v_cm > 0:  return v_cm
+                v_old = float((prod_calc.set_index("KeyID")["CustoAtual"].get(keyid, 0.0) if "CustoAtual" in prod_calc.columns else 0.0) or 0.0)
+                return v_old
 
-                st.success("CustoAtual sincronizado com sucesso na aba Produtos ✅")
-                st.session_state["_force_refresh"] = True
-                st.rerun()
-            except Exception as e:
-                st.error(f"Falha ao atualizar CustoAtual: {e}")
+            # 4) Pega o range da coluna CustoAtual exatamente nas mesmas linhas dos IDs
+            cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
+            cells = ws.range(cell_range)
+
+            # 5) Preenche célula a célula, batendo o custo pelo ID daquela linha
+            def _canon_id(x: str) -> str:
+                import re
+                return re.sub(r"[^0-9]", "", str(x or ""))
+
+            for i, cell in enumerate(cells):
+                raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
+                keyid  = _canon_id(raw_id)
+                val    = float(_choose_cost(keyid)) if keyid else 0.0
+                cell.value = val  # grava como número (sem string formatada)
+
+            ws.update_cells(cells, value_input_option="USER_ENTERED")
+            st.success("CustoAtual sincronizado linha a linha (sem desalinhamento) ✅")
+            st.session_state["_force_refresh"] = True
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Falha ao atualizar CustoAtual: {e}")
+
 
     # ----- Filtros adicionais -----
     m = pd.Series(True, index=prod_calc.index)
