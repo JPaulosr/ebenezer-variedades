@@ -3,6 +3,7 @@
 import json, unicodedata, re
 from collections.abc import Mapping
 from datetime import datetime, date, timedelta
+from calendar import monthrange
 
 import streamlit as st
 import pandas as pd
@@ -171,7 +172,7 @@ ocultar_zerados = st.sidebar.checkbox("Ocultar itens com estoque zerado", value=
 busca = st.sidebar.text_input("Buscar por nome/ID")
 
 # =========================
-# Filtros de Ano/Meses (para gráficos mensais)
+# Filtros de Ano/Meses (para gráficos e período global)
 # =========================
 def _anos_disponiveis(df: pd.DataFrame) -> list[int]:
     if df is None or df.empty:
@@ -186,8 +187,19 @@ MESES_IDX = {nome:i+1 for i, nome in enumerate(MESES_PT)}
 anos_opts = _anos_disponiveis(vend_raw)
 ano_default_idx = anos_opts.index(date.today().year) if date.today().year in anos_opts else len(anos_opts)-1
 ano_sel = st.sidebar.selectbox("Ano (gráficos mensais)", anos_opts, index=ano_default_idx)
-
 meses_sel = st.sidebar.multiselect("Meses (totais por mês)", MESES_PT, default=MESES_PT)
+
+# ⬇️ APLICA a seleção Ano/Meses ao período global do dashboard
+aplicar_no_dashboard = st.sidebar.checkbox(
+    "Aplicar Ano/Meses ao dashboard",
+    value=True,
+    help="Se ligado, usa os meses selecionados para definir o período global (dt_ini/dt_fim)."
+)
+if aplicar_no_dashboard and meses_sel:
+    meses_idx_sel = sorted(MESES_IDX[m] for m in meses_sel)
+    m_ini, m_fim = meses_idx_sel[0], meses_idx_sel[-1]
+    dt_ini = date(int(ano_sel), m_ini, 1)
+    dt_fim = date(int(ano_sel), m_fim, monthrange(int(ano_sel), m_fim)[1])
 
 # =========================
 # Vendas (período)
@@ -519,9 +531,12 @@ if not cupom_grp.empty:
 
         mens["ValorFmt"] = mens["ReceitaCupom"].apply(_fmt_brl)
 
-        # garantir ordem mensal correta no eixo X
-        ordem = [MESES_IDX[n] for n in MESES_PT if n in meses_sel] if meses_sel and len(meses_sel) < 12 else list(range(1,13))
-        mens = mens.sort_values("mes")
+        # ordem correta no eixo X
+        if meses_sel and len(meses_sel) < 12:
+            ordem = [MESES_IDX[n] for n in MESES_PT if n in meses_sel]
+        else:
+            ordem = list(range(1,13))
+
         figm = px.bar(
             mens, x="MesNome", y="ReceitaCupom",
             text="ValorFmt",
