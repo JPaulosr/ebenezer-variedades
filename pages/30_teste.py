@@ -171,7 +171,7 @@ ocultar_zerados = st.sidebar.checkbox("Ocultar itens com estoque zerado", value=
 busca = st.sidebar.text_input("Buscar por nome/ID")
 
 # =========================
-# Filtros de Ano/Mês (gráfico mensal)
+# Filtros de Ano/Meses (para gráficos mensais)
 # =========================
 def _anos_disponiveis(df: pd.DataFrame) -> list[int]:
     if df is None or df.empty:
@@ -180,12 +180,14 @@ def _anos_disponiveis(df: pd.DataFrame) -> list[int]:
     anos = sorted({d.year for d in df[col_data].apply(_parse_date_any).dropna()})
     return anos or [date.today().year]
 
-MESES_NOMES = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+MESES_PT = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
+MESES_IDX = {nome:i+1 for i, nome in enumerate(MESES_PT)}
+
 anos_opts = _anos_disponiveis(vend_raw)
 ano_default_idx = anos_opts.index(date.today().year) if date.today().year in anos_opts else len(anos_opts)-1
-ano_sel = st.sidebar.selectbox("Ano (gráfico mensal)", anos_opts, index=ano_default_idx)
-mes_default_idx = min(max(date.today().month - 1, 0), 11)
-mes_sel = st.sidebar.selectbox("Mês", list(range(1,13)), index=mes_default_idx, format_func=lambda m: MESES_NOMES[m-1])
+ano_sel = st.sidebar.selectbox("Ano (gráficos mensais)", anos_opts, index=ano_default_idx)
+
+meses_sel = st.sidebar.multiselect("Meses (totais por mês)", MESES_PT, default=MESES_PT)
 
 # =========================
 # Vendas (período)
@@ -490,30 +492,49 @@ else:
 st.divider()
 
 # =========================
-# Vendas do mês (por dia)
+# Vendas por mês — Totais (ano selecionado)
 # =========================
-st.subheader(f"📈 Vendas no mês — {MESES_NOMES[mes_sel-1]}/{ano_sel}")
+st.subheader(f"📈 Totais de vendas por mês — {ano_sel}")
 
 if not cupom_grp.empty:
     cup = cupom_grp.copy()
-    # garantir datetime para filtragem por ano/mês
     cup["Data_d"] = pd.to_datetime(cup["Data_d"])
-    cup_month = cup[(cup["Data_d"].dt.year == int(ano_sel)) & (cup["Data_d"].dt.month == int(mes_sel))]
+    cup["ano"] = cup["Data_d"].dt.year
+    cup["mes"] = cup["Data_d"].dt.month
 
-    diario = (cup_month.groupby("Data_d")["ReceitaCupom"]
-              .sum()
-              .reset_index()
-              .sort_values("Data_d"))
-    if diario.empty:
-        st.info("Sem vendas no mês selecionado.")
+    mens = (cup[cup["ano"] == int(ano_sel)]
+            .groupby("mes")["ReceitaCupom"]
+            .sum()
+            .reset_index()
+            .sort_values("mes"))
+
+    if mens.empty:
+        st.info("Sem vendas no ano selecionado.")
     else:
-        diario["Acumulado"] = diario["ReceitaCupom"].cumsum()
+        mens["MesNome"] = mens["mes"].map({i+1:n for i,n in enumerate(MESES_PT)})
+        # aplica filtro de meses (em português)
+        if meses_sel and len(meses_sel) < 12:
+            meses_idx_sel = [MESES_IDX[n] for n in meses_sel]
+            mens = mens[mens["mes"].isin(meses_idx_sel)]
 
-        figm = px.bar(diario, x="Data_d", y="ReceitaCupom",
-                      labels={"Data_d":"Dia","ReceitaCupom":"Receita (R$)"},
-                      title=None)
-        figm.add_scatter(x=diario["Data_d"], y=diario["Acumulado"], mode="lines+markers", name="Acumulado")
-        figm.update_layout(yaxis_title="R$", xaxis_title="", legend_title="", hovermode="x unified")
+        mens["ValorFmt"] = mens["ReceitaCupom"].apply(_fmt_brl)
+
+        # garantir ordem mensal correta no eixo X
+        ordem = [MESES_IDX[n] for n in MESES_PT if n in meses_sel] if meses_sel and len(meses_sel) < 12 else list(range(1,13))
+        mens = mens.sort_values("mes")
+        figm = px.bar(
+            mens, x="MesNome", y="ReceitaCupom",
+            text="ValorFmt",
+            labels={"MesNome":"Mês","ReceitaCupom":"Receita do mês (R$)"},
+        )
+        figm.update_traces(textposition="outside", cliponaxis=False)
+        figm.update_layout(
+            xaxis_title="",
+            yaxis_title="R$",
+            xaxis={'categoryorder':'array','categoryarray':[MESES_PT[i-1] for i in ordem]},
+            hovermode="x unified",
+            margin=dict(t=30, b=40)
+        )
         st.plotly_chart(figm, use_container_width=True)
 else:
     st.info("Sem dados de vendas para montar o gráfico mensal.")
