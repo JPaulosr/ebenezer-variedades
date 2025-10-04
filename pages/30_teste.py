@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
@@ -170,6 +171,23 @@ ocultar_zerados = st.sidebar.checkbox("Ocultar itens com estoque zerado", value=
 busca = st.sidebar.text_input("Buscar por nome/ID")
 
 # =========================
+# Filtros de Ano/Mês (gráfico mensal)
+# =========================
+def _anos_disponiveis(df: pd.DataFrame) -> list[int]:
+    if df is None or df.empty:
+        return [date.today().year]
+    col_data = _first_col(df, ["Data"]) or "Data"
+    anos = sorted({d.year for d in df[col_data].apply(_parse_date_any).dropna()})
+    return anos or [date.today().year]
+
+MESES_NOMES = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+anos_opts = _anos_disponiveis(vend_raw)
+ano_default_idx = anos_opts.index(date.today().year) if date.today().year in anos_opts else len(anos_opts)-1
+ano_sel = st.sidebar.selectbox("Ano (gráfico mensal)", anos_opts, index=ano_default_idx)
+mes_default_idx = min(max(date.today().month - 1, 0), 11)
+mes_sel = st.sidebar.selectbox("Mês", list(range(1,13)), index=mes_default_idx, format_func=lambda m: MESES_NOMES[m-1])
+
+# =========================
 # Vendas (período)
 # =========================
 def _normalize_vendas_period(v: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -232,11 +250,9 @@ vendas, cupom_grp = _normalize_vendas_period(vend_raw)
 def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
     """
     Retorna KeyID, QtdNum, CustoNum (custo unitário efetivo) e Data_d.
-    - Aceita cabeçalhos variados (IDProduto/ID/Código/SKU; Custo Unitário/CustoUnit/PrecoCusto/etc).
-    - Limpa "R$" e formata número pt-BR.
+    - Aceita cabeçalhos variados.
     - Se não houver custo unitário, usa Total/Qtd.
-    - Se houver FreteRateado (ou Frete), adiciona ao custo unitário.
-    - Ignora linhas com Qtd <= 0 ou ID vazio.
+    - Se houver FreteRateado/Frete, adiciona ao custo unitário.
     """
     if c is None or c.empty:
         return pd.DataFrame(columns=["KeyID", "QtdNum", "CustoNum", "Data_d"])
@@ -252,7 +268,6 @@ def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
         s = re.sub(r"[\s_]+", "", s)
         return s
 
-    # mapa normalizado -> coluna original
     norm2orig = {_norm(col): col for col in d.columns}
 
     def _pick(*aliases):
@@ -262,7 +277,6 @@ def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
                 return col
         return None
 
-    # Colunas possíveis
     col_idp = _pick("IDProduto", "ID do Produto", "ProdutoID", "Produto Id", "SKU", "COD", "Código", "Codigo", "ID")
     col_qtd = _pick("Qtd", "Quantidade", "Qtde", "Qde", "QTD")
     col_cu  = _pick("Custo Unitário", "CustoUnitário", "Custo Unit", "CustoUnit",
@@ -271,7 +285,6 @@ def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
     col_dat = _pick("Data", "Emissao", "Emissão")
     col_fre = _pick("FreteRateado", "Frete Rateado", "Frete")
 
-    # Helpers (usa sua _to_float e _parse_date_any)
     def to_f(x): 
         return _to_float(x, default=0.0)
 
@@ -281,27 +294,46 @@ def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
         "Data_d":  d[col_dat].apply(_parse_date_any) if col_dat in d else None,
     })
 
-    # custo unitário direto
     if col_cu in d:
         out["CustoNum"] = d[col_cu].apply(to_f)
     else:
         out["CustoNum"] = 0.0
 
-    # fallback: Total / Qtd
     if col_tot in d:
         total_num = d[col_tot].apply(to_f)
         mask_fb = (out["CustoNum"] <= 0) & (out["QtdNum"] > 0)
         out.loc[mask_fb, "CustoNum"] = (total_num[mask_fb] / out.loc[mask_fb, "QtdNum"]).astype(float)
 
-    # frete rateado por item (se existir)
     if col_fre in d:
         frete = d[col_fre].apply(to_f)
         out["CustoNum"] = (out["CustoNum"].fillna(0.0) + frete.fillna(0.0)).astype(float)
 
-    # filtros finais
     out = out[(out["KeyID"] != "") & (out["QtdNum"] > 0)]
     out.loc[abs(out["CustoNum"]) > 1e6, "CustoNum"] = 0.0
     return out[["KeyID", "QtdNum", "CustoNum", "Data_d"]]
+
+c_all = _normalize_compras_all_with_date(comp_raw)
+
+# =========================
+# Ajustes (opcional)
+# =========================
+def _normalize_ajustes(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["KeyID","QtdNum"])
+    d = df.copy(); d.columns = [x.strip() for x in d.columns]
+    col_idp = _first_col(d, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
+    col_qtd = _first_col(d, ["Qtd","Quantidade","Qtde","Qde","Ajuste","Delta"])
+    if not col_idp or not col_qtd:
+        return pd.DataFrame(columns=["KeyID","QtdNum"])
+    out = pd.DataFrame({"KeyID": d[col_idp].apply(_canon_id), "QtdNum": d[col_qtd].apply(_to_float)})
+    out = out[(out["KeyID"]!="") & (out["QtdNum"]!=0)]
+    return out
+
+try:
+    ajustes_raw = carregar_aba("Ajustes")
+except Exception:
+    ajustes_raw = pd.DataFrame()
+a_all = _normalize_ajustes(ajustes_raw)
 
 # =========================
 # Contagem/Estoque Inicial (opcional)
@@ -327,6 +359,7 @@ saldo_inicial = cont.groupby("KeyID")["SaldoInicial"].sum() if not cont.empty el
 # =========================
 # Estoque: Entradas/Saídas/Ajustes + SaldoInicial
 # =========================
+v_all = vendas.copy() if not vendas.empty else pd.DataFrame(columns=["KeyID","QtdNum"])
 entradas = c_all.groupby("KeyID")["QtdNum"].sum() if not c_all.empty else pd.Series(dtype=float)
 saidas   = v_all.groupby("KeyID")["QtdNum"].sum() if not v_all.empty else pd.Series(dtype=float)
 ajustes  = a_all.groupby("KeyID")["QtdNum"].sum() if not a_all.empty else pd.Series(dtype=float)
@@ -349,7 +382,7 @@ def _last_cost_per_product(comp_df: pd.DataFrame) -> pd.Series:
     d = d.sort_values(["KeyID","Data_d","_ord"]).groupby("KeyID").tail(1)
     return d.set_index("KeyID")["CustoNum"]
 
-last_cost = _last_cost_per_product(c_all)  # custos (float) por KeyID
+last_cost = _last_cost_per_product(c_all)
 
 calc = calc.reset_index().rename(columns={"index":"KeyID"})
 prod_calc = prod.copy() if not prod.empty else pd.DataFrame()
@@ -364,7 +397,6 @@ fator_map = (prod_calc.set_index("KeyID")["FatorCusto"].fillna(1.0)
              if "FatorCusto" in prod_calc.columns else pd.Series(dtype=float))
 
 def _choose_cost_base(keyid: str) -> float:
-    """Último Custo Unitário (compras) — sem cair para valores antigos da planilha."""
     v = float(last_cost.get(str(keyid), 0.0) or 0.0)
     return v
 
@@ -440,7 +472,7 @@ st.subheader("📆 Vendas vs Compras por dia")
 def _daily(df_in, date_col, val_col, label):
     if df_in is None or df_in.empty: return pd.DataFrame(columns=["Data","Valor","Tipo"])
     d = df_in.copy()
-    d[date_col] = d[date_col].apply(_parse_date_any)
+    d[date_col] = pd.to_datetime(d[date_col])
     g = d.groupby(date_col)[val_col].sum().reset_index().rename(columns={date_col:"Data", val_col:"Valor"})
     g["Tipo"] = label
     return g
@@ -458,6 +490,36 @@ else:
 st.divider()
 
 # =========================
+# Vendas do mês (por dia)
+# =========================
+st.subheader(f"📈 Vendas no mês — {MESES_NOMES[mes_sel-1]}/{ano_sel}")
+
+if not cupom_grp.empty:
+    cup = cupom_grp.copy()
+    # garantir datetime para filtragem por ano/mês
+    cup["Data_d"] = pd.to_datetime(cup["Data_d"])
+    cup_month = cup[(cup["Data_d"].dt.year == int(ano_sel)) & (cup["Data_d"].dt.month == int(mes_sel))]
+
+    diario = (cup_month.groupby("Data_d")["ReceitaCupom"]
+              .sum()
+              .reset_index()
+              .sort_values("Data_d"))
+    if diario.empty:
+        st.info("Sem vendas no mês selecionado.")
+    else:
+        diario["Acumulado"] = diario["ReceitaCupom"].cumsum()
+
+        figm = px.bar(diario, x="Data_d", y="ReceitaCupom",
+                      labels={"Data_d":"Dia","ReceitaCupom":"Receita (R$)"},
+                      title=None)
+        figm.add_scatter(x=diario["Data_d"], y=diario["Acumulado"], mode="lines+markers", name="Acumulado")
+        figm.update_layout(yaxis_title="R$", xaxis_title="", legend_title="", hovermode="x unified")
+        st.plotly_chart(figm, use_container_width=True)
+else:
+    st.info("Sem dados de vendas para montar o gráfico mensal.")
+st.divider()
+
+# =========================
 # Estoque — visão geral
 # =========================
 st.subheader("📦 Estoque — visão geral")
@@ -465,63 +527,62 @@ if prod_calc.empty:
     st.info("Sem produtos para exibir.")
 else:
     # Botão de sincronizar custo atual (linha a linha, numérico)
-with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=False):
-    st.caption("Atualiza 'CustoAtual' com o último Custo Unitário × FatorCusto (linha a linha por ID).")
+    with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=False):
+        st.caption("Atualiza 'CustoAtual' com o último Custo Unitário × FatorCusto (linha a linha por ID).")
 
-    import unicodedata, re
-    def _norm(s: str) -> str:
-        """Normaliza string para comparação de cabeçalho (sem acento/espaco/maiuscula)."""
-        s = unicodedata.normalize("NFKD", str(s))
-        s = "".join(ch for ch in s if not unicodedata.combining(ch))
-        s = s.lower().strip()
-        s = re.sub(r"[\s_]+", "", s)
-        return s
+        import unicodedata, re
+        def _norm(s: str) -> str:
+            s = unicodedata.normalize("NFKD", str(s))
+            s = "".join(ch for ch in s if not unicodedata.combining(ch))
+            s = s.lower().strip()
+            s = re.sub(r"[\s_]+", "", s)
+            return s
 
-    def _find_col_idx(header, aliases):
-        norm_map = {_norm(h): i+1 for i, h in enumerate(header)}  # 1-based index
-        for a in aliases:
-            idx = norm_map.get(_norm(a))
-            if idx:
-                return idx
-        return None
+        def _find_col_idx(header, aliases):
+            norm_map = {_norm(h): i+1 for i, h in enumerate(header)}  # 1-based index
+            for a in aliases:
+                idx = norm_map.get(_norm(a))
+                if idx:
+                    return idx
+            return None
 
-    if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
-        try:
-            from gspread.utils import rowcol_to_a1
-            sh = conectar_sheets()
-            ws = sh.worksheet(ABA_PROD)
-            header = ws.row_values(1)
+        if st.button("✍️ Atualizar coluna CustoAtual na planilha"):
+            try:
+                from gspread.utils import rowcol_to_a1
+                sh = conectar_sheets()
+                ws = sh.worksheet(ABA_PROD)
+                header = ws.row_values(1)
 
-            id_col_idx    = _find_col_idx(header, ["ID","Codigo","Código","ProdutoID","SKU"])
-            custo_col_idx = _find_col_idx(header, ["CustoAtual","Custo Atual","Custo_Atual"])
+                id_col_idx    = _find_col_idx(header, ["ID","Codigo","Código","ProdutoID","SKU"])
+                custo_col_idx = _find_col_idx(header, ["CustoAtual","Custo Atual","Custo_Atual"])
 
-            if not id_col_idx or not custo_col_idx:
-                st.error("⚠️ Cabeçalho precisa ter colunas equivalentes a 'ID' e 'CustoAtual' na aba Produtos.")
-                st.stop()
+                if not id_col_idx or not custo_col_idx:
+                    st.error("⚠️ Cabeçalho precisa ter colunas equivalentes a 'ID' e 'CustoAtual' na aba Produtos.")
+                    st.stop()
 
-            ids_sheet = ws.col_values(id_col_idx)[1:]  # pula header
-            start_row = 2
-            end_row   = start_row + len(ids_sheet) - 1
-            if end_row < start_row:
-                st.warning("Não há linhas de produtos para atualizar.")
-                st.stop()
+                ids_sheet = ws.col_values(id_col_idx)[1:]  # pula header
+                start_row = 2
+                end_row   = start_row + len(ids_sheet) - 1
+                if end_row < start_row:
+                    st.warning("Não há linhas de produtos para atualizar.")
+                    st.stop()
 
-            cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
-            cells = ws.range(cell_range)
+                cell_range = f"{rowcol_to_a1(start_row, custo_col_idx)}:{rowcol_to_a1(end_row, custo_col_idx)}"
+                cells = ws.range(cell_range)
 
-            for i, cell in enumerate(cells):
-                raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
-                keyid  = _canon_id(raw_id)
-                val    = float(_choose_cost_final(keyid)) if keyid else 0.0
-                cell.value = val
+                for i, cell in enumerate(cells):
+                    raw_id = ids_sheet[i] if i < len(ids_sheet) else ""
+                    keyid  = _canon_id(raw_id)
+                    val    = float(_choose_cost_final(keyid)) if keyid else 0.0
+                    cell.value = val
 
-            ws.update_cells(cells, value_input_option="USER_ENTERED")
-            st.success("✅ CustoAtual sincronizado com sucesso")
-            st.session_state["_force_refresh"] = True
-            st.rerun()
+                ws.update_cells(cells, value_input_option="USER_ENTERED")
+                st.success("✅ CustoAtual sincronizado com sucesso")
+                st.session_state["_force_refresh"] = True
+                st.rerun()
 
-        except Exception as e:
-            st.error(f"❌ Falha ao atualizar CustoAtual: {e}")
+            except Exception as e:
+                st.error(f"❌ Falha ao atualizar CustoAtual: {e}")
 
     # Filtros visuais
     m = pd.Series(True, index=prod_calc.index)
@@ -554,7 +615,7 @@ with st.expander("⚙️ Sincronizar 'CustoAtual' na aba Produtos", expanded=Fal
         if not alert.empty:
             alert["SugestaoCompra"] = (alert[estq_min_col].fillna(0)*2 - alert["EstoqueCalc"].fillna(0)).clip(lower=0).round()
             cols_alert = [c for c in ["ID","Nome","Categoria","Fornecedor","EstoqueCalc",estq_min_col,"SugestaoCompra","LeadTimeDias"] if c in alert.columns]
-            st.dataframe(alert[cols_alert].rename(columns={"EstoqueCalc":"EstoqueAtual", estq_min_col:"EstoqueMin"}),
+            st.dataframe(alert[cols_alert].rename(columns={"EstoqueCalc":"EstoqueAtual", "EstoqueMin":"EstoqueMin"}),
                          use_container_width=True, hide_index=True)
         else:
             st.info("Nenhum item abaixo do mínimo.")
