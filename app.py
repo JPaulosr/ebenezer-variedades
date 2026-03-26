@@ -16,26 +16,6 @@ from google.oauth2.service_account import Credentials
 # Setup & Estilo
 # =========================
 
-# ✅ Força o tema cinza escrevendo o config.toml antes do set_page_config
-import os, pathlib
-_cfg_dir = pathlib.Path(".streamlit")
-_cfg_dir.mkdir(exist_ok=True)
-_cfg_file = _cfg_dir / "config.toml"
-_cfg_content = """
-[theme]
-backgroundColor = "#f0f2f6"
-secondaryBackgroundColor = "#e8eaf0"
-textColor = "#1a1a2e"
-"""
-# Só escreve se não existir ou se o backgroundColor estiver diferente
-_write = True
-if _cfg_file.exists():
-    _existing = _cfg_file.read_text()
-    if "#f0f2f6" in _existing:
-        _write = False
-if _write:
-    _cfg_file.write_text(_cfg_content)
-
 st.set_page_config(
     page_title="Ebenezér Variedades",
     page_icon="🛍️",
@@ -52,22 +32,6 @@ html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif;
 }
 
-/* Fundo cinza — força em todos os elementos do Streamlit */
-html, body,
-.stApp,
-.stApp > div,
-.stApp > div > div,
-[data-testid="stAppViewContainer"],
-[data-testid="stAppViewBlockContainer"],
-[data-testid="block-container"],
-.main,
-.main > div,
-.block-container,
-section.main,
-section.main > div {
-    background-color: #f0f2f6 !important;
-    background: #f0f2f6 !important;
-}
 
 /* Header customizado */
 .page-header {
