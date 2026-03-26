@@ -402,38 +402,47 @@ if not prod.empty:
     prod["ValorEstoque"] = prod["CustoAtual"].fillna(0)*prod["EstoqueAtual"].fillna(0)
 
 # =========================
-# BOTÃO FLUTUANTE — abre sidebar via JS
+# BARRA DE NAVEGAÇÃO NATIVA
 # =========================
 st.markdown("""
 <style>
-#menu-fab {
-    position: fixed;
-    top: 14px;
-    left: 14px;
-    z-index: 99999;
-    background: #0f3460;
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 46px;
-    height: 46px;
-    font-size: 1.3rem;
-    cursor: pointer;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background 0.2s;
+/* Estilo da barra de nav */
+div[data-testid="stPageLink"] a {
+    background: rgba(255,255,255,0.07) !important;
+    border-radius: 10px !important;
+    padding: 6px 10px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    color: rgba(255,255,255,0.75) !important;
+    text-decoration: none !important;
+    transition: background 0.15s !important;
+    white-space: nowrap !important;
 }
-#menu-fab:hover { background: #1a1a2e; }
+div[data-testid="stPageLink"] a:hover {
+    background: rgba(255,255,255,0.15) !important;
+    color: #fff !important;
+}
 </style>
-<button id="menu-fab" title="Abrir menu" onclick="
-    var btn = window.parent.document.querySelector('[data-testid=stSidebarCollapsedControl] button');
-    if (!btn) btn = window.parent.document.querySelector('[data-testid=collapsedControl] button');
-    if (!btn) btn = window.parent.document.querySelector('button[kind=header]');
-    if (btn) btn.click();
-">☰</button>
 """, unsafe_allow_html=True)
+
+with st.container():
+    nav_cols = st.columns(12)
+    pages = [
+        ("🏠 Dashboard",    "app.py"),
+        ("💰 Fiado",         "pages/000_Fiado_Dashboard.py"),
+        ("🛒 Vendas",        "pages/00_Vendas.py"),
+        ("🏦 Caixa",         "pages/01_Fechamento_Caixa.py"),
+        ("📦 Produtos",      "pages/01_Produtos.py"),
+        ("➕ Cadastrar",     "pages/02_Cadastrar_Produto.py"),
+        ("🚚 Compras",       "pages/03_Compras_Produtos_Entradas.py"),
+        ("📊 Estoque",       "pages/04_Estoque.py"),
+        ("🔢 Contagem",      "pages/05_Contagem_Estoque.py"),
+        ("✂️ Fracionar",     "pages/05_Fracionar.py"),
+        ("🖼️ Fotos",         "pages/07_upload_fotos.py"),
+    ]
+    for i, (label, path) in enumerate(pages):
+        with nav_cols[i]:
+            st.page_link(path, label=label)
 
 # =========================
 # HEADER
