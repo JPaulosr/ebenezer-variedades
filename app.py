@@ -31,7 +31,7 @@ html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif;
 }
 .stApp {
-    background: #f7f5f2;
+    background: #f0f2f6;
 }
 
 /* Header customizado */
@@ -194,12 +194,8 @@ html, body, [class*="css"] {
     box-shadow: 0 2px 8px rgba(0,0,0,0.04);
 }
 
-/* Fundo branco limpo */
-.stApp {
-    background: #ffffff;
-}
 
-/* Esconde APENAS o botão de colapso da sidebar (não a sidebar em si) */
+/* Cards ficam brancos sobre o fundo cinza — contraste elegante */
 [data-testid="collapsedControl"] { display: none; }
 
 /* Mantém a sidebar de navegação visível — só remove padding extra */
