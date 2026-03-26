@@ -205,7 +205,7 @@ html, body, [class*="css"] {
 
 
 /* Cards ficam brancos sobre o fundo cinza — contraste elegante */
-[data-testid="collapsedControl"] { display: none; }
+/* sidebar toggle mantido visível para navegação */
 
 /* Mantém a sidebar de navegação visível — só remove padding extra */
 section[data-testid="stSidebar"] > div:first-child {
