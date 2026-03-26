@@ -214,7 +214,13 @@ section[data-testid="stSidebar"] > div:first-child {
 
 footer { display: none !important; }
 #MainMenu { display: none !important; }
-header { visibility: hidden; height: 0; }
+/* Mantém header visível para o botão de sidebar funcionar */
+header { visibility: visible !important; height: auto !important; }
+/* Esconde apenas o deploy button */
+[data-testid="stToolbar"] { display: none !important; }
+/* Garante que o botão de abrir/fechar sidebar apareça sempre */
+[data-testid="collapsedControl"] { display: flex !important; }
+[data-testid="stSidebarCollapsedControl"] { display: flex !important; }
 
 /* Botão estilizado */
 .stButton > button {
