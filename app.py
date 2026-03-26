@@ -29,7 +29,7 @@ st.set_page_config(
     page_title="Ebenezér Variedades",
     page_icon="🛍️",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
@@ -231,6 +231,48 @@ header { visibility: hidden; height: 0; }
     background: #0f3460;
     transform: translateY(-1px);
 }
+
+/* ===== RESPONSIVO MOBILE ===== */
+@media (max-width: 768px) {
+    .page-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 18px 16px;
+    }
+    .page-header h1 {
+        font-size: 1.3rem !important;
+    }
+    .header-badge {
+        padding: 6px 12px;
+        font-size: 0.75rem;
+    }
+    .kpi-value {
+        font-size: 1.2rem !important;
+    }
+    .kpi-card {
+        padding: 14px 16px;
+    }
+    .kpi-label {
+        font-size: 0.7rem;
+    }
+    .alerta-card {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+    }
+    .alerta-badge {
+        margin-left: 0;
+    }
+    .secao-titulo {
+        font-size: 0.95rem;
+    }
+    .filtro-container {
+        padding: 12px 14px;
+    }
+}
+
+[data-testid="stHeader"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -635,7 +677,7 @@ caixa_periodo = faturamento - compras_total
 # =========================
 # CARDS KPI — layout bonito
 # =========================
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3 = st.columns(3)
 
 def kpi_html(icon, label, value, sub="", sub_color="kpi-neutral"):
     return f"""
@@ -655,6 +697,8 @@ with c2:
                 f"Ticket médio: {_fmt_brl(ticket_medio)}"), unsafe_allow_html=True)
 with c3:
     st.markdown(kpi_html("📦", "Itens vendidos", f"{itens_vendidos:.0f}"), unsafe_allow_html=True)
+
+c4, c5 = st.columns(2)
 with c4:
     cor = "kpi-positive" if lucro_bruto > 0 else "kpi-negative"
     st.markdown(kpi_html("📊", "Lucro bruto", _fmt_brl(lucro_bruto),
@@ -753,11 +797,12 @@ if not prod_calc.empty:
     valor_estoque  = float(dfv["ValorEstoqueCalc"].fillna(0).sum()) if "ValorEstoqueCalc" in dfv.columns else 0.0
     abaixo_min     = int((dfv["EstoqueCalc"].fillna(0) <= dfv[estq_min_col].fillna(0)).sum()) if estq_min_col else 0
 
-    e1, e2, e3 = st.columns(3)
+    e1, e2 = st.columns(2)
     with e1:
         st.markdown(kpi_html("🏷️", "Produtos no estoque", str(total_produtos)), unsafe_allow_html=True)
     with e2:
         st.markdown(kpi_html("💰", "Valor em estoque", _fmt_brl(valor_estoque)), unsafe_allow_html=True)
+    e3, _ = st.columns([1, 1])
     with e3:
         cor = "kpi-negative" if abaixo_min > 0 else "kpi-positive"
         sub = "Precisam de reposição" if abaixo_min > 0 else "Tudo dentro do limite"
