@@ -16,6 +16,15 @@ from google.oauth2.service_account import Credentials
 # Setup & Estilo
 # =========================
 
+# Restaura o tema escuro (desfaz config.toml anterior que deixou tudo branco)
+import pathlib
+_cfg_dir = pathlib.Path(".streamlit")
+_cfg_dir.mkdir(exist_ok=True)
+(_cfg_dir / "config.toml").write_text("""
+[theme]
+base = "dark"
+""")
+
 st.set_page_config(
     page_title="Ebenezér Variedades",
     page_icon="🛍️",
