@@ -402,6 +402,40 @@ if not prod.empty:
     prod["ValorEstoque"] = prod["CustoAtual"].fillna(0)*prod["EstoqueAtual"].fillna(0)
 
 # =========================
+# BOTÃO FLUTUANTE — abre sidebar via JS
+# =========================
+st.markdown("""
+<style>
+#menu-fab {
+    position: fixed;
+    top: 14px;
+    left: 14px;
+    z-index: 99999;
+    background: #0f3460;
+    color: white;
+    border: none;
+    border-radius: 50%;
+    width: 46px;
+    height: 46px;
+    font-size: 1.3rem;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+}
+#menu-fab:hover { background: #1a1a2e; }
+</style>
+<button id="menu-fab" title="Abrir menu" onclick="
+    var btn = window.parent.document.querySelector('[data-testid=stSidebarCollapsedControl] button');
+    if (!btn) btn = window.parent.document.querySelector('[data-testid=collapsedControl] button');
+    if (!btn) btn = window.parent.document.querySelector('button[kind=header]');
+    if (btn) btn.click();
+">☰</button>
+""", unsafe_allow_html=True)
+
+# =========================
 # HEADER
 # =========================
 hoje = date.today()
