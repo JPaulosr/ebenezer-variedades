@@ -31,7 +31,10 @@ html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif;
 }
 .stApp {
-    background: #f0f2f6;
+    background: #f0f2f6 !important;
+}
+.main, .block-container {
+    background: #f0f2f6 !important;
 }
 
 /* Header customizado */
