@@ -19,7 +19,7 @@ st.set_page_config(
     page_title="Ebenezér Variedades",
     page_icon="🛍️",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="auto",
 )
 
 st.markdown("""
@@ -194,12 +194,22 @@ html, body, [class*="css"] {
     box-shadow: 0 2px 8px rgba(0,0,0,0.04);
 }
 
-/* Esconde sidebar e botão de toggle */
-[data-testid="collapsedControl"] { display: none; }
-section[data-testid="stSidebar"] { display: none; }
+/* Fundo branco limpo */
+.stApp {
+    background: #ffffff;
+}
 
-/* Métricas nativas Streamlit — esconde as padrão */
-[data-testid="stMetric"] { display: none; }
+/* Esconde APENAS o botão de colapso da sidebar (não a sidebar em si) */
+[data-testid="collapsedControl"] { display: none; }
+
+/* Mantém a sidebar de navegação visível — só remove padding extra */
+section[data-testid="stSidebar"] > div:first-child {
+    padding-top: 1rem;
+}
+
+footer { display: none !important; }
+#MainMenu { display: none !important; }
+header { visibility: hidden; height: 0; }
 
 /* Botão estilizado */
 .stButton > button {
@@ -216,11 +226,6 @@ section[data-testid="stSidebar"] { display: none; }
     background: #0f3460;
     transform: translateY(-1px);
 }
-
-/* Esconde elementos técnicos desnecessários */
-footer { display: none !important; }
-#MainMenu { display: none !important; }
-header { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
