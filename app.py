@@ -80,30 +80,30 @@ html, body, [class*="css"] {
 
 /* Período selector */
 .periodo-bar {
-    background: #ffffff;
+    background: rgba(255,255,255,0.05);
     border-radius: 14px;
     padding: 14px 20px;
     margin-bottom: 24px;
     display: flex;
     align-items: center;
     gap: 12px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
-    border: 1px solid #eee;
+    border: 1px solid rgba(255,255,255,0.08);
 }
 
-/* KPI Cards */
+/* KPI Cards — tema escuro */
 .kpi-card {
-    background: #ffffff;
+    background: rgba(255,255,255,0.06);
     border-radius: 18px;
     padding: 22px 24px;
-    box-shadow: 0 2px 16px rgba(0,0,0,0.06);
-    border: 1px solid #efefef;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.25);
+    border: 1px solid rgba(255,255,255,0.1);
     height: 100%;
     transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
 .kpi-card:hover {
     transform: translateY(-2px);
-    box-shadow: 0 6px 24px rgba(0,0,0,0.1);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+    background: rgba(255,255,255,0.09);
 }
 .kpi-icon {
     font-size: 1.5rem;
@@ -113,7 +113,7 @@ html, body, [class*="css"] {
 .kpi-label {
     font-size: 0.75rem;
     font-weight: 600;
-    color: #999;
+    color: rgba(255,255,255,0.45);
     text-transform: uppercase;
     letter-spacing: 0.6px;
     margin-bottom: 6px;
@@ -122,22 +122,22 @@ html, body, [class*="css"] {
     font-family: 'Nunito', sans-serif;
     font-size: 1.65rem;
     font-weight: 800;
-    color: #1a1a2e;
+    color: #ffffff;
     line-height: 1.1;
 }
 .kpi-sub {
     font-size: 0.78rem;
-    color: #888;
+    color: rgba(255,255,255,0.4);
     margin-top: 5px;
 }
-.kpi-positive { color: #16a34a; }
-.kpi-negative { color: #dc2626; }
-.kpi-neutral  { color: #2563eb; }
+.kpi-positive { color: #4ade80; }
+.kpi-negative { color: #f87171; }
+.kpi-neutral  { color: #60a5fa; }
 
-/* Alerta estoque */
+/* Alerta estoque — tema escuro */
 .alerta-card {
-    background: #fff8f0;
-    border: 1.5px solid #fed7aa;
+    background: rgba(251,146,60,0.12);
+    border: 1.5px solid rgba(251,146,60,0.35);
     border-radius: 14px;
     padding: 16px 20px;
     margin-bottom: 8px;
@@ -147,30 +147,31 @@ html, body, [class*="css"] {
 }
 .alerta-nome {
     font-weight: 700;
-    color: #9a3412;
+    color: #fb923c;
     font-size: 0.92rem;
 }
 .alerta-info {
     font-size: 0.78rem;
-    color: #c2410c;
+    color: rgba(251,146,60,0.7);
 }
 .alerta-badge {
-    background: #fed7aa;
-    color: #9a3412;
+    background: rgba(251,146,60,0.2);
+    color: #fb923c;
     border-radius: 8px;
     padding: 4px 10px;
     font-size: 0.75rem;
     font-weight: 700;
     white-space: nowrap;
     margin-left: auto;
+    border: 1px solid rgba(251,146,60,0.3);
 }
 
-/* Seção */
+/* Seção — tema escuro */
 .secao-titulo {
     font-family: 'Nunito', sans-serif;
     font-weight: 800;
     font-size: 1.1rem;
-    color: #1a1a2e;
+    color: rgba(255,255,255,0.9);
     margin: 28px 0 16px 0;
     display: flex;
     align-items: center;
@@ -179,22 +180,22 @@ html, body, [class*="css"] {
 .secao-titulo::after {
     content: '';
     flex: 1;
-    height: 2px;
-    background: linear-gradient(to right, #e2e8f0, transparent);
+    height: 1px;
+    background: linear-gradient(to right, rgba(255,255,255,0.15), transparent);
     margin-left: 10px;
     border-radius: 2px;
 }
 
-/* Tabela limpa */
+/* Tabela */
 .stDataFrame {
     border-radius: 14px !important;
     overflow: hidden;
-    border: 1px solid #eee !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
 }
 
-/* Filtros no topo */
+/* Filtros no topo — tema escuro */
 .filtro-container {
-    background: #fff;
+    background: rgba(255,255,255,0.05);
     border-radius: 14px;
     padding: 16px 20px;
     margin-bottom: 20px;
@@ -684,14 +685,15 @@ serie = pd.concat([g_v, g_c], ignore_index=True)
 
 if not serie.empty:
     fig = px.bar(serie, x="Data", y="Valor", color="Tipo", barmode="group",
-                 color_discrete_map={"💵 Vendas": "#0f3460", "🛒 Compras": "#e94560"},
-                 template="plotly_white")
+                 color_discrete_map={"💵 Vendas": "#60a5fa", "🛒 Compras": "#f87171"},
+                 template="plotly_dark")
     fig.update_layout(
         yaxis_title="R$", xaxis_title="",
         legend_title="",
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font_family="DM Sans",
+        font_color="rgba(255,255,255,0.75)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=0, r=0, t=10, b=0),
         height=280,
@@ -772,8 +774,8 @@ if not prod_calc.empty:
         fig2 = px.bar(
             top, x="ValorEstoqueCalc", y="Nome", orientation="h",
             color="ValorEstoqueCalc",
-            color_continuous_scale=["#c7d2fe","#0f3460"],
-            template="plotly_white",
+            color_continuous_scale=["#1e3a5f","#60a5fa"],
+            template="plotly_dark",
         )
         fig2.update_layout(
             xaxis_title="R$ em estoque", yaxis_title="",
@@ -781,6 +783,7 @@ if not prod_calc.empty:
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
             font_family="DM Sans",
+            font_color="rgba(255,255,255,0.75)",
             margin=dict(l=0, r=0, t=10, b=0),
             height=320,
             yaxis={"autorange": "reversed"},
