@@ -146,8 +146,19 @@ def _refresh():
     st.rerun()
 
 def _to_float(x):
-    if x is None or str(x).strip() == "": return None
-    s = str(x).strip().replace("R$","").replace(" ","").replace(".","").replace(",",".")
+    if x is None: return None
+    # Se já é número (vindo do pandas/sheets como float/int), retorna direto
+    if isinstance(x, (int, float)):
+        import math
+        return None if math.isnan(x) else float(x)
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"): return None
+    s = s.replace("R$","").replace(" ","").replace("\u00A0","")
+    # Formato BR (tem vírgula): remove pontos de milhar, troca vírgula por ponto
+    if "," in s:
+        s = s.replace(".","").replace(",",".")
+    # Formato US / já numérico: mantém o ponto decimal como está
+    s = s.replace("-","") if s.count("-") > 1 else s
     try: return float(s)
     except: return None
 
@@ -437,13 +448,25 @@ with aba_frac:
     if prod_df.empty:
         st.info("Cadastre produtos primeiro.")
     else:
-        labels_g = prod_df.apply(_fmt_prod, axis=1).tolist()
+        # Filtrar apenas produtos com estoque > 0 para a lista do granel
+        def _tem_estoque(r):
+            pid  = _nz(r.get(COL_ID,"")   if COL_ID   else "")
+            pnom = _nz(r.get(COL_NOME,"") if COL_NOME else "")
+            return _estoque_atual(pid, pnom) > 0
+
+        prod_com_estoque = prod_df[prod_df.apply(_tem_estoque, axis=1)].reset_index(drop=True)
+
+        if prod_com_estoque.empty:
+            st.info("Nenhum produto com estoque disponível para fracionar. Registre uma compra primeiro.")
+            st.stop()
+
+        labels_g = prod_com_estoque.apply(_fmt_prod, axis=1).tolist()
 
         st.markdown("**1️⃣ Qual produto granel você vai fracionar?**")
-        idx_g = st.selectbox("Produto granel", options=range(len(prod_df)),
+        idx_g = st.selectbox("Produto granel (apenas com estoque)", options=range(len(prod_com_estoque)),
                              format_func=lambda i: labels_g[i], key="frac_granel")
 
-        row_g = prod_df.iloc[idx_g]
+        row_g = prod_com_estoque.iloc[idx_g]
         gid   = _nz(row_g.get(COL_ID,"")   if COL_ID   else "")
         gnome = _nz(row_g.get(COL_NOME,"") if COL_NOME else "")
         gunid = _nz(row_g.get(COL_UNID,"") if COL_UNID else "un")
@@ -453,12 +476,17 @@ with aba_frac:
         custo_unit_granel = ult_g["custo_unit"] if ult_g and ult_g.get("custo_unit") else None
 
         cor_estq = "#4ade80" if estq_g > 0 else "#f87171"
-        info_custo = ("&nbsp;·&nbsp; 💰 Última compra: <b>" + _brl(custo_unit_granel) + "/" + gunid + "</b>") if custo_unit_granel else "&nbsp;·&nbsp; ⚠️ Sem histórico de compra"
+        # Mostrar custo de forma clara: quanto custou cada unidade
+        if custo_unit_granel:
+            info_custo = f"&nbsp;·&nbsp; 💰 Cada {gunid} custou: <b>{_brl(custo_unit_granel)}</b>"
+        else:
+            info_custo = "&nbsp;·&nbsp; ⚠️ Sem histórico de compra"
+        estq_fmt = str(int(estq_g)) if estq_g == int(estq_g) else f"{estq_g:.2f}"
         st.markdown(f'''
         <div class="info-card">
           <div class="titulo">{gnome}</div>
           <div class="detalhe">
-            📦 Estoque disponível: <b style="color:{cor_estq}">{estq_g:.2f} {gunid}</b>
+            📦 Estoque disponível: <b style="color:{cor_estq}">{estq_fmt} {gunid}</b>
             {info_custo}
           </div>
         </div>
@@ -475,11 +503,17 @@ with aba_frac:
 
         if custo_unit_granel:
             custo_total_lote = custo_unit_granel * qtd_granel_usar
+            qtd_str = str(int(qtd_granel_usar)) if qtd_granel_usar == int(qtd_granel_usar) else f"{qtd_granel_usar:.2f}"
             st.markdown(f'''
-            <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
-            border-radius:10px;padding:10px 16px;font-size:0.83rem;color:rgba(255,255,255,0.6)">
-            💰 Custo do lote: <b style="color:#fff">{_brl(custo_total_lote)}</b>
-            &nbsp;({_brl(custo_unit_granel)}/{gunid} × {qtd_granel_usar:.2f} {gunid})
+            <div style="background:rgba(74,222,128,0.07);border:1px solid rgba(74,222,128,0.2);
+            border-radius:10px;padding:12px 16px;font-size:0.85rem;">
+            💰 <span style="color:rgba(255,255,255,0.6)">Vai fracionar</span>
+            <b style="color:#fff">{qtd_str} {gunid}</b>
+            <span style="color:rgba(255,255,255,0.6)"> que custou </span>
+            <b style="color:#4ade80;font-size:1rem">{_brl(custo_total_lote)}</b>
+            <span style="color:rgba(255,255,255,0.35);font-size:0.75rem">
+             ({_brl(custo_unit_granel)}/un × {qtd_str})
+            </span>
             </div>
             ''', unsafe_allow_html=True)
         else:
