@@ -369,8 +369,7 @@ for k, d in [("cart",[]),("forma","Dinheiro"),("obs",""),("data_venda",date.toda
     if k not in _ss: _ss[k] = d
 
 def _rerun():
-    try: st.rerun()
-    except: st.experimental_rerun()
+    st.rerun()
 
 
 # ──────────────────────────────────────────────
