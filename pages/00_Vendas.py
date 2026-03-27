@@ -546,19 +546,26 @@ with col_dir:
     total_liq   = max(0.0, total_bruto - float(_ss["desc"]))
     n_itens     = sum(i["qtd"] for i in _ss["cart"])
 
+    _label_itens = "item" if n_itens == 1 else "itens"
+    _desc_txt    = f"· Desconto {_brl(_ss['desc'])}" if _ss["desc"] > 0 else ""
+    _forma_val   = _ss["forma"]
+    if _forma_val == "Dinheiro":   _forma_emoji = "💸"
+    elif _forma_val == "Pix":      _forma_emoji = "📱"
+    elif "Cart" in _forma_val:     _forma_emoji = "💳"
+    elif _forma_val == "Fiado":    _forma_emoji = "📒"
+    else:                          _forma_emoji = "💰"
+
     st.markdown(f"""
     <div class="total-box" style="margin-top:16px">
       <div style="display:flex;justify-content:space-between;align-items:flex-end">
         <div>
           <div class="total-label">Total a receber</div>
           <div class="total-val">{_brl(total_liq)}</div>
-          <div class="total-sub">{n_itens} {"item" if n_itens==1 else "itens"}
-            {"· Desconto " + _brl(_ss['desc']) if _ss['desc'] > 0 else ""}
-          </div>
+          <div class="total-sub">{n_itens} {_label_itens} {_desc_txt}</div>
         </div>
         <div style="text-align:right">
-          <div style="font-size:1.8rem">{"💸" if _ss["forma"]=="Dinheiro" else "📱" if _ss["forma"]=="Pix" else "💳" if "Cart" in _ss["forma"] else "📒" if _ss["forma"]=="Fiado" else "💰"}</div>
-          <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);margin-top:4px">{_ss["forma"]}</div>
+          <div style="font-size:1.8rem">{_forma_emoji}</div>
+          <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);margin-top:4px">{_forma_val}</div>
         </div>
       </div>
     </div>
