@@ -283,10 +283,35 @@ def estoque_atual(ch):
 
 
 # ──────────────────────────────────────────────
-#  SESSION STATE — auditoria (quais já contados)
+#  AUDITORIA PERSISTENTE — lê da planilha
+#  Um produto é "contado" se existe em MovimentosEstoque
+#  um Ajuste/Contagem com Data de hoje.
+#  Ao reabrir o app o progresso é restaurado automaticamente.
 # ──────────────────────────────────────────────
-if "contados" not in st.session_state:
-    st.session_state["contados"] = set()
+_hoje = datetime.now().strftime("%d/%m/%Y")
+
+def _contados_hoje() -> set:
+    """Produtos já contados hoje: tem Ajuste/Contagem com Data = hoje."""
+    if df_mov.empty:
+        return set()
+    col_data = _first_col(df_mov, ["Data","data"])
+    col_tipo = _first_col(df_mov, ["Tipo","tipo"])
+    col_obs  = _first_col(df_mov, ["Obs","obs","Observação","Observacao"])
+    if not col_data or not col_tipo:
+        return set()
+    mask_data = df_mov[col_data].astype(str).str.strip() == _hoje
+    mask_tipo = df_mov[col_tipo].astype(str).str.lower().str.contains("ajuste|contagem", na=False)
+    mask_obs  = pd.Series([True] * len(df_mov), index=df_mov.index)
+    if col_obs:
+        mask_obs = df_mov[col_obs].astype(str).str.lower().str.contains("contagem", na=False)
+    df_hoje = df_mov[mask_data & mask_tipo & mask_obs]
+    return set(df_hoje["__key"].tolist())
+
+# Só lê da planilha na primeira carga da sessão ou após salvar
+if "contados" not in st.session_state or st.session_state.get("_reload_audit"):
+    st.session_state["contados"] = _contados_hoje()
+    st.session_state["_reload_audit"] = False
+
 if "prod_sel" not in st.session_state:
     st.session_state["prod_sel"] = df_prod["__key"].iloc[0] if not df_prod.empty else None
 if "filtro_audit" not in st.session_state:
@@ -433,28 +458,31 @@ with col_left:
         btn_salvar = st.button("💾  Salvar contagem", type="primary", use_container_width=True)
 
         if btn_salvar:
-            if delta == 0:
-                st.success("✅ Estoque já está correto — marcado como contado!")
+            data_str  = datetime.now().strftime("%d/%m/%Y")
+            obs_final = f"{motivo or 'Contagem'} por {responsavel}".strip(" por").strip()
+            if obs: obs_final = (obs_final + " — " + obs) if obs_final else obs
+
+            # Sempre grava na planilha (delta=0 grava Qtd=0 para registrar a contagem)
+            qtd_str = str(int(delta) if float(delta).is_integer() else delta).replace(".",",")
+            try:
+                ws = _sheet().worksheet("MovimentosEstoque")
+                cur = ws.row_values(1) or ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
+                row_map = {"Data": data_str, "IDProduto": prod_id, "Produto": prod_nome,
+                           "Tipo": "Ajuste", "Qtd": qtd_str, "Obs": obs_final}
+                linha = [row_map.get(h,"") for h in cur]
+                ws.append_row(linha, value_input_option="USER_ENTERED")
+                # Marca como contado e força releitura da planilha na próxima vez
                 st.session_state["contados"].add(sel_key)
-            else:
-                data_str = datetime.now().strftime("%d/%m/%Y")
-                qtd_str  = str(delta).replace(".", ",")
-                obs_final = f"{motivo or 'Contagem'} por {responsavel}".strip(" por").strip()
-                if obs: obs_final = (obs_final + " — " + obs) if obs_final else obs
-                try:
-                    ws = _sheet().worksheet("MovimentosEstoque")
-                    cur = ws.row_values(1) or ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
-                    row_map = {"Data": data_str, "IDProduto": prod_id, "Produto": prod_nome,
-                               "Tipo": "Ajuste", "Qtd": qtd_str, "Obs": obs_final}
-                    linha = [row_map.get(h,"") for h in cur]
-                    ws.append_row(linha, value_input_option="USER_ENTERED")
-                    st.session_state["contados"].add(sel_key)
-                    st.cache_data.clear()
+                st.session_state["_reload_audit"] = True
+                st.cache_data.clear()
+                if delta == 0:
+                    st.success("✅ Estoque confirmado e contagem registrada!")
+                else:
                     sinal = "+" if delta > 0 else ""
-                    st.success(f"✅ Ajuste salvo! {sinal}{delta:.0f} unidades → estoque esperado: {alvo:.0f}")
-                except Exception as e:
-                    st.error("Falha ao salvar.")
-                    st.code(str(e))
+                    st.success(f"✅ Ajuste salvo! {sinal}{int(delta) if float(delta).is_integer() else delta} unidades → estoque esperado: {int(alvo) if float(alvo).is_integer() else alvo}")
+            except Exception as e:
+                st.error("Falha ao salvar.")
+                st.code(str(e))
 
 
 # ═══════════════════════════════════════════════
@@ -540,8 +568,16 @@ with col_right:
                         st.session_state["prod_sel"] = chave
                         st.rerun()
 
-    # Botão limpar auditoria
+    # Botões de controle
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🔄  Reiniciar contagem (limpar auditoria)", use_container_width=True):
-        st.session_state["contados"] = set()
-        st.rerun()
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        if st.button("🔄  Recarregar progresso", use_container_width=True, help="Busca novamente na planilha quais produtos já foram contados hoje"):
+            st.session_state["_reload_audit"] = True
+            st.cache_data.clear()
+            st.rerun()
+    with col_r2:
+        if st.button("⚠️  Limpar sessão", use_container_width=True, help="Limpa apenas a visualização local. Os ajustes já salvos na planilha permanecem."):
+            st.session_state["contados"] = set()
+            st.rerun()
+    st.caption("ℹ️ O progresso é salvo automaticamente na planilha. Feche e abra o app à vontade — ao reabrir, o sistema recupera tudo que foi contado hoje.")
