@@ -440,10 +440,10 @@ with col_esq:
         # Qtd + Preço + Botão
         c1, c2 = st.columns([1, 1])
         with c1:
-            qtd_add = st.number_input("Quantidade", min_value=1, step=1, value=1, key="qtd_add")
+            qtd_add = st.number_input("Quantidade", min_value=1, step=1, value=1, key=f"qtd_add_{pid_s}")
         with c2:
             preco_add = st.number_input("Preço unit. (R$)", min_value=0.0,
-                                        value=float(preco_s), step=0.10, format="%.2f", key="preco_add")
+                                        value=float(preco_s), step=0.10, format="%.2f", key=f"preco_add_{pid_s}")
 
         if st.button("➕  Adicionar ao carrinho", type="primary", use_container_width=True):
             _ss["cart"].append({
