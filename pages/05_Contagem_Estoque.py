@@ -404,10 +404,12 @@ with col_left:
         # ── Formulário de ajuste ──
         st.markdown('<div class="sec-titulo">✏️ Definir estoque</div>', unsafe_allow_html=True)
 
+        _val_input = float(est_atual)
+        _min_input = min(0.0, _val_input)
         alvo = st.number_input(
             "Quantidade contada (nova quantidade)",
-            min_value=0.0, step=1.0,
-            value=float(est_atual),
+            min_value=_min_input, step=1.0,
+            value=_val_input,
         )
         delta = alvo - est_atual
 
