@@ -460,7 +460,8 @@ with aba_frac:
             st.info("Nenhum produto com estoque disponível para fracionar. Registre uma compra primeiro.")
             st.stop()
 
-        labels_g = prod_com_estoque.apply(_fmt_prod, axis=1).tolist()
+        labels_g    = prod_com_estoque.apply(_fmt_prod, axis=1).tolist()
+        labels_todos = prod_df.apply(_fmt_prod, axis=1).tolist()  # todos os produtos como destino do frasco
 
         st.markdown("**1️⃣ Qual produto granel você vai fracionar?**")
         idx_g = st.selectbox("Produto granel (apenas com estoque)", options=range(len(prod_com_estoque)),
@@ -530,7 +531,7 @@ with aba_frac:
         with fa1:
             st.markdown("**Frasco A**")
             idx_a = st.selectbox("Produto do frasco A", options=range(len(prod_df)),
-                                 format_func=lambda i: labels_g[i], key="frac_a_prod")
+                                 format_func=lambda i: labels_todos[i], key="frac_a_prod")
             qtd_a = st.number_input("Quantos frascos A?", min_value=0, step=1, value=0, key="frac_a_qtd")
             emb_a = st.number_input("Custo embalagem A (R$)", min_value=0.0, step=0.01,
                                     value=0.0, format="%.2f", key="frac_a_emb",
@@ -540,7 +541,7 @@ with aba_frac:
             if usar_b:
                 st.markdown("**Frasco B**")
                 idx_b = st.selectbox("Produto do frasco B", options=range(len(prod_df)),
-                                     format_func=lambda i: labels_g[i], key="frac_b_prod")
+                                     format_func=lambda i: labels_todos[i], key="frac_b_prod")
                 qtd_b = st.number_input("Quantos frascos B?", min_value=0, step=1, value=0, key="frac_b_qtd")
                 emb_b = st.number_input("Custo embalagem B (R$)", min_value=0.0, step=0.01,
                                         value=0.0, format="%.2f", key="frac_b_emb")
