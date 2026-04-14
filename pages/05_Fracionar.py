@@ -1,82 +1,259 @@
 # -*- coding: utf-8 -*-
-# pages/05_fracionar.py — Fracionar GRANEL (L) em fracionados (1L, 500ml, etc.)
-import json, unicodedata, hashlib
-from datetime import datetime, date, timedelta
+# pages/05_Fracionar.py — Fracionar granel em fracionados
+# Visual idêntico ao Dashboard e Vendas (Ebenezér Variedades)
+from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
+import hashlib, json, unicodedata
+from datetime import date, datetime
+
 import gspread
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
+import pandas as pd
+import streamlit as st
 from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
-st.set_page_config(page_title="Fracionar (Granel → Fracionados)", page_icon="🧪", layout="wide")
-st.title("🧪 Fracionar — converter GRANEL (L) em fracionados")
+# ──────────────────────────────────────────────
+#  CONFIG & TEMA
+# ──────────────────────────────────────────────
+import pathlib
+_cfg = pathlib.Path(".streamlit"); _cfg.mkdir(exist_ok=True)
+(_cfg / "config.toml").write_text('[theme]\nbase = "dark"\n')
 
-# =============================================================================
-# Auth / Sheets helpers
-# =============================================================================
+st.set_page_config(
+    page_title="Fracionar",
+    page_icon="✂️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=DM+Sans:wght@300;400;500&display=swap');
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+
+/* Header */
+.page-header {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
+    border-radius: 20px; padding: 24px 32px; margin-bottom: 24px;
+    display: flex; align-items: center; justify-content: space-between;
+    box-shadow: 0 8px 32px rgba(15,52,96,0.25);
+}
+.page-header h1 { font-family:'Nunito',sans-serif; font-weight:900; font-size:1.7rem; color:#fff; margin:0; }
+.page-header .sub { font-size:0.82rem; color:rgba(255,255,255,0.5); margin-top:4px; }
+.header-badge {
+    background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2);
+    border-radius:50px; padding:8px 18px; color:#fff; font-size:0.82rem;
+    font-weight:600; backdrop-filter:blur(10px);
+}
+
+/* Seção título */
+.sec-titulo {
+    font-family:'Nunito',sans-serif; font-weight:800; font-size:1.05rem;
+    color:rgba(255,255,255,0.9); margin:24px 0 14px 0;
+    display:flex; align-items:center; gap:8px;
+}
+.sec-titulo::after {
+    content:''; flex:1; height:1px;
+    background:linear-gradient(to right,rgba(255,255,255,0.15),transparent);
+    margin-left:8px; border-radius:2px;
+}
+
+/* Card produto selecionado */
+.prod-card {
+    background: rgba(255,255,255,0.05);
+    border: 1.5px solid rgba(255,255,255,0.12);
+    border-radius: 20px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+}
+.prod-card img {
+    width: 90px; height: 90px; border-radius: 14px;
+    object-fit: contain; background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1); flex-shrink: 0;
+}
+.prod-card-ph {
+    width: 90px; height: 90px; border-radius: 14px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 2.5rem; flex-shrink: 0;
+}
+.prod-card-nome { font-family:'Nunito',sans-serif; font-weight:800; font-size:1.1rem; color:#fff; }
+.prod-card-sub   { font-size:0.78rem; color:rgba(255,255,255,0.45); margin-top:4px; }
+.prod-card-estq  { font-size:1rem; font-weight:700; color:#60a5fa; margin-top:6px; }
+
+/* KPI mini */
+.kpi-mini {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 14px;
+    padding: 16px 18px;
+    text-align: center;
+}
+.kpi-mini .label { font-size:0.72rem; font-weight:600; color:rgba(255,255,255,0.45); text-transform:uppercase; letter-spacing:0.5px; }
+.kpi-mini .valor { font-family:'Nunito',sans-serif; font-size:1.6rem; font-weight:800; color:#fff; margin-top:4px; }
+.kpi-mini .sub   { font-size:0.72rem; color:rgba(255,255,255,0.35); margin-top:3px; }
+.kpi-ok    { color:#4ade80 !important; }
+.kpi-warn  { color:#fbbf24 !important; }
+.kpi-err   { color:#f87171 !important; }
+
+/* Card de fracionado (preview) */
+.frac-card {
+    background: rgba(96,165,250,0.08);
+    border: 1.5px solid rgba(96,165,250,0.25);
+    border-radius: 16px;
+    padding: 16px 20px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+.frac-card img { width:60px; height:60px; border-radius:10px; object-fit:contain;
+    background:rgba(255,255,255,0.06); flex-shrink:0; }
+.frac-card-ph { width:60px; height:60px; border-radius:10px; background:rgba(255,255,255,0.06);
+    display:flex; align-items:center; justify-content:center; font-size:1.8rem; flex-shrink:0; }
+.frac-nome  { font-weight:700; font-size:0.9rem; color:#fff; }
+.frac-qtd   { font-family:'Nunito',sans-serif; font-size:1.1rem; font-weight:800; color:#60a5fa; }
+.frac-litros{ font-size:0.75rem; color:rgba(255,255,255,0.4); margin-top:2px; }
+
+/* Caixa de confirmação */
+.confirm-box {
+    background: linear-gradient(135deg, rgba(74,222,128,0.1), rgba(34,211,238,0.07));
+    border: 1.5px solid rgba(74,222,128,0.3);
+    border-radius: 18px;
+    padding: 22px 26px;
+    margin-top: 10px;
+}
+.confirm-titulo { font-family:'Nunito',sans-serif; font-size:1.1rem; font-weight:800; color:#4ade80; margin-bottom:12px; }
+.confirm-linha  { font-size:0.88rem; color:rgba(255,255,255,0.75); margin-bottom:6px; }
+.confirm-destaque { color:#fff; font-weight:700; }
+
+/* Aviso litros insuficientes */
+.aviso-erro {
+    background: rgba(248,113,113,0.1);
+    border: 1.5px solid rgba(248,113,113,0.35);
+    border-radius: 14px;
+    padding: 16px 20px;
+    color: #f87171;
+    font-weight: 600;
+    margin-top: 10px;
+}
+
+/* Botão principal */
+.stButton > button {
+    background: #0f3460 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 12px 28px !important;
+    font-weight: 700 !important;
+    font-size: 0.95rem !important;
+    transition: all 0.15s !important;
+}
+.stButton > button:hover {
+    background: #1a4a7a !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Navegação */
+div[data-testid="stPageLink"] a {
+    background: rgba(255,255,255,0.07) !important;
+    border-radius: 10px !important;
+    padding: 6px 10px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    color: rgba(255,255,255,0.75) !important;
+    text-decoration: none !important;
+    white-space: nowrap !important;
+}
+div[data-testid="stPageLink"] a:hover {
+    background: rgba(255,255,255,0.15) !important;
+    color: #fff !important;
+}
+
+footer { display: none !important; }
+#MainMenu { display: none !important; }
+[data-testid="stToolbar"] { display: none !important; }
+[data-testid="stHeader"] { display: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────
+#  HELPERS SHEETS
+# ──────────────────────────────────────────────
 def _normalize_private_key(key: str) -> str:
     if not isinstance(key, str): return key
     key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
-    return key
+    return "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
 
 def _load_sa() -> dict:
     svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None:
-        st.error("🛑 GCP_SERVICE_ACCOUNT ausente em st.secrets."); st.stop()
-    if isinstance(svc, str):
-        svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
+    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
+    if isinstance(svc, str): svc = json.loads(svc)
+    return {**svc, "private_key": _normalize_private_key(svc["private_key"])}
 
 @st.cache_resource
-def _client():
+def _conectar():
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    return gspread.authorize(creds)
+    gc = gspread.authorize(creds)
+    url = st.secrets.get("PLANILHA_URL", "")
+    if not url: st.error("🛑 PLANILHA_URL ausente."); st.stop()
+    return gc.open_by_url(url) if str(url).startswith("http") else gc.open_by_key(url)
 
-@st.cache_resource
-def _sheet():
-    gc = _client()
-    url_or_id = st.secrets.get("PLANILHA_URL")
-    if not url_or_id:
-        st.error("🛑 PLANILHA_URL ausente em st.secrets."); st.stop()
-    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
-
-@st.cache_data
-def _load_df(aba: str) -> pd.DataFrame:
-    ws = _sheet().worksheet(aba)
+@st.cache_data(ttl=15, show_spinner=False)
+def _carregar(aba: str) -> pd.DataFrame:
+    ws = _conectar().worksheet(aba)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
     return df
 
-def _safe_load(aba):
-    try: return _load_df(aba)
+def _safe_load(aba: str) -> pd.DataFrame:
+    try: return _carregar(aba)
     except Exception: return pd.DataFrame()
 
-def _ensure_ws(name: str, headers: list[str]):
-    sh = _sheet()
+def _pick(df: pd.DataFrame, *candidates) -> str | None:
+    for c in candidates:
+        if c in df.columns: return c
+    return None
+
+def _to_f(x) -> float:
+    if x is None: return 0.0
+    s = str(x).strip().replace("R$","").replace(" ","")
+    # formato BR: ponto como milhar, vírgula como decimal
+    if "," in s and "." in s:
+        s = s.replace(".","").replace(",",".")
+    else:
+        s = s.replace(",",".")
+    try: return float(s)
+    except: return 0.0
+
+def _fmt_brl(v: float) -> str:
+    return ("R$ " + f"{v:,.2f}").replace(",","X").replace(".",",").replace("X",".")
+
+def _ensure_ws(name: str, headers: list):
+    sh = _conectar()
     try:
         ws = sh.worksheet(name)
     except Exception:
         ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
+        set_with_dataframe(ws, pd.DataFrame(columns=headers),
+                           include_index=False, include_column_header=True, resize=True)
         return ws
-    # garante colunas sem perder dados
     cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
     cur.columns = [c.strip() for c in cur.columns]
-    missing = [h for h in headers if h not in cur.columns]
-    if missing:
-        for h in missing: cur[h] = ""
+    miss = [h for h in headers if h not in cur.columns]
+    if miss:
+        for h in miss: cur[h] = ""
         ws.clear()
         set_with_dataframe(ws, cur.fillna(""), include_index=False, include_column_header=True, resize=True)
     return ws
 
-def _rewrite_append(ws, row: dict):
+def _append_row(ws, row: dict):
     cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
     if cur is None or cur.empty:
         cur = pd.DataFrame(columns=list(row.keys()))
@@ -86,354 +263,381 @@ def _rewrite_append(ws, row: dict):
     ws.clear()
     set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
 
-# =============================================================================
-# Normalização / números
-# =============================================================================
-def _to_float(x):
-    if x is None or str(x).strip()=="":
-        return ""
-    s = str(x).strip().replace("R$","").replace(".","").replace(",",".")
-    try: return float(s)
-    except: return ""
 
-def _to_int(x):
-    if x is None or str(x).strip()=="":
-        return ""
-    try: return int(float(str(x).strip().replace(",", ".")))
-    except: return ""
+# ──────────────────────────────────────────────
+#  SALDO DE ESTOQUE (via MovimentosEstoque)
+# ──────────────────────────────────────────────
+def _saldo(df_mov: pd.DataFrame, prod_id: str, nome: str) -> float:
+    if df_mov.empty: return 0.0
+    c_id   = _pick(df_mov, "IDProduto", "ID")
+    c_tipo = _pick(df_mov, "Tipo", "Movimento", "Mov")
+    c_qtd  = _pick(df_mov, "Qtd", "Quantidade", "Qtde")
+    if not c_tipo or not c_qtd: return 0.0
+    if c_id and prod_id:
+        base = df_mov[df_mov[c_id].astype(str) == str(prod_id)]
+    elif _pick(df_mov, "Produto", "Nome"):
+        c_nm = _pick(df_mov, "Produto", "Nome")
+        base = df_mov[df_mov[c_nm].astype(str).str.strip().str.lower() == nome.strip().lower()]
+    else:
+        return 0.0
+    entradas = ["entrada","ajuste+","entrada manual","compra","in"]
+    saidas   = ["saida","saída","venda","ajuste-","saída manual","out"]
+    ent = base[base[c_tipo].astype(str).str.lower().isin(entradas)][c_qtd].apply(_to_f).sum()
+    sai = base[base[c_tipo].astype(str).str.lower().isin(saidas)][c_qtd].apply(_to_f).sum()
+    return round(float(ent) - float(sai), 3)
 
-# =============================================================================
-# Mapas de colunas
-# =============================================================================
-def _pick_col(df, candidates):
-    for c in candidates:
-        if c in df.columns: return c
-    return None
+# ──────────────────────────────────────────────
+#  ANTI DUPLICIDADE
+# ──────────────────────────────────────────────
+def _refid(data_str, produto, qtd, custo) -> str:
+    base = "|".join([data_str, str(produto).lower(), f"{float(qtd):.4f}", f"{float(custo):.4f}"])
+    return "FRAC-" + hashlib.sha1(base.encode()).hexdigest()[:12]
 
-def _map_cols_produtos(df):
-    return {
-        "id":        _pick_col(df, ["ID","Id","id"]),
-        "nome":      _pick_col(df, ["Nome","Produto","Descrição","Descricao"]),
-        "unidade":   _pick_col(df, ["Unidade","Unid"]),
-        "forn":      _pick_col(df, ["Fornecedor","FornecedorNome"]),
-        "custo":     _pick_col(df, ["CustoAtual","Custo","Custo Atual"]),
-        "preco":     _pick_col(df, ["PreçoVenda","PrecoVenda","Preço","Valor"]),
-        "estoque":   _pick_col(df, ["EstoqueAtual","Estoque","QtdEstoque","Quantidade"]),
-        "ativo":     _pick_col(df, ["Ativo?","Ativo","Status"]),
-    }
-
-def _map_cols_mov(df):
-    return {
-        "data": _pick_col(df, ["Data","DATA"]),
-        "id":   _pick_col(df, ["IDProduto","ID"]),
-        "nome": _pick_col(df, ["Produto","Nome"]),
-        "tipo": _pick_col(df, ["Tipo","Movimento","Mov"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "obs":  _pick_col(df, ["Obs","Observação","Observacoes","Observações"]),
-    }
-
-def _map_cols_compras(df):
-    return {
-        "data": _pick_col(df, ["Data","DATA"]),
-        "nome": _pick_col(df, ["Produto","Nome"]),
-        "unid": _pick_col(df, ["Unidade","Unid"]),
-        "forn": _pick_col(df, ["Fornecedor","FornecedorNome"]),
-        "qtd":  _pick_col(df, ["Qtd","Quantidade","Qtde"]),
-        "custo_unit": _pick_col(df, ["Custo Unitário","CustoUnit","Preço Unitário"]),
-        "total": _pick_col(df, ["Total","ValorTotal"]),
-        "id": _pick_col(df, ["IDProduto","ID"]),
-        "refid": _pick_col(df, ["RefID"]),
-        "obs": _pick_col(df, ["Obs","Observação","Observacoes","Observações"]),
-    }
-
-# =============================================================================
-# Carrega bases
-# =============================================================================
-df_prod = _safe_load("Produtos")
-df_mov  = _safe_load("MovimentosEstoque")
-df_comp = _safe_load("Compras")
-
-COLP = _map_cols_produtos(df_prod) if not df_prod.empty else {}
-COLM = _map_cols_mov(df_mov) if not df_mov.empty else {}
-COLC = _map_cols_compras(df_comp) if not df_comp.empty else {}
-
-COMPRAS_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs","RefID"]
-MOV_HEADERS     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
-
-# =============================================================================
-# Estoque (saldo) a partir de Movimentos
-# =============================================================================
-def _stock_balance(prod_id: str|None, nome: str):
-    if df_mov.empty or not COLM: return 0
-    base = df_mov.copy()
-    if prod_id and COLM.get("id"):
-        base = base[ base[COLM["id"]].astype(str) == str(prod_id) ]
-    elif COLM.get("nome"):
-        base = base[ base[COLM["nome"]].astype(str).str.strip().str.lower() == nome.strip().lower() ]
-    if base.empty: return 0
-    ent = base[ base[COLM["tipo"]].astype(str).str.lower().isin(["entrada","ajuste+","entrada manual","compra","in"]) ][COLM["qtd"]].apply(_to_float).sum()
-    sai = base[ base[COLM["tipo"]].astype(str).str.lower().isin(["saida","venda","ajuste-","saída manual","out"]) ][COLM["qtd"]].apply(_to_float).sum()
-    saldo = (ent or 0) - (sai or 0)
-    try: return round(float(saldo), 3)
-    except: return 0
-
-# =============================================================================
-# Anti duplicidade para "Compras internas"
-# =============================================================================
-def _norm_val_str(x) -> str:
-    if x is None: return ""
-    s = str(x).strip().replace("R$","").replace(".","").replace(",",".")
-    try: return f"{float(s):.6f}"
-    except: return str(x).strip().lower()
-
-def _make_refid_compra(data_str, produto, fornecedor, qtd, custo_unit) -> str:
-    base = "|".join([
-        (data_str or "").strip(),
-        (produto or "").strip().lower(),
-        (fornecedor or "").strip().lower(),
-        _norm_val_str(qtd),
-        _norm_val_str(custo_unit),
-    ])
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
-
-def _seen_refid_in_session(refid: str) -> bool:
-    bag = st.session_state.setdefault("_seen_compra_refids", set())
-    if refid in bag: return True
-    bag.add(refid); return False
-
-def _compra_exists(ws, refid: str) -> bool:
+def _ja_existe(ws, refid: str) -> bool:
     try:
         cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+        if cur.empty or "RefID" not in cur.columns: return False
+        return refid in cur["RefID"].astype(str).tolist()
     except Exception:
         return False
-    if cur.empty or "RefID" not in [c.strip() for c in cur.columns]: return False
-    return refid in cur["RefID"].astype(str).tolist()
 
-# =============================================================================
-# UI — seleção do granel e linhas de saída
-# =============================================================================
-if df_prod.empty or not COLP:
-    st.error("Aba 'Produtos' vazia ou não mapeada."); st.stop()
 
-# candidatos a granel: unidade 'L' ou nome contém 'granel'
-def _is_granel_row(r):
-    un = str(r.get(COLP["unidade"], "")).strip().lower()
-    nm = str(r.get(COLP["nome"], "")).strip().lower()
-    return ("l" in un) or ("litro" in un) or ("granel" in nm)
+# ──────────────────────────────────────────────
+#  CARREGA DADOS
+# ──────────────────────────────────────────────
+df_prod = _safe_load("Produtos")
+df_mov  = _safe_load("MovimentosEstoque")
 
-df_granel = df_prod[df_prod.apply(_is_granel_row, axis=1)].copy()
+MOV_HEADERS  = ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
+COMP_HEADERS = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs","RefID"]
+
+if df_prod.empty:
+    st.error("Aba 'Produtos' não encontrada ou vazia."); st.stop()
+
+c_id    = _pick(df_prod, "ID","Id")
+c_nome  = _pick(df_prod, "Nome","Produto","Descrição")
+c_unid  = _pick(df_prod, "Unidade","Unid")
+c_custo = _pick(df_prod, "CustoAtual","Custo Atual","CustoMedio","Custo")
+c_preco = _pick(df_prod, "PreçoVenda","PrecoVenda","Preço","Preco","Valor")
+c_foto  = _pick(df_prod, "Foto","FotoURL","Imagem","Cloudinary")
+c_ativo = _pick(df_prod, "Ativo?","Ativo","Status")
+
+
+# ──────────────────────────────────────────────
+#  BARRA DE NAVEGAÇÃO
+# ──────────────────────────────────────────────
+with st.container():
+    nav_cols = st.columns(12)
+    pages = [
+        ("🏠 Dashboard",    "app.py"),
+        ("💰 Fiado",         "pages/000_Fiado_Dashboard.py"),
+        ("🛒 Vendas",        "pages/00_Vendas.py"),
+        ("🏦 Caixa",         "pages/01_Fechamento_Caixa.py"),
+        ("📦 Produtos",      "pages/01_Produtos.py"),
+        ("➕ Cadastrar",     "pages/02_Cadastrar_Produto.py"),
+        ("🚚 Compras",       "pages/03_Compras_Produtos_Entradas.py"),
+        ("📊 Estoque",       "pages/04_Estoque.py"),
+        ("🔢 Contagem",      "pages/05_Contagem_Estoque.py"),
+        ("✂️ Fracionar",     "pages/05_Fracionar.py"),
+        ("🖼️ Fotos",         "pages/07_upload_fotos.py"),
+    ]
+    for i, (label, path) in enumerate(pages):
+        with nav_cols[i]:
+            st.page_link(path, label=label)
+
+# ──────────────────────────────────────────────
+#  HEADER
+# ──────────────────────────────────────────────
+hoje = date.today()
+st.markdown(f"""
+<div class="page-header">
+    <div>
+        <h1>✂️ Fracionar produto</h1>
+        <div class="sub">Divide o galão grande em garrafinhas menores</div>
+    </div>
+    <div class="header-badge">📅 {hoje.strftime('%d/%m/%Y')}</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────
+#  PASSO 1 — escolhe o produto a fracionar
+# ──────────────────────────────────────────────
+st.markdown('<div class="sec-titulo">📦 Passo 1 — Qual produto você vai fracionar?</div>', unsafe_allow_html=True)
+st.caption("Escolha o galão grande (de 20 L, 5 L etc.) que você quer dividir em pedaços menores.")
+
+# Filtra produtos com unidade L ou nome sugerindo granel
+def _e_granel(row) -> bool:
+    un = str(row.get(c_unid or "", "") or "").strip().lower()
+    nm = str(row.get(c_nome or "", "") or "").strip().lower()
+    ativo = str(row.get(c_ativo or "", "sim") or "sim").strip().lower()
+    if ativo not in ("sim","s","1","yes","ativo","true",""): return False
+    return un in ("l","litro","litros") or any(x in nm for x in ["20 l","5 l","granel","20l","5l","litro"])
+
+df_granel = df_prod[df_prod.apply(_e_granel, axis=1)].copy()
+
 if df_granel.empty:
-    st.warning("Nenhum produto granel (L) encontrado. Cadastre um SKU de matéria-prima em litros.")
+    st.warning("Nenhum produto granel (em litros) encontrado. Verifique se os produtos têm unidade 'L' ou nome contendo '20 L'.")
     st.stop()
 
-# formatador
-def _fmt_prod(r):
-    nm = str(r.get(COLP["nome"], "(sem nome)"))
-    un = str(r.get(COLP["unidade"], "") or "").strip()
-    forn = str(r.get(COLP["forn"], "") or "").strip()
-    return f"{nm} [{un}]" + (f" — {forn}" if forn else "")
+def _label_granel(row) -> str:
+    nm = str(row.get(c_nome, "") or "").strip()
+    un = str(row.get(c_unid, "") or "").strip()
+    return f"{nm}  [{un}]"
 
-labels_granel = df_granel.apply(_fmt_prod, axis=1).tolist()
-idx = st.selectbox("Materia-prima (GRANEL em L)", options=range(len(df_granel)), format_func=lambda i: labels_granel[i])
-row_g = df_granel.iloc[idx].to_dict()
+opcoes_granel = df_granel.apply(_label_granel, axis=1).tolist()
+sel_idx = st.selectbox(
+    "Produto a fracionar",
+    options=range(len(df_granel)),
+    format_func=lambda i: opcoes_granel[i],
+    key="sel_granel"
+)
+row_g = df_granel.iloc[sel_idx].to_dict()
+pid_g    = str(row_g.get(c_id, "") or "")
+nome_g   = str(row_g.get(c_nome, "") or "")
+unid_g   = str(row_g.get(c_unid, "") or "").strip()
+custo_g  = _to_f(row_g.get(c_custo, 0))   # custo por litro
+foto_g   = str(row_g.get(c_foto, "") or "").strip()
+saldo_g  = _saldo(df_mov, pid_g, nome_g)
 
-prod_id_g   = row_g.get(COLP["id"], "")
-nome_g      = str(row_g.get(COLP["nome"], ""))
-unid_g      = str(row_g.get(COLP["unidade"], "") or "")
-saldo_l     = _stock_balance(prod_id_g, nome_g)  # em litros
+# Card do produto selecionado
+img_tag = f'<img src="{foto_g}" alt="foto">' if foto_g.startswith("http") else '<div class="prod-card-ph">🧴</div>'
+cor_est = "kpi-ok" if saldo_g >= 2 else ("kpi-warn" if saldo_g > 0 else "kpi-err")
+st.markdown(f"""
+<div class="prod-card">
+    {img_tag}
+    <div>
+        <div class="prod-card-nome">{nome_g}</div>
+        <div class="prod-card-sub">Unidade: {unid_g} &nbsp;·&nbsp; Custo atual: {_fmt_brl(custo_g)}/{unid_g}</div>
+        <div class="prod-card-estq {cor_est}">📦 Estoque disponível: {saldo_g:.1f} {unid_g}</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-c1, c2, c3 = st.columns([1,1,1])
-with c1: st.metric("Estoque atual do GRANEL (L)", f"{saldo_l}")
-with c2: data_op = st.date_input("Data da operação", value=date.today())
-with c3: gerar_compras = st.checkbox("Gerar 'Compras internas' p/ fracionados (ajusta CustoAtual)", value=True)
+if saldo_g <= 0:
+    st.markdown('<div class="aviso-erro">⚠️ Estoque zerado! Registre uma entrada antes de fracionar.</div>', unsafe_allow_html=True)
+    st.stop()
 
-st.caption("Dica: se não quiser afetar CustoAtual dos fracionados, desmarque a opção de 'Compras internas' e deixe só os MovimentosEstoque.")
 
-st.markdown("### Saídas (fracionados)")
-# linhas dinâmicas
-if "_frac_rows" not in st.session_state:
-    st.session_state["_frac_rows"] = [
-        {"label":"SKU 1L", "sku": "", "vol_l": "1", "qtd": "", "embalagem": ""},   # custo adicional da embalagem
-        {"label":"SKU 500 ml", "sku": "", "vol_l": "0,5", "qtd": "", "embalagem": ""},
-    ]
+# ──────────────────────────────────────────────
+#  PASSO 2 — escolhe o produto fracionado
+# ──────────────────────────────────────────────
+st.markdown('<div class="sec-titulo">🧴 Passo 2 — Qual garrafinha vai sair?</div>', unsafe_allow_html=True)
+st.caption("Escolha o produto menor que vai ser produzido (ex: Maridão 2L).")
 
-# catálogo para saída (todos exceto o granel selecionado)
-df_out_options = df_prod.copy()
-df_out_options = df_out_options[df_out_options[COLP["id"]] != prod_id_g]
+# Filtra os que NÃO são granel (unidade un, ml, etc.)
+ids_granel = set(df_granel[c_id].astype(str).tolist()) if c_id else set()
 
-def _fmt_out(r):
-    nm = str(r.get(COLP["nome"], "(sem nome)"))
-    un = str(r.get(COLP["unidade"], "") or "").strip()
-    return f"{nm} [{un}]"
+def _e_fracionado(row) -> bool:
+    ativo = str(row.get(c_ativo or "", "sim") or "sim").strip().lower()
+    if ativo not in ("sim","s","1","yes","ativo","true",""): return False
+    rid = str(row.get(c_id, "") or "")
+    un  = str(row.get(c_unid, "") or "").strip().lower()
+    return rid not in ids_granel and un not in ("l","litro","litros")
 
-labels_out = df_out_options.apply(_fmt_out, axis=1).tolist()
+df_frac = df_prod[df_prod.apply(_e_fracionado, axis=1)].copy()
 
-# editor simples de linhas
-rows = st.session_state["_frac_rows"]
-for i, row in enumerate(rows):
-    st.write(f"**Linha {i+1} — {row['label']}**")
-    c1, c2, c3, c4 = st.columns([2,1,1,1])
-    with c1:
-        idx_out = st.selectbox("SKU de saída", options=["(selecione)"] + labels_out, key=f"sku_{i}")
-        row["sku"] = idx_out
-    with c2:
-        row["vol_l"] = st.text_input("Volume por unidade (L)", value=row["vol_l"], key=f"vol_{i}")
-    with c3:
-        row["qtd"] = st.text_input("Quantidade a produzir", value=row["qtd"], key=f"qtd_{i}")
-    with c4:
-        row["embalagem"] = st.text_input("Custo embalagem por un. (R$)", value=row["embalagem"], key=f"emb_{i}")
-    st.divider()
+def _label_frac(row) -> str:
+    nm = str(row.get(c_nome, "") or "").strip()
+    un = str(row.get(c_unid, "") or "").strip()
+    return f"{nm}  [{un}]"
 
-colb1, colb2, colb3 = st.columns([1,1,2])
-with colb1:
-    if st.button("➕ Adicionar linha"):
-        rows.append({"label":f"SKU extra {len(rows)+1}", "sku":"", "vol_l":"", "qtd":"", "embalagem":""})
-with colb2:
-    if st.button("🗑️ Limpar linhas"):
-        st.session_state["_frac_rows"] = []
-        st.rerun()
+opcoes_frac = df_frac.apply(_label_frac, axis=1).tolist()
 
-# =============================================================================
-# Simulação
-# =============================================================================
-def _find_row_by_label(label):
-    if label == "(selecione)": return None
-    if label not in labels_out: return None
-    pos = labels_out.index(label)
-    return df_out_options.iloc[pos].to_dict()
+frac_sel = st.selectbox(
+    "Produto fracionado que vai ser produzido",
+    options=["(selecione)"] + opcoes_frac,
+    key="sel_frac"
+)
 
-def _calc_litros_usados(rows):
-    total = 0.0
-    for r in rows:
-        if not r.get("sku") or r["sku"]=="(selecione)": 
-            continue
-        vol = _to_float(r.get("vol_l", ""))
-        qtd = _to_float(r.get("qtd", ""))
-        if vol not in ("", None) and qtd not in ("", None):
-            total += float(vol) * float(qtd)
-    return round(total, 3)
+if frac_sel == "(selecione)":
+    st.info("👆 Selecione o produto fracionado para continuar.")
+    st.stop()
 
-litros_usados = _calc_litros_usados(rows)
-st.metric("Litros que serão usados", f"{litros_usados}")
+pos_frac = opcoes_frac.index(frac_sel)
+row_f    = df_frac.iloc[pos_frac].to_dict()
+pid_f    = str(row_f.get(c_id, "") or "")
+nome_f   = str(row_f.get(c_nome, "") or "")
+unid_f   = str(row_f.get(c_unid, "") or "").strip()
+foto_f   = str(row_f.get(c_foto, "") or "").strip()
+preco_f  = _to_f(row_f.get(c_preco, 0))
 
-if litros_usados > saldo_l:
-    st.error("Litros usados excedem o estoque atual do granel.")
-elif litros_usados == 0:
-    st.info("Preencha volume e quantidade das saídas para simular.")
 
-# =============================================================================
-# Confirmar
-# =============================================================================
-batch_id = "FRAC-" + datetime.now().strftime("%Y%m%d%H%M%S")
+# ──────────────────────────────────────────────
+#  PASSO 3 — quantas unidades e volume por unidade
+# ──────────────────────────────────────────────
+st.markdown('<div class="sec-titulo">🔢 Passo 3 — Quantidade e volume</div>', unsafe_allow_html=True)
+st.caption("Informe quantas garrafinhas vão ser produzidas e quantos litros cada uma leva.")
 
-def _append_mov_saida_granel(ws_mov, data_str, qtd_l):
-    _rewrite_append(ws_mov, {
-        "Data": data_str,
-        "IDProduto": prod_id_g,
-        "Produto": nome_g,
-        "Tipo": "ajuste-",
-        "Qtd": str(qtd_l).replace(".", ","),
-        "Obs": f"{batch_id} — saída para fracionamento"
-    })
+col1, col2, col3 = st.columns([1, 1, 1])
 
-def _append_mov_entrada_saida(ws_mov, data_str, prod_dict, qtd_un):
-    _rewrite_append(ws_mov, {
-        "Data": data_str,
-        "IDProduto": prod_dict.get(COLP["id"], ""),
-        "Produto": prod_dict.get(COLP["nome"], ""),
-        "Tipo": "ajuste+",
-        "Qtd": str(int(qtd_un)) if float(qtd_un).is_integer() else str(qtd_un).replace(".", ","),
-        "Obs": f"{batch_id} — entrada de fracionado"
-    })
-
-def _upsert_compra_interna(ws_cmp, data_str, prod_dict, qtd_un, custo_unit, obs_extra=""):
-    refid = _make_refid_compra(
-        data_str,
-        prod_dict.get(COLP["nome"], ""),
-        "Produção interna",
-        str(int(qtd_un)) if float(qtd_un).is_integer() else str(qtd_un).replace(".", ","),
-        f"{float(custo_unit):.2f}".replace(".", ","),
+with col1:
+    qtd_prod = st.number_input(
+        "Quantas garrafinhas vão sair?",
+        min_value=1, max_value=9999, value=10, step=1,
+        key="qtd_prod",
+        help="Ex: 10 garrafinhas de 2L"
     )
-    if _seen_refid_in_session(refid):
-        return False, refid
-    if _compra_exists(ws_cmp, refid):
-        return False, refid
 
-    total = round(float(qtd_un) * float(custo_unit), 2)
-    _rewrite_append(ws_cmp, {
-        "Data": data_str,
-        "Produto": prod_dict.get(COLP["nome"], ""),
-        "Unidade": prod_dict.get(COLP["unidade"], "") or "un",
-        "Fornecedor": "Produção interna",
-        "Qtd": str(int(qtd_un)) if float(qtd_un).is_integer() else str(qtd_un).replace(".", ","),
-        "Custo Unitário": f"{float(custo_unit):.2f}".replace(".", ","),
-        "Total": f"{total:.2f}".replace(".", ","),
-        "IDProduto": prod_dict.get(COLP["id"], ""),
-        "Obs": (obs_extra or "").strip(),
-        "RefID": refid
-    })
-    return True, refid
+with col2:
+    vol_unit = st.number_input(
+        f"Quantos litros por garrafinha?",
+        min_value=0.1, max_value=100.0, value=2.0, step=0.5,
+        format="%.1f",
+        key="vol_unit",
+        help="Ex: 2.0 para uma garrafa de 2 litros"
+    )
 
-st.markdown("### Confirmar operação")
-ok_btn = st.button("✅ Gerar fracionamento agora")
+with col3:
+    data_op = st.date_input(
+        "Data da operação",
+        value=date.today(),
+        key="data_op"
+    )
 
-if ok_btn:
-    data_str = data_op.strftime("%d/%m/%Y")
+litros_usados = round(float(qtd_prod) * float(vol_unit), 3)
 
-    if litros_usados <= 0:
-        st.error("Preencha pelo menos uma linha válida (SKU, volume e quantidade)."); st.stop()
-    if litros_usados > saldo_l:
-        st.error("Litros usados excedem o estoque atual do granel."); st.stop()
 
-    # prepara planilhas
-    ws_mov = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
-    ws_cmp = _ensure_ws("Compras", COMPRAS_HEADERS)
+# ──────────────────────────────────────────────
+#  RESUMO VISUAL — antes de confirmar
+# ──────────────────────────────────────────────
+st.markdown('<div class="sec-titulo">📋 Resumo da operação</div>', unsafe_allow_html=True)
 
-    # 1) saída do granel
-    _append_mov_saida_granel(ws_mov, data_str, litros_usados)
+litros_restantes = round(saldo_g - litros_usados, 3)
+custo_unit_f     = round(custo_g * float(vol_unit), 4)  # custo de cada fracionado
 
-    # 2) entradas dos fracionados (+ compras internas opcionais)
-    criados = []
-    for r in rows:
-        if not r.get("sku") or r["sku"] == "(selecione)": 
-            continue
-        vol = _to_float(r.get("vol_l", ""))
-        qtd = _to_float(r.get("qtd", ""))
-        emb = _to_float(r.get("embalagem", "")) or 0.0
-        if vol in ("", None) or qtd in ("", None) or qtd == 0:
-            continue
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.markdown(f"""
+    <div class="kpi-mini">
+        <div class="label">Litros disponíveis</div>
+        <div class="valor">{saldo_g:.1f} L</div>
+        <div class="sub">{nome_g}</div>
+    </div>""", unsafe_allow_html=True)
 
-        prod_out = _find_row_by_label(r["sku"])
-        if not prod_out:
-            continue
+with k2:
+    cor = "kpi-err" if litros_usados > saldo_g else "kpi-warn"
+    st.markdown(f"""
+    <div class="kpi-mini">
+        <div class="label">Litros que serão usados</div>
+        <div class="valor {cor}">{litros_usados:.1f} L</div>
+        <div class="sub">{qtd_prod} × {vol_unit:.1f} L</div>
+    </div>""", unsafe_allow_html=True)
 
-        # custo do fracionado = (custo por litro do GRANEL) * vol + embalagem
-        # custo por litro: usamos CustoAtual do granel (se existir), senão 0
-        custo_granel = _to_float(row_g.get(COLP["custo"], "")) or 0.0
-        custo_unit_out = round(custo_granel * float(vol) + float(emb), 4)
+with k3:
+    cor3 = "kpi-ok" if litros_restantes >= 0 else "kpi-err"
+    st.markdown(f"""
+    <div class="kpi-mini">
+        <div class="label">Vai sobrar</div>
+        <div class="valor {cor3}">{litros_restantes:.1f} L</div>
+        <div class="sub">no galão</div>
+    </div>""", unsafe_allow_html=True)
 
-        # entrada no MOV
-        _append_mov_entrada_saida(ws_mov, data_str, prod_out, qtd)
+st.markdown("<br>", unsafe_allow_html=True)
 
-        # compra interna (opcional)
-        if gerar_compras:
-            ok, rid = _upsert_compra_interna(
-                ws_cmp, data_str, prod_out, qtd, custo_unit_out,
-                obs_extra=f"{batch_id} — produção interna (vol={vol}L; emb={emb})"
-            )
-            # ok=False significa duplicado (já existia), mas o MOV já entrou; tudo certo
-        criados.append({
-            "Produto": prod_out.get(COLP["nome"], ""),
-            "Qtd": qtd,
-            "CustoUnit(calc)": custo_unit_out
+# Card de preview do fracionado
+img_f = f'<img src="{foto_f}" alt="foto">' if foto_f.startswith("http") else '<div class="frac-card-ph">🧴</div>'
+st.markdown(f"""
+<div class="frac-card">
+    {img_f}
+    <div>
+        <div class="frac-nome">{nome_f} [{unid_f}]</div>
+        <div class="frac-qtd">{qtd_prod} unidades</div>
+        <div class="frac-litros">Cada uma usa {vol_unit:.1f} L — custo estimado: {_fmt_brl(custo_unit_f)} / un.</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────
+#  ERRO: litros insuficientes
+# ──────────────────────────────────────────────
+if litros_usados > saldo_g:
+    st.markdown(f"""
+    <div class="aviso-erro">
+        ❌ Você quer usar <strong>{litros_usados:.1f} L</strong> mas só tem <strong>{saldo_g:.1f} L</strong> no galão.
+        Reduza a quantidade de garrafinhas ou o volume por unidade.
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+
+# ──────────────────────────────────────────────
+#  PASSO 4 — Confirmar
+# ──────────────────────────────────────────────
+st.markdown('<div class="sec-titulo">✅ Passo 4 — Confirmar e lançar</div>', unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="confirm-box">
+    <div class="confirm-titulo">✅ Tudo certo! Confira antes de confirmar:</div>
+    <div class="confirm-linha">📤 <span class="confirm-destaque">Saída:</span> {litros_usados:.1f} L de <em>{nome_g}</em></div>
+    <div class="confirm-linha">📥 <span class="confirm-destaque">Entrada:</span> {qtd_prod} unidades de <em>{nome_f}</em></div>
+    <div class="confirm-linha">📅 <span class="confirm-destaque">Data:</span> {data_op.strftime('%d/%m/%Y')}</div>
+    <div class="confirm-linha">💰 <span class="confirm-destaque">Custo por unidade:</span> {_fmt_brl(custo_unit_f)}</div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+btn_confirmar = st.button("✂️ Confirmar fracionamento", type="primary", use_container_width=True)
+
+if btn_confirmar:
+    data_str  = data_op.strftime("%d/%m/%Y")
+    batch_id  = "FRAC-" + datetime.now().strftime("%Y%m%d%H%M%S")
+    refid     = _refid(data_str, nome_f, qtd_prod, custo_unit_f)
+
+    with st.spinner("Registrando... aguarde ⏳"):
+        ws_mov  = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
+        ws_comp = _ensure_ws("Compras", COMP_HEADERS)
+
+        # 1) Saída do galão (granel)
+        _append_row(ws_mov, {
+            "Data":      data_str,
+            "IDProduto": pid_g,
+            "Produto":   nome_g,
+            "Tipo":      "ajuste-",
+            "Qtd":       str(litros_usados).replace(".", ","),
+            "Obs":       f"{batch_id} — saída p/ fracionamento",
         })
 
-    st.success("Fracionamento lançado com sucesso! ✅")
-    if criados:
-        st.write("**Entradas geradas (fracionados):**")
-        st.dataframe(pd.DataFrame(criados))
-    st.info(f"Batch: {batch_id} • Saída do granel: {litros_usados} L • Data: {data_str}")
+        # 2) Entrada do fracionado
+        _append_row(ws_mov, {
+            "Data":      data_str,
+            "IDProduto": pid_f,
+            "Produto":   nome_f,
+            "Tipo":      "ajuste+",
+            "Qtd":       str(int(qtd_prod)),
+            "Obs":       f"{batch_id} — entrada de fracionado",
+        })
 
-st.divider()
-st.page_link("pages/01_produtos.py", label="📦 Ir para Catálogo de Produtos", icon="📦")
-st.page_link("pages/03_compras_entradas.py", label="🧾 Ir para Compras/Entradas", icon="🧾")
+        # 3) Compra interna (atualiza CustoAtual do fracionado)
+        if not _ja_existe(ws_comp, refid):
+            total = round(float(qtd_prod) * float(custo_unit_f), 2)
+            _append_row(ws_comp, {
+                "Data":           data_str,
+                "Produto":        nome_f,
+                "Unidade":        unid_f or "un",
+                "Fornecedor":     "Produção interna",
+                "Qtd":            str(int(qtd_prod)),
+                "Custo Unitário": f"{custo_unit_f:.2f}".replace(".", ","),
+                "Total":          f"{total:.2f}".replace(".", ","),
+                "IDProduto":      pid_f,
+                "Obs":            f"{batch_id} — frac {vol_unit:.1f}L/un",
+                "RefID":          refid,
+            })
+
+        # Limpa o cache pra dashboard atualizar
+        st.cache_data.clear()
+
+    st.balloons()
+    st.success(f"✅ Fracionamento registrado com sucesso! {qtd_prod} unidades de {nome_f} geradas.")
+
+    st.markdown(f"""
+    <div class="confirm-box" style="margin-top:16px;">
+        <div class="confirm-titulo">📋 Resumo do que foi feito</div>
+        <div class="confirm-linha">✅ Saída de <strong>{litros_usados:.1f} L</strong> do galão de <em>{nome_g}</em></div>
+        <div class="confirm-linha">✅ Entrada de <strong>{qtd_prod} un.</strong> de <em>{nome_f}</em> no estoque</div>
+        <div class="confirm-linha">✅ Custo atualizado para <strong>{_fmt_brl(custo_unit_f)}</strong> por unidade</div>
+        <div class="confirm-linha" style="margin-top:10px; color:rgba(255,255,255,0.4); font-size:0.78rem;">Código da operação: {batch_id}</div>
+    </div>
+    """, unsafe_allow_html=True)
