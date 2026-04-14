@@ -280,16 +280,32 @@ def _saldo(df_mov: pd.DataFrame, prod_id: str, nome: str) -> float:
         base = df_mov[df_mov[c_nm].astype(str).str.strip().str.lower() == nome.strip().lower()]
     else:
         return 0.0
-    entradas = ["entrada","ajuste+","entrada manual","compra","in"]
-    saidas   = ["saida","saída","venda","ajuste-","saída manual","out"]
-    ent_series = base[base[c_tipo].astype(str).str.lower().isin(entradas)][c_qtd].apply(_to_f)
-    sai_series = base[base[c_tipo].astype(str).str.lower().isin(saidas)][c_qtd].apply(_to_f)
-    ent = ent_series.sum(skipna=True) if not ent_series.empty else 0.0
-    sai = sai_series.sum(skipna=True) if not sai_series.empty else 0.0
-    # Guard against NaN/NA that can slip through when all values failed conversion
     import math
-    ent = 0.0 if (ent is None or (isinstance(ent, float) and math.isnan(ent))) else float(ent)
-    sai = 0.0 if (sai is None or (isinstance(sai, float) and math.isnan(sai))) else float(sai)
+
+    # Tipos exatos — inclui variantes prefixadas usadas pelo sistema (B entrada, B saída, etc.)
+    entradas_exatas = {"entrada", "ajuste+", "entrada manual", "compra", "in",
+                       "b entrada", "c fracionamento +"}
+    saidas_exatas   = {"saida", "saída", "venda", "ajuste-", "saída manual", "out",
+                       "b saída", "b saida", "c fracionamento -"}
+
+    tipos_lower = base[c_tipo].astype(str).str.strip().str.lower()
+
+    mask_ent    = tipos_lower.isin(entradas_exatas)
+    mask_sai    = tipos_lower.isin(saidas_exatas)
+
+    # "Ajuste" genérico sem sinal no nome: sinal vem do valor (+ = entrada, - = saída)
+    mask_ajuste = tipos_lower.str.startswith("ajuste") & ~mask_ent & ~mask_sai
+    ajuste_qtds = base[mask_ajuste][c_qtd].apply(_to_f)
+    ajuste_pos  = float(ajuste_qtds[ajuste_qtds >= 0].sum())
+    ajuste_neg  = float(ajuste_qtds[ajuste_qtds  < 0].abs().sum())
+
+    def _safe_sum(series):
+        if series.empty: return 0.0
+        v = series.sum(skipna=True)
+        return 0.0 if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
+
+    ent = _safe_sum(base[mask_ent][c_qtd].apply(_to_f)) + ajuste_pos
+    sai = _safe_sum(base[mask_sai][c_qtd].apply(_to_f)) + ajuste_neg
     return round(ent - sai, 3)
 
 # ──────────────────────────────────────────────
