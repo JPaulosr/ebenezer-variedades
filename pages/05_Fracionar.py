@@ -282,9 +282,15 @@ def _saldo(df_mov: pd.DataFrame, prod_id: str, nome: str) -> float:
         return 0.0
     entradas = ["entrada","ajuste+","entrada manual","compra","in"]
     saidas   = ["saida","saída","venda","ajuste-","saída manual","out"]
-    ent = base[base[c_tipo].astype(str).str.lower().isin(entradas)][c_qtd].apply(_to_f).sum()
-    sai = base[base[c_tipo].astype(str).str.lower().isin(saidas)][c_qtd].apply(_to_f).sum()
-    return round(float(ent) - float(sai), 3)
+    ent_series = base[base[c_tipo].astype(str).str.lower().isin(entradas)][c_qtd].apply(_to_f)
+    sai_series = base[base[c_tipo].astype(str).str.lower().isin(saidas)][c_qtd].apply(_to_f)
+    ent = ent_series.sum(skipna=True) if not ent_series.empty else 0.0
+    sai = sai_series.sum(skipna=True) if not sai_series.empty else 0.0
+    # Guard against NaN/NA that can slip through when all values failed conversion
+    import math
+    ent = 0.0 if (ent is None or (isinstance(ent, float) and math.isnan(ent))) else float(ent)
+    sai = 0.0 if (sai is None or (isinstance(sai, float) and math.isnan(sai))) else float(sai)
+    return round(ent - sai, 3)
 
 # ──────────────────────────────────────────────
 #  ANTI DUPLICIDADE
