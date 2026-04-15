@@ -593,7 +593,7 @@ preco_f  = _to_f(row_f.get(c_preco, 0))
 st.markdown('<div class="sec-titulo">🔢 Passo 3 — Quantidade e volume</div>', unsafe_allow_html=True)
 st.caption("Informe quantas garrafinhas vão ser produzidas e quantos litros cada uma leva.")
 
-col1, col2, col3 = st.columns([1, 1, 1])
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 
 with col1:
     qtd_prod = st.number_input(
@@ -605,7 +605,7 @@ with col1:
 
 with col2:
     vol_unit = st.number_input(
-        f"Quantos litros por garrafinha?",
+        "Litros por garrafinha?",
         min_value=0.1, max_value=100.0, value=2.0, step=0.5,
         format="%.1f",
         key="vol_unit",
@@ -613,6 +613,15 @@ with col2:
     )
 
 with col3:
+    vol_galao = st.number_input(
+        "Litros totais do galão?",
+        min_value=0.1, max_value=1000.0, value=20.0, step=1.0,
+        format="%.1f",
+        key="vol_galao",
+        help="Ex: 20.0 para um galão de 20 litros"
+    )
+
+with col4:
     data_op = st.date_input(
         "Data da operação",
         value=date.today(),
@@ -628,7 +637,12 @@ litros_usados = round(float(qtd_prod) * float(vol_unit), 3)
 st.markdown('<div class="sec-titulo">📋 Resumo da operação</div>', unsafe_allow_html=True)
 
 litros_restantes = round(saldo_g - litros_usados, 3)
-custo_unit_f     = round(custo_g * float(vol_unit), 4)  # custo de cada fracionado
+# custo_g = custo total do galão (ex: R$12 para galão de 20L)
+# custo por litro = custo_g / vol_galao
+# custo por garrafa = custo_por_litro * vol_unit
+_vol_galao_safe = float(vol_galao) if float(vol_galao) > 0 else 1.0
+_custo_por_litro = custo_g / _vol_galao_safe
+custo_unit_f = round(_custo_por_litro * float(vol_unit), 4)  # custo de cada fracionado
 
 k1, k2, k3 = st.columns(3)
 with k1:
@@ -714,22 +728,22 @@ if btn_confirmar:
         ws_mov  = _ensure_ws("MovimentosEstoque", MOV_HEADERS)
         ws_comp = _ensure_ws("Compras", COMP_HEADERS)
 
-        # 1) Saída do galão (granel)
+        # 1) Saída do galão (granel) — subtrai do estoque
         _append_row(ws_mov, {
             "Data":      data_str,
             "IDProduto": pid_g,
             "Produto":   nome_g,
-            "Tipo":      "ajuste-",
+            "Tipo":      "saida",
             "Qtd":       str(litros_usados).replace(".", ","),
             "Obs":       f"{batch_id} — saída p/ fracionamento",
         })
 
-        # 2) Entrada do fracionado
+        # 2) Entrada do fracionado — adiciona ao estoque
         _append_row(ws_mov, {
             "Data":      data_str,
             "IDProduto": pid_f,
             "Produto":   nome_f,
-            "Tipo":      "ajuste+",
+            "Tipo":      "entrada",
             "Qtd":       str(int(qtd_prod)),
             "Obs":       f"{batch_id} — entrada de fracionado",
         })
