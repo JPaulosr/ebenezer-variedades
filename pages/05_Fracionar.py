@@ -593,7 +593,7 @@ preco_f  = _to_f(row_f.get(c_preco, 0))
 st.markdown('<div class="sec-titulo">🔢 Passo 3 — Quantidade e volume</div>', unsafe_allow_html=True)
 st.caption("Informe quantas garrafinhas vão ser produzidas e quantos litros cada uma leva.")
 
-col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+col1, col2, col3 = st.columns([1, 1, 1])
 
 with col1:
     qtd_prod = st.number_input(
@@ -613,15 +613,6 @@ with col2:
     )
 
 with col3:
-    vol_galao = st.number_input(
-        "Litros totais do galão?",
-        min_value=0.1, max_value=1000.0, value=20.0, step=1.0,
-        format="%.1f",
-        key="vol_galao",
-        help="Ex: 20.0 para um galão de 20 litros"
-    )
-
-with col4:
     data_op = st.date_input(
         "Data da operação",
         value=date.today(),
@@ -637,12 +628,10 @@ litros_usados = round(float(qtd_prod) * float(vol_unit), 3)
 st.markdown('<div class="sec-titulo">📋 Resumo da operação</div>', unsafe_allow_html=True)
 
 litros_restantes = round(saldo_g - litros_usados, 3)
-# custo_g = custo total do galão (ex: R$12 para galão de 20L)
-# custo por litro = custo_g / vol_galao
+# custo_g = custo por litro do granel (ex: R$1,20/L)
 # custo por garrafa = custo_por_litro * vol_unit
-_vol_galao_safe = float(vol_galao) if float(vol_galao) > 0 else 1.0
-_custo_por_litro = custo_g / _vol_galao_safe
-custo_unit_f = round(_custo_por_litro * float(vol_unit), 4)  # custo de cada fracionado
+# Ex: R$1,20/L × 2L = R$2,40 por garrafa
+custo_unit_f = round(custo_g * float(vol_unit), 4)  # custo de cada fracionado
 
 k1, k2, k3 = st.columns(3)
 with k1:
