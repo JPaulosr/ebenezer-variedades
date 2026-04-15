@@ -660,6 +660,10 @@ calc = pd.DataFrame({
 }).fillna(0.0)
 calc["SaldoInicial"] = 0.0
 calc["EstoqueCalc"]  = calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
+calc = calc.reset_index().rename(columns={"index": "KeyID", "_key": "KeyID"})
+if "KeyID" not in calc.columns and calc.index.name:
+    calc.index.name = "KeyID"
+    calc = calc.reset_index()
 
 def _last_cost_per_product(comp_df):
     if comp_df.empty: return pd.Series(dtype=float)
