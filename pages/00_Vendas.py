@@ -302,43 +302,40 @@ def _build_catalogo():
         if col_foto:  id_img[pid]   = str(r.get(col_foto,"") or "").strip()
         if col_emin:  id_emin[pid]  = _to_num(r.get(col_emin))
 
-    # ── Estoque ──
-    entradas: Dict[str,float] = {}
-    try:
-        dcc = carregar_aba(ABA_COMPRAS)
-        c_pid = _first_col(dcc,["IDProduto","ProdutoID","ID"])
-        c_qtd = _first_col(dcc,["Qtd","Quantidade"])
-        if c_pid and c_qtd:
-            for _, r in dcc.iterrows():
-                pid = str(r.get(c_pid,"")).strip()
-                entradas[pid] = entradas.get(pid,0.0) + _to_num(r.get(c_qtd))
-    except: pass
-
-    saidas: Dict[str,float] = {}
-    try:
-        dv = carregar_aba(ABA_VEND)
-        c_pid = _first_col(dv,["IDProduto","ProdutoID","ID"])
-        c_qtd = _first_col(dv,["Qtd","Quantidade"])
-        if c_pid and c_qtd:
-            for _, r in dv.iterrows():
-                pid = str(r.get(c_pid,"")).strip()
-                saidas[pid] = saidas.get(pid,0.0) + _to_num(r.get(c_qtd))
-    except: pass
-
-    ajustes: Dict[str,float] = {}
-    try:
-        daj = carregar_aba(ABA_AJUSTES)
-        c_pid = _first_col(daj,["ID","IDProduto","ProdutoID"])
-        c_qtd = _first_col(daj,["Qtd","Quantidade","Qtde"])
-        if c_pid and c_qtd:
-            for _, r in daj.iterrows():
-                pid = str(r.get(c_pid,"")).strip()
-                ajustes[pid] = ajustes.get(pid,0.0) + _to_num(r.get(c_qtd))
-    except: pass
+    # ── Estoque — lê MovimentosEstoque (mesma fonte que Contagem de Estoque) ──
+    def _norm_tipo_mov(t: str) -> str:
+        """Classifica o tipo de movimento igual ao 05_Contagem_Estoque."""
+        import re as _re
+        raw = str(t or ""); low = "".join(ch for ch in unicodedata.normalize("NFKD", raw.lower()) if unicodedata.category(ch) != "Mn")
+        if "fracion" in low:
+            return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
+        lowc = _re.sub(r"[^a-z]","",low)
+        if "contagem" in lowc or "inventario" in lowc: return "ajuste"
+        if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
+        if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
+        if "ajuste"  in lowc: return "ajuste"
+        return "outro"
 
     id_stock: Dict[str,float] = {}
-    for pid in set(list(entradas)+list(saidas)+list(ajustes)+list(id_nome)):
-        id_stock[pid] = entradas.get(pid,0.0) - saidas.get(pid,0.0) + ajustes.get(pid,0.0)
+    try:
+        dmov = carregar_aba(ABA_MOVS)
+        c_pid  = _first_col(dmov, ["IDProduto","ProdutoID","ID"])
+        c_qtd  = _first_col(dmov, ["Qtd","Quantidade"])
+        c_tipo = _first_col(dmov, ["Tipo","tipo"])
+        if c_pid and c_qtd and c_tipo:
+            for _, r in dmov.iterrows():
+                pid   = str(r.get(c_pid,"")).strip()
+                if not pid: continue
+                tipo  = _norm_tipo_mov(r.get(c_tipo,""))
+                qtd   = _to_num(r.get(c_qtd))
+                cur   = id_stock.get(pid, 0.0)
+                if tipo == "entrada":
+                    id_stock[pid] = cur + qtd
+                elif tipo == "saida":
+                    id_stock[pid] = cur - qtd
+                elif tipo == "ajuste":
+                    id_stock[pid] = cur + qtd
+    except: pass
 
     return dfp, cat_map, labels, id_nome, id_custo, id_stock, col_id, col_nome, col_preco, col_unid, id_img, id_emin
 
