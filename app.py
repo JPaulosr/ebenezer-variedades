@@ -684,11 +684,23 @@ prod_calc["FatorCusto"] = prod_calc["FatorCusto"].fillna(1.0)
 fator_map = (prod_calc.set_index("KeyID")["FatorCusto"].fillna(1.0) if "FatorCusto" in prod_calc.columns else pd.Series(dtype=float))
 
 def _choose_cost_final(keyid):
+    # Usa CustoAtual da aba Produtos (coluna já carregada em prod_calc)
+    # Fallback para último custo de compra se não tiver
+    custo_prod = float(prod_calc.loc[prod_calc["KeyID"] == str(keyid), "CustoAtual"].values[0]
+                       if str(keyid) in prod_calc["KeyID"].values else 0.0) if not prod_calc.empty else 0.0
+    if custo_prod > 0:
+        return custo_prod
     base  = float(last_cost.get(str(keyid), 0.0) or 0.0)
     fator = float(fator_map.get(str(keyid), 1.0) or 1.0)
     return base * fator
 
-prod_calc["CustoAtual"] = prod_calc["KeyID"].astype(str).map(_choose_cost_final).astype(float)
+# Usa CustoAtual já presente em prod_calc (vem da aba Produtos)
+prod_calc["CustoAtual"] = pd.to_numeric(prod_calc["CustoAtual"], errors="coerce").fillna(0.0)
+# Fallback: preenche zeros com último custo de compra
+mask_zero = prod_calc["CustoAtual"] <= 0
+prod_calc.loc[mask_zero, "CustoAtual"] = prod_calc.loc[mask_zero, "KeyID"].map(
+    lambda k: float(last_cost.get(str(k), 0.0) or 0.0)
+)
 prod_calc["ValorEstoqueCalc"] = prod_calc["CustoAtual"].fillna(0) * prod_calc["EstoqueCalc"].fillna(0)
 
 # =========================
