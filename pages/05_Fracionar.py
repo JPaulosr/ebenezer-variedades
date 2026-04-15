@@ -360,6 +360,13 @@ c_preco = _pick(df_prod, "PreçoVenda","PrecoVenda","Preço","Preco","Valor")
 c_foto  = _pick(df_prod, "Foto","FotoURL","Imagem","Cloudinary")
 c_ativo = _pick(df_prod, "Ativo?","Ativo","Status")
 
+# ── Debug temporário ──
+with st.expander("🔍 Debug — colunas detectadas (remova depois)", expanded=True):
+    st.write("**Colunas na aba Produtos:**", list(df_prod.columns))
+    st.write(f"`ID={c_id}` | `Nome={c_nome}` | `Unidade={c_unid}` | `Ativo={c_ativo}`")
+    if c_unid:
+        st.write("**Valores únicos em Unidade:**", df_prod[c_unid].unique().tolist()[:20])
+
 
 # ──────────────────────────────────────────────
 #  BARRA DE NAVEGAÇÃO
@@ -453,8 +460,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if saldo_g <= 0:
-    st.markdown('<div class="aviso-erro">⚠️ Estoque zerado! Registre uma entrada antes de fracionar.</div>', unsafe_allow_html=True)
-    st.stop()
+    st.markdown('<div class="aviso-erro">⚠️ Atenção: estoque zerado ou negativo. Verifique se o produto está correto.</div>', unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────
