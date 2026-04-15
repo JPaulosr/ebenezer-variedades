@@ -282,8 +282,9 @@ header { visibility: visible !important; height: auto !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Refresh leve
-if st.session_state.pop("_force_refresh", False):
+# Refresh leve — evita loop de rerun
+if st.session_state.get("_force_refresh", False):
+    st.session_state["_force_refresh"] = False
     st.cache_data.clear()
     st.rerun()
 
@@ -319,7 +320,7 @@ def conectar_sheets():
         st.error("🛑 PLANILHA_URL não está no Secrets."); st.stop()
     return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def carregar_aba(nome: str) -> pd.DataFrame:
     ws = conectar_sheets().worksheet(nome)
     df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
@@ -595,19 +596,19 @@ def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
     col_fre = _pick("FreteRateado", "Frete Rateado", "Frete")
     def to_f(x): return _to_float(x, default=0.0)
     out = pd.DataFrame({
-        "KeyID":   d[col_idp].apply(_canon_id) if col_idp in d else "",
-        "QtdNum":  d[col_qtd].apply(to_f)      if col_qtd in d else 0.0,
-        "Data_d":  d[col_dat].apply(_parse_date_any) if col_dat in d else None,
+        "KeyID":   d[col_idp].apply(_canon_id) if col_idp and col_idp in d.columns else pd.Series("", index=d.index),
+        "QtdNum":  d[col_qtd].apply(to_f)      if col_qtd and col_qtd in d.columns else pd.Series(0.0, index=d.index),
+        "Data_d":  d[col_dat].apply(_parse_date_any) if col_dat and col_dat in d.columns else pd.Series(None, index=d.index),
     })
-    if col_cu in d:
+    if col_cu and col_cu in d.columns:
         out["CustoNum"] = d[col_cu].apply(to_f)
     else:
         out["CustoNum"] = 0.0
-    if col_tot in d:
+    if col_tot and col_tot in d.columns:
         total_num = d[col_tot].apply(to_f)
         mask_fb = (out["CustoNum"] <= 0) & (out["QtdNum"] > 0)
         out.loc[mask_fb, "CustoNum"] = (total_num[mask_fb] / out.loc[mask_fb, "QtdNum"]).astype(float)
-    if col_fre in d:
+    if col_fre and col_fre in d.columns:
         frete = d[col_fre].apply(to_f)
         out["CustoNum"] = (out["CustoNum"].fillna(0.0) + frete.fillna(0.0)).astype(float)
     out = out[(out["KeyID"] != "") & (out["QtdNum"] > 0)]
