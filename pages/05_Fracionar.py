@@ -482,11 +482,80 @@ def _label_frac(row) -> str:
 
 opcoes_frac = df_frac.apply(_label_frac, axis=1).tolist()
 
+NOVO_LABEL = "➕ Cadastrar novo produto fracionado..."
 frac_sel = st.selectbox(
     "Produto fracionado que vai ser produzido",
-    options=["(selecione)"] + opcoes_frac,
+    options=["(selecione)"] + opcoes_frac + [NOVO_LABEL],
     key="sel_frac"
 )
+
+# ── Cadastro inline de novo produto fracionado ──
+if frac_sel == NOVO_LABEL:
+    st.markdown("""
+    <div style="background:rgba(96,165,250,0.08);border:1.5px solid rgba(96,165,250,0.3);
+    border-radius:16px;padding:20px 24px;margin:12px 0;">
+    <div style="font-family:Nunito;font-weight:800;font-size:1rem;color:#60a5fa;margin-bottom:12px;">
+    ➕ Novo produto fracionado</div>
+    """, unsafe_allow_html=True)
+
+    cn1, cn2 = st.columns(2)
+    with cn1:
+        novo_nome  = st.text_input("Nome do produto *", placeholder="Ex: Maridão 2L", key="novo_frac_nome")
+        novo_unid  = st.text_input("Unidade *", value="un", placeholder="un / ml / g", key="novo_frac_unid")
+    with cn2:
+        novo_preco = st.number_input("Preço de venda (R$)", min_value=0.0, value=0.0, step=0.5, format="%.2f", key="novo_frac_preco")
+        novo_cat   = st.text_input("Categoria", placeholder="Ex: Higiene", key="novo_frac_cat")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    btn_cadastrar = st.button("💾 Cadastrar e usar este produto", type="primary", use_container_width=True, key="btn_cadastrar_frac")
+
+    if btn_cadastrar:
+        if not novo_nome.strip():
+            st.error("❌ Informe o nome do produto.")
+            st.stop()
+
+        try:
+            sh      = _conectar()
+            ws_prod = sh.worksheet("Produtos")
+            df_cur  = get_as_dataframe(ws_prod, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+            df_cur.columns = [c.strip() for c in df_cur.columns]
+
+            # Gera novo ID
+            col_id_ws = _pick(df_cur, "ID", "Id")
+            if col_id_ws:
+                ids_existentes = df_cur[col_id_ws].astype(str).str.strip().tolist()
+                nums = [int(re.sub(r"\D","",x)) for x in ids_existentes if re.sub(r"\D","",x).isdigit()]
+                novo_id = str(max(nums) + 1) if nums else "1"
+            else:
+                novo_id = str(len(df_cur) + 1)
+
+            nova_linha = {c: "" for c in df_cur.columns}
+            for col_cand, val in [
+                (["ID","Id"],                                   novo_id),
+                (["Nome","Produto","Descrição"],                 novo_nome.strip()),
+                (["Unidade","Unid"],                            novo_unid.strip() or "un"),
+                (["PreçoVenda","PrecoVenda","Preço","Preco"],   f"{novo_preco:.2f}".replace(".",",")),
+                (["Categoria","categoria"],                      novo_cat.strip()),
+                (["Ativo?","Ativo","Status"],                   "sim"),
+            ]:
+                for cand in col_cand:
+                    if cand in nova_linha:
+                        nova_linha[cand] = val; break
+
+            df_novo = pd.concat([df_cur, pd.DataFrame([nova_linha])], ignore_index=True)
+            ws_prod.clear()
+            set_with_dataframe(ws_prod, df_novo.fillna(""), include_index=False,
+                               include_column_header=True, resize=True)
+            st.cache_data.clear()
+            st.success(f"✅ Produto **{novo_nome.strip()}** cadastrado! Selecione-o na lista acima.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Erro ao cadastrar: {e}")
+        st.stop()
+
+    st.info("👆 Preencha os dados e clique em **Cadastrar** para continuar.")
+    st.stop()
 
 if frac_sel == "(selecione)":
     st.info("👆 Selecione o produto fracionado para continuar.")
