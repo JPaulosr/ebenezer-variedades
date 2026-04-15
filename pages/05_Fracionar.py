@@ -593,40 +593,52 @@ preco_f  = _to_f(row_f.get(c_preco, 0))
 st.markdown('<div class="sec-titulo">🔢 Passo 3 — Quantidade e volume</div>', unsafe_allow_html=True)
 st.caption("Informe quantas garrafinhas vão ser produzidas e quantos litros cada uma leva.")
 
-col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+# Detecta se o custo já está em R$/litro (unidade L) ou R$/galão (unidade un)
+_unid_g_lower = unid_g.strip().lower()
+_custo_ja_por_litro = _unid_g_lower in ("l", "litro", "litros")
 
-with col1:
-    qtd_prod = st.number_input(
-        "Quantas garrafinhas vão sair?",
-        min_value=1, max_value=9999, value=10, step=1,
-        key="qtd_prod",
-        help="Ex: 10 garrafinhas de 2L"
-    )
-
-with col2:
-    vol_unit = st.number_input(
-        "Litros por garrafinha?",
-        min_value=0.1, max_value=100.0, value=2.0, step=0.5,
-        format="%.1f",
-        key="vol_unit",
-        help="Ex: 2.0 para uma garrafa de 2 litros"
-    )
-
-with col3:
-    vol_galao = st.number_input(
-        "Litros totais do galão?",
-        min_value=0.1, max_value=1000.0, value=20.0, step=1.0,
-        format="%.1f",
-        key="vol_galao",
-        help="Ex: 20 para galão de 20L"
-    )
-
-with col4:
-    data_op = st.date_input(
-        "Data da operação",
-        value=date.today(),
-        key="data_op"
-    )
+if _custo_ja_por_litro:
+    # Unidade L: CustoAtual = R$/litro → apenas 3 campos
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        qtd_prod = st.number_input(
+            "Quantas garrafinhas vão sair?",
+            min_value=1, max_value=9999, value=10, step=1,
+            key="qtd_prod", help="Ex: 10 garrafinhas de 2L"
+        )
+    with col2:
+        vol_unit = st.number_input(
+            "Litros por garrafinha?",
+            min_value=0.1, max_value=100.0, value=2.0, step=0.5,
+            format="%.1f", key="vol_unit", help="Ex: 2.0 para uma garrafa de 2 litros"
+        )
+    with col3:
+        data_op = st.date_input("Data da operação", value=date.today(), key="data_op")
+    vol_galao = None
+else:
+    # Unidade un: CustoAtual = R$/galão inteiro → 4 campos
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        qtd_prod = st.number_input(
+            "Quantas garrafinhas vão sair?",
+            min_value=1, max_value=9999, value=10, step=1,
+            key="qtd_prod", help="Ex: 10 garrafinhas de 2L"
+        )
+    with col2:
+        vol_unit = st.number_input(
+            "Litros por garrafinha?",
+            min_value=0.1, max_value=100.0, value=2.0, step=0.5,
+            format="%.1f", key="vol_unit", help="Ex: 2.0 para uma garrafa de 2 litros"
+        )
+    with col3:
+        vol_galao = st.number_input(
+            "Litros totais do galão?",
+            min_value=0.1, max_value=1000.0, value=20.0, step=1.0,
+            format="%.1f", key="vol_galao",
+            help="Ex: 20 para galão de 20L (custo cadastrado é do galão inteiro)"
+        )
+    with col4:
+        data_op = st.date_input("Data da operação", value=date.today(), key="data_op")
 
 litros_usados = round(float(qtd_prod) * float(vol_unit), 3)
 
@@ -637,12 +649,17 @@ litros_usados = round(float(qtd_prod) * float(vol_unit), 3)
 st.markdown('<div class="sec-titulo">📋 Resumo da operação</div>', unsafe_allow_html=True)
 
 litros_restantes = round(saldo_g - litros_usados, 3)
-# custo_g = custo do galão inteiro (ex: R$12 para galão de 20L)
-# custo por litro = custo_g / vol_galao
-# custo por garrafa = custo_por_litro × vol_unit
-# Ex: R$12 ÷ 20L × 2L = R$2,40 por garrafa
-_vol_galao_safe = float(vol_galao) if float(vol_galao) > 0 else 1.0
-custo_unit_f = round((custo_g / _vol_galao_safe) * float(vol_unit), 4)
+
+# Cálculo do custo por unidade fracionada:
+# - Unidade=L: CustoAtual já é R$/litro → custo_unit = CustoAtual × vol_unit
+#   Ex: R$2,14/L × 2L = R$4,28 por garrafa
+# - Unidade=un: CustoAtual é R$/galão inteiro → custo_unit = CustoAtual / vol_galao × vol_unit
+#   Ex: R$24/galão ÷ 20L × 2L = R$2,40 por garrafa
+if _custo_ja_por_litro:
+    custo_unit_f = round(float(custo_g) * float(vol_unit), 4)
+else:
+    _vol_galao_safe = float(vol_galao) if vol_galao and float(vol_galao) > 0 else 1.0
+    custo_unit_f = round((float(custo_g) / _vol_galao_safe) * float(vol_unit), 4)
 
 k1, k2, k3 = st.columns(3)
 with k1:
