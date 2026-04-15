@@ -544,7 +544,11 @@ if st.session_state.get("mostrar_cadastro_frac"):
             set_with_dataframe(ws_prod, df_novo.fillna(""), include_index=False,
                                include_column_header=True, resize=True)
             st.cache_data.clear()
-            st.success(f"✅ Produto **{novo_nome.strip()}** cadastrado! Selecione-o na lista acima.")
+            _carregar.clear()
+            st.session_state["mostrar_cadastro_frac"] = False
+            st.session_state["prod_recém_cadastrado"] = novo_nome.strip()
+            st.success(f"✅ Produto **{novo_nome.strip()}** cadastrado!")
+            import time; time.sleep(1)
             st.rerun()
         except Exception as e:
             st.error(f"Erro ao cadastrar: {e}")
@@ -553,9 +557,20 @@ if st.session_state.get("mostrar_cadastro_frac"):
     st.info("👆 Preencha os dados e clique em **Cadastrar** para continuar.")
     st.stop()
 
+# Se acabou de cadastrar, pré-seleciona o novo produto
+_recem = st.session_state.get("prod_recém_cadastrado", "")
+_idx_default = 0
+if _recem:
+    for _i, _op in enumerate(opcoes_frac):
+        if _recem.lower() in _op.lower():
+            _idx_default = _i + 1  # +1 por causa do (selecione)
+            break
+    st.session_state.pop("prod_recém_cadastrado", None)
+
 frac_sel = st.selectbox(
     "Produto fracionado que vai ser produzido",
     options=["(selecione)"] + opcoes_frac,
+    index=_idx_default,
     key="sel_frac"
 )
 
