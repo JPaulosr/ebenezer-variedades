@@ -616,53 +616,50 @@ def _normalize_compras_all_with_date(c: pd.DataFrame) -> pd.DataFrame:
 
 c_all = _normalize_compras_all_with_date(comp_raw)
 
-# Ajustes
+# ── Estoque calculado via MovimentosEstoque (fonte única de verdade) ──
+def _norm_tipo_mov(t: str) -> str:
+    import unicodedata as _ud2, re as _re2
+    raw = str(t or "")
+    low = "".join(ch for ch in _ud2.normalize("NFKD", raw.lower()) if _ud2.category(ch) != "Mn")
+    if "fracion" in low:
+        return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
+    lowc = _re2.sub(r"[^a-z]","",low)
+    if "contagem" in lowc or "inventario" in lowc: return "ajuste"
+    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
+    if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
+    if "ajuste"  in lowc: return "ajuste"
+    return "outro"
+
 try:
-    ajustes_raw = carregar_aba("Ajustes")
+    mov_raw = carregar_aba("MovimentosEstoque")
 except:
-    ajustes_raw = pd.DataFrame()
+    mov_raw = pd.DataFrame()
 
-def _normalize_ajustes(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["KeyID","QtdNum"])
-    d = df.copy(); d.columns = [x.strip() for x in d.columns]
-    col_idp = _first_col(d, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(d, ["Qtd","Quantidade","Qtde","Qde","Ajuste","Delta"])
-    if not col_idp or not col_qtd: return pd.DataFrame(columns=["KeyID","QtdNum"])
-    out = pd.DataFrame({"KeyID": d[col_idp].apply(_canon_id), "QtdNum": d[col_qtd].apply(_to_float)})
-    return out[(out["KeyID"]!="") & (out["QtdNum"]!=0)]
+entradas_mov = pd.Series(dtype=float)
+saidas_mov   = pd.Series(dtype=float)
+ajustes_mov  = pd.Series(dtype=float)
 
-a_all = _normalize_ajustes(ajustes_raw)
+if not mov_raw.empty:
+    dm = mov_raw.copy(); dm.columns = [c.strip() for c in dm.columns]
+    col_mid  = _first_col(dm, ["IDProduto","ProdutoID","ID"])
+    col_mqtd = _first_col(dm, ["Qtd","Quantidade"])
+    col_mtip = _first_col(dm, ["Tipo","tipo"])
+    if col_mid and col_mqtd and col_mtip:
+        dm["_key"]  = dm[col_mid].apply(_canon_id)
+        dm["_qtd"]  = dm[col_mqtd].apply(_to_float)
+        dm["_tipo"] = dm[col_mtip].apply(_norm_tipo_mov)
+        dm = dm[dm["_key"] != ""]
+        entradas_mov = dm[dm["_tipo"]=="entrada"].groupby("_key")["_qtd"].sum()
+        saidas_mov   = dm[dm["_tipo"]=="saida"  ].groupby("_key")["_qtd"].sum()
+        ajustes_mov  = dm[dm["_tipo"]=="ajuste" ].groupby("_key")["_qtd"].sum()
 
-# Contagem inicial
-try:
-    cont_raw = carregar_aba("ContagemEstoque")
-except:
-    try: cont_raw = carregar_aba("EstoqueInicial")
-    except: cont_raw = pd.DataFrame()
-
-def _normalize_contagem_inicial(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["KeyID","SaldoInicial"])
-    d = df.copy(); d.columns = [x.strip() for x in d.columns]
-    col_idp = _first_col(d, ["IDProduto","ID do Produto","ProdutoID","Produto Id","SKU","COD","Código","Codigo","ID"])
-    col_qtd = _first_col(d, ["Qtd","Quantidade","Qtde","Qde","EstoqueInicial","SaldoInicial"])
-    if not col_idp or not col_qtd: return pd.DataFrame(columns=["KeyID","SaldoInicial"])
-    out = pd.DataFrame({"KeyID": d[col_idp].apply(_canon_id), "SaldoInicial": d[col_qtd].apply(_to_float)})
-    return out[out["KeyID"]!=""]
-
-cont = _normalize_contagem_inicial(cont_raw)
-saldo_inicial = cont.groupby("KeyID")["SaldoInicial"].sum() if not cont.empty else pd.Series(dtype=float)
-
-# Estoque calculado
-v_all = vendas.copy() if not vendas.empty else pd.DataFrame(columns=["KeyID","QtdNum"])
-entradas = c_all.groupby("KeyID")["QtdNum"].sum() if not c_all.empty else pd.Series(dtype=float)
-saidas   = v_all.groupby("KeyID")["QtdNum"].sum() if not v_all.empty else pd.Series(dtype=float)
-ajustes  = a_all.groupby("KeyID")["QtdNum"].sum() if not a_all.empty else pd.Series(dtype=float)
-
-calc = pd.DataFrame({"Entradas": entradas, "Saidas": saidas, "Ajustes": ajustes}).fillna(0.0)
-saldo_inicial_df = saldo_inicial.to_frame("SaldoInicial") if not saldo_inicial.empty else pd.DataFrame(columns=["SaldoInicial"])
-calc = calc.join(saldo_inicial_df, how="left")
-calc["SaldoInicial"] = calc["SaldoInicial"].fillna(0.0)
-calc["EstoqueCalc"]  = calc["SaldoInicial"] + calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
+calc = pd.DataFrame({
+    "Entradas": entradas_mov,
+    "Saidas":   saidas_mov,
+    "Ajustes":  ajustes_mov,
+}).fillna(0.0)
+calc["SaldoInicial"] = 0.0
+calc["EstoqueCalc"]  = calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
 
 def _last_cost_per_product(comp_df):
     if comp_df.empty: return pd.Series(dtype=float)
