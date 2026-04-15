@@ -764,8 +764,26 @@ if btn_confirmar:
                 "RefID":          refid,
             })
 
+        # 4) Atualiza CustoAtual na aba Produtos para o fracionado
+        try:
+            ws_prod  = _conectar().worksheet("Produtos")
+            df_prods = get_as_dataframe(ws_prod, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+            df_prods.columns = [c.strip() for c in df_prods.columns]
+            col_pid   = _pick(df_prods, "ID", "Id")
+            col_custo = _pick(df_prods, "CustoAtual", "Custo Atual", "CustoMedio", "Custo")
+            if col_pid and col_custo and pid_f:
+                mask = df_prods[col_pid].astype(str).str.strip() == str(pid_f).strip()
+                if mask.any():
+                    df_prods.loc[mask, col_custo] = f"{custo_unit_f:.2f}".replace(".", ",")
+                    ws_prod.clear()
+                    set_with_dataframe(ws_prod, df_prods.fillna(""), include_index=False,
+                                       include_column_header=True, resize=True)
+        except Exception as _e:
+            st.warning(f"⚠️ Estoque atualizado, mas não foi possível salvar o custo: {_e}")
+
         # Limpa o cache pra dashboard atualizar
         st.cache_data.clear()
+        _carregar.clear()
 
     st.balloons()
     st.success(f"✅ Fracionamento registrado com sucesso! {qtd_prod} unidades de {nome_f} geradas.")
