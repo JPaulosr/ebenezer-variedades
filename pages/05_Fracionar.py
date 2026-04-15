@@ -3,7 +3,7 @@
 # Visual idêntico ao Dashboard e Vendas (Ebenezér Variedades)
 from __future__ import annotations
 
-import hashlib, json, unicodedata
+import hashlib, json, re, unicodedata
 from datetime import date, datetime
 
 import gspread
@@ -221,16 +221,47 @@ def _pick(df: pd.DataFrame, *candidates) -> str | None:
         if c in df.columns: return c
     return None
 
+def _strip_txt(s: str) -> str:
+    """Remove acentos e normaliza pra lowercase."""
+    import unicodedata as _ud
+    s = _ud.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not _ud.combining(c))
+    return s.lower().strip()
+
 def _to_f(x) -> float:
+    """Converte string BR para float preservando sinal negativo — mesma lógica da Contagem."""
     if x is None: return 0.0
-    s = str(x).strip().replace("R$","").replace(" ","")
-    # formato BR: ponto como milhar, vírgula como decimal
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none"): return 0.0
+    neg = False
+    s = s.replace("−", "-").replace("\u2212", "-")
+    if s.startswith("(") and s.endswith(")"): s = s[1:-1]; neg = True
+    s = s.replace("R$", "").replace(" ", "")
+    if s.startswith("-"): neg = True; s = s[1:]
     if "," in s and "." in s:
-        s = s.replace(".","").replace(",",".")
-    else:
-        s = s.replace(",",".")
-    try: return float(s)
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.]", "", s)
+    if s.count(".") > 1:
+        p = s.split(".")
+        s = "".join(p[:-1]) + "." + p[-1]
+    try: v = float(s)
     except: return 0.0
+    return -v if neg else v
+
+def _norm_tipo(t: str) -> str:
+    """Classifica o tipo de movimento — mesma lógica da Contagem Estoque."""
+    raw = str(t or "")
+    low = _strip_txt(raw)
+    if "fracion" in low:
+        return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
+    lowc = re.sub(r"[^a-z]", "", low)
+    if "contagem" in lowc or "inventario" in lowc: return "ajuste"
+    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
+    if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
+    if "ajuste"  in lowc: return "ajuste"
+    return "outro"
 
 def _fmt_brl(v: float) -> str:
     return ("R$ " + f"{v:,.2f}").replace(",","X").replace(".",",").replace("X",".")
@@ -265,48 +296,33 @@ def _append_row(ws, row: dict):
 
 
 # ──────────────────────────────────────────────
-#  SALDO DE ESTOQUE (via MovimentosEstoque)
+#  SALDO DE ESTOQUE — mesma lógica da Contagem Estoque
 # ──────────────────────────────────────────────
 def _saldo(df_mov: pd.DataFrame, prod_id: str, nome: str) -> float:
+    """Calcula saldo exatamente como a página Contagem Estoque: entradas - saidas + ajustes."""
     if df_mov.empty: return 0.0
-    c_id   = _pick(df_mov, "IDProduto", "ID")
-    c_tipo = _pick(df_mov, "Tipo", "Movimento", "Mov")
-    c_qtd  = _pick(df_mov, "Qtd", "Quantidade", "Qtde")
-    if not c_tipo or not c_qtd: return 0.0
+    c_id  = _pick(df_mov, "IDProduto", "ID")
+    c_qtd = _pick(df_mov, "Qtd", "Quantidade", "Qtde")
+    c_tip = _pick(df_mov, "Tipo", "Movimento", "Mov")
+    if not c_qtd or not c_tip: return 0.0
+
+    # filtra pelo produto
     if c_id and prod_id:
         base = df_mov[df_mov[c_id].astype(str) == str(prod_id)]
-    elif _pick(df_mov, "Produto", "Nome"):
-        c_nm = _pick(df_mov, "Produto", "Nome")
-        base = df_mov[df_mov[c_nm].astype(str).str.strip().str.lower() == nome.strip().lower()]
     else:
-        return 0.0
-    import math
+        c_nm = _pick(df_mov, "Produto", "Nome")
+        if not c_nm: return 0.0
+        base = df_mov[df_mov[c_nm].astype(str).str.strip().str.lower() == nome.strip().lower()]
+    if base.empty: return 0.0
 
-    # Tipos exatos — inclui variantes prefixadas usadas pelo sistema (B entrada, B saída, etc.)
-    entradas_exatas = {"entrada", "ajuste+", "entrada manual", "compra", "in",
-                       "b entrada", "c fracionamento +"}
-    saidas_exatas   = {"saida", "saída", "venda", "ajuste-", "saída manual", "out",
-                       "b saída", "b saida", "c fracionamento -"}
+    tnorm = base[c_tip].apply(_norm_tipo)
+    qtds  = base[c_qtd].apply(_to_f)
 
-    tipos_lower = base[c_tipo].astype(str).str.strip().str.lower()
+    ent = qtds[tnorm == "entrada"].sum()
+    sai = qtds[tnorm == "saida"].sum()
+    adj = qtds[tnorm == "ajuste"].sum()   # ajustes negativos já vêm com sinal
 
-    mask_ent    = tipos_lower.isin(entradas_exatas)
-    mask_sai    = tipos_lower.isin(saidas_exatas)
-
-    # "Ajuste" genérico sem sinal no nome: sinal vem do valor (+ = entrada, - = saída)
-    mask_ajuste = tipos_lower.str.startswith("ajuste") & ~mask_ent & ~mask_sai
-    ajuste_qtds = base[mask_ajuste][c_qtd].apply(_to_f)
-    ajuste_pos  = float(ajuste_qtds[ajuste_qtds >= 0].sum())
-    ajuste_neg  = float(ajuste_qtds[ajuste_qtds  < 0].abs().sum())
-
-    def _safe_sum(series):
-        if series.empty: return 0.0
-        v = series.sum(skipna=True)
-        return 0.0 if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
-
-    ent = _safe_sum(base[mask_ent][c_qtd].apply(_to_f)) + ajuste_pos
-    sai = _safe_sum(base[mask_sai][c_qtd].apply(_to_f)) + ajuste_neg
-    return round(ent - sai, 3)
+    return round(float(ent) - float(sai) + float(adj), 3)
 
 # ──────────────────────────────────────────────
 #  ANTI DUPLICIDADE
