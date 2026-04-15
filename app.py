@@ -653,20 +653,17 @@ if not mov_raw.empty:
         saidas_mov   = dm[dm["_tipo"]=="saida"  ].groupby("_key")["_qtd"].sum()
         ajustes_mov  = dm[dm["_tipo"]=="ajuste" ].groupby("_key")["_qtd"].sum()
 
-calc = pd.DataFrame({
-    "Entradas": entradas_mov,
-    "Saidas":   saidas_mov,
-    "Ajustes":  ajustes_mov,
-}).fillna(0.0)
-calc["SaldoInicial"] = 0.0
-calc["EstoqueCalc"]  = calc["Entradas"] - calc["Saidas"] + calc["Ajustes"]
-# O index é o KeyID (agrupado por _key) — transforma em coluna
-calc.index.name = "KeyID"
-calc = calc.reset_index()
-calc = calc.groupby("KeyID", as_index=False).agg({
-    "Entradas": "sum", "Saidas": "sum", "Ajustes": "sum",
-    "SaldoInicial": "sum", "EstoqueCalc": "sum"
-})
+# Monta calc com KeyID como coluna (não como index)
+_rows = []
+_all_keys = set(entradas_mov.index) | set(saidas_mov.index) | set(ajustes_mov.index)
+for _k in _all_keys:
+    _e = float(entradas_mov.get(_k, 0.0))
+    _s = float(saidas_mov.get(_k, 0.0))
+    _a = float(ajustes_mov.get(_k, 0.0))
+    _rows.append({"KeyID": _k, "Entradas": _e, "Saidas": _s, "Ajustes": _a,
+                  "SaldoInicial": 0.0, "EstoqueCalc": _e - _s + _a})
+calc = pd.DataFrame(_rows) if _rows else pd.DataFrame(
+    columns=["KeyID","Entradas","Saidas","Ajustes","SaldoInicial","EstoqueCalc"])
 
 def _last_cost_per_product(comp_df):
     if comp_df.empty: return pd.Series(dtype=float)
@@ -678,7 +675,6 @@ def _last_cost_per_product(comp_df):
     return d.set_index("KeyID")["CustoNum"]
 
 last_cost = _last_cost_per_product(c_all)
-calc = calc.reset_index().rename(columns={"index":"KeyID"})
 prod_calc = prod.copy() if not prod.empty else pd.DataFrame()
 if not prod_calc.empty and "KeyID" in prod_calc.columns:
     prod_calc = prod_calc.merge(calc, how="left", on="KeyID", suffixes=("_orig",""))
