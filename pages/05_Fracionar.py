@@ -488,15 +488,11 @@ def _label_frac(row) -> str:
 
 opcoes_frac = df_frac.apply(_label_frac, axis=1).tolist()
 
-NOVO_LABEL = "➕ Cadastrar novo produto fracionado..."
-frac_sel = st.selectbox(
-    "Produto fracionado que vai ser produzido",
-    options=["(selecione)"] + opcoes_frac + [NOVO_LABEL],
-    key="sel_frac"
-)
+# ── Botão de cadastro ANTES do selectbox ──
+if st.button("➕ Cadastrar novo produto fracionado", use_container_width=True, key="btn_abrir_cadastro"):
+    st.session_state["mostrar_cadastro_frac"] = True
 
-# ── Cadastro inline de novo produto fracionado ──
-if frac_sel == NOVO_LABEL:
+if st.session_state.get("mostrar_cadastro_frac"):
     st.markdown("""
     <div style="background:rgba(96,165,250,0.08);border:1.5px solid rgba(96,165,250,0.3);
     border-radius:16px;padding:20px 24px;margin:12px 0;">
@@ -562,6 +558,12 @@ if frac_sel == NOVO_LABEL:
 
     st.info("👆 Preencha os dados e clique em **Cadastrar** para continuar.")
     st.stop()
+
+frac_sel = st.selectbox(
+    "Produto fracionado que vai ser produzido",
+    options=["(selecione)"] + opcoes_frac,
+    key="sel_frac"
+)
 
 if frac_sel == "(selecione)":
     st.info("👆 Selecione o produto fracionado para continuar.")
