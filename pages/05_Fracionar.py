@@ -417,7 +417,7 @@ def _e_granel(row) -> bool:
     nm = str(row.get(c_nome or "", "") or "").strip().lower()
     ativo = str(row.get(c_ativo or "", "sim") or "sim").strip().lower()
     if ativo not in ("sim","s","1","yes","ativo","true",""): return False
-    return un in ("l","litro","litros") or any(x in nm for x in ["20 l","5 l","granel","20l","5l","litro"])
+    return un in ("l","L","litro","litros","Litro","Litros") or any(x in nm for x in ["20 l","5 l","granel","20l","5l","litro","20 L","5 L"])
 
 df_granel = df_prod[df_prod.apply(_e_granel, axis=1)].copy()
 
@@ -477,7 +477,7 @@ def _e_fracionado(row) -> bool:
     if ativo not in ("sim","s","1","yes","ativo","true",""): return False
     rid = str(row.get(c_id, "") or "")
     un  = str(row.get(c_unid, "") or "").strip().lower()
-    return rid not in ids_granel and un not in ("l","litro","litros")
+    return rid not in ids_granel and un not in ("l","L","litro","litros","Litro","Litros")
 
 df_frac = df_prod[df_prod.apply(_e_fracionado, axis=1)].copy()
 
