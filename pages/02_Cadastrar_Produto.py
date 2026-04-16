@@ -94,16 +94,26 @@ from utils.sheets import (
     tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases para compatibilidade com código existente
+# Aliases completos para compatibilidade com código existente
 _to_num = to_num
+_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
 _brl = brl
+_fmt_brl = brl
 _first_col = first_col
 _fmt_num = fmt_num
 _tg_send = tg_send
 _tg_media = tg_media
 _gerar_id = gerar_id
 _parse_date = parse_date
+_parse_date_any = parse_date
+_norm_tipo_mov = norm_tipo_mov
+_norm_tipo = norm_tipo_mov
 conectar_sheets = sheet
+
+def _canon_id(x):
+    import re as _re
+    return _re.sub(r"[^0-9]", "", str(x or ""))
+
 _to_float = to_num
 
 
