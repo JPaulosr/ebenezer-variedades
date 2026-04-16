@@ -2,37 +2,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json, re, unicodedata, unicodedata as _ud
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
+import gspread
 import pandas as pd
 import requests
 import streamlit as st
-from utils.sheets import (
-    sheet, carregar_aba, garantir_aba, append_rows,
-    to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id,
-    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
-)
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-conectar_sheets = sheet
-
-def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
-
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
 # ──────────────────────────────────────────────
 #  CONFIG & TEMA
@@ -148,76 +127,24 @@ div[data-testid="stNumberInput"] input { border-radius:10px !important; }
 # ──────────────────────────────────────────────
 #  HELPERS GOOGLE SHEETS
 # ──────────────────────────────────────────────
-# carregar_aba importado de utils.sheets
-
-def _first_col(df, cands):
-    if df is None or df.empty: return None
-    for c in cands:
-        if c in df.columns: return c
-    low = {c.lower(): c for c in df.columns}
-    for c in cands:
-        if c.lower() in low: return low[c.lower()]
-    return None
-
-def _to_num(x):
-    if x is None: return 0.0
-    if isinstance(x, (int, float)): return float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace(".","").replace(",",".") if s.count(",") == 1 and s.count(".") > 1 else s.replace(",",".")
-    try: return float(s)
-    except: return 0.0
-
-def _brl(v): return f"R$ {float(v):,.2f}".replace(",","X").replace(".",",").replace("X",".")
-def _gerar_id(p="F"): return f"{p}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
-
-def _garantir_aba(sh, nome, cols):
-    try: ws = sh.worksheet(nome)
-    except:
-        ws = sh.add_worksheet(title=nome, rows=3000, cols=max(10,len(cols)))
-        ws.update("A1",[cols]); return ws
-    hdrs = [h.strip() for h in (ws.row_values(1) or [])]
-    falt = [c for c in cols if c not in hdrs]
-    if falt: ws.update("A1",[hdrs+falt])
-    return ws
-
-def _append_rows(ws, rows):
-    hdrs = [h.strip() for h in ws.row_values(1)]
-    ws.append_rows([[d.get(h,"") for h in hdrs] for d in rows], value_input_option="USER_ENTERED")
-
-
+#  CONEXÃO / HELPERS  (centralizados em utils/sheets.py)
 # ──────────────────────────────────────────────
-#  TELEGRAM
-# ──────────────────────────────────────────────
-def _tg_on(): 
-    try: return str(st.secrets.get("TELEGRAM_ENABLED","0")) == "1"
-    except: return False
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases de compatibilidade
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
+def _canon_id(x):
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return sheet()
 
-def _tg_conf():
-    token   = st.secrets.get("TELEGRAM_TOKEN","")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA","") or st.secrets.get("TELEGRAM_CHAT_ID","")
-    return str(token or ""), str(chat_id or "")
-
-def _tg_send(msg):
-    if not _tg_on(): return
-    token, cid = _tg_conf()
-    if not token or not cid: return
-    try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id":cid,"text":msg,"parse_mode":"HTML","disable_web_page_preview":True}, timeout=8)
-    except: pass
-
-def _tg_media(media):
-    if not _tg_on(): return
-    token, cid = _tg_conf()
-    if not token or not cid or not media: return
-    try: requests.post(f"https://api.telegram.org/bot{token}/sendMediaGroup",
-        json={"chat_id":cid,"media":media[:10]}, timeout=12)
-    except: pass
-
-
-# ──────────────────────────────────────────────
-#  CLIENTES
-# ──────────────────────────────────────────────
 ABA_CLIENTES = "Clientes"
 
 def _strip_acc(s):
@@ -589,7 +516,6 @@ with col_dir:
                 ws_v.update("A1:K1",[["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha",
                                        "FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"]])
 
-            # Garante que a aba tem os cabeçalhos certos (sem recarregar tudo)
             ws_v = garantir_aba(ABA_VEND)
 
             try: ws_m = sh.worksheet(ABA_MOVS)
@@ -639,7 +565,6 @@ with col_dir:
                     "ID":venda_id,"Documento/NF":"","Origem":"Vendas rápidas",
                     "SaldoApós":str(int(aft))})
 
-            # SEGURO: nunca faz clear() + reescrita completa — só acrescenta linhas
             append_rows(ws_v, novas)
             append_rows(ws_m, movs)
 
@@ -774,7 +699,6 @@ with col_dir:
                         "FormaPagto":f"Estorno - {forma}","Obs":f"ESTORNO DE {vid}",
                         "Desconto":"0,00","TotalCupom":"0,00","CupomStatus":"ESTORNO",
                         "Cliente":str(r.get("Cliente","")),"FiadoID":""})
-                # SEGURO: só acrescenta linhas de estorno
                 append_rows(ws2, novas2)
                 try: ws_m2 = sh2.worksheet(ABA_MOVS)
                 except: ws_m2 = _garantir_aba(sh2, ABA_MOVS,
