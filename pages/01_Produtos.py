@@ -57,7 +57,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 # ──────────────────────────────────────────────
 #  HELPERS
 from utils.sheets import (
-    sheet as _sheet_obj, carregar_aba, garantir_aba, append_rows,
+    sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
     norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
@@ -66,9 +66,28 @@ _to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
 _first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
 _tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
 _gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
+
 def _canon_id(x):
     import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
-def conectar_sheets(): return _sheet_obj()
+def conectar_sheets(): return sheet()
+
+def _nz(x):
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except: pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan","none") else s
+
+def _strip_low(s):
+    import unicodedata as _ud2
+    s = _ud2.normalize("NFKD", str(s or ""))
+    return "".join(ch for ch in s if _ud2.category(ch) != "Mn").lower().strip()
+
+def _prod_key(pid, pnome):
+    p = _nz(pid)
+    return p if p else f"nm:{_strip_low(_nz(pnome))}"
 
 
 ABA_PROD, ABA_MOV, ABA_COMP = "Produtos", "MovimentosEstoque", "Compras"
