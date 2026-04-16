@@ -3,10 +3,14 @@
 # Visual idêntico ao Dashboard e Vendas (Ebenezér Variedades)
 from __future__ import annotations
 
+import hashlib, json, re, unicodedata
 from datetime import date, datetime
 
+import gspread
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
 # ──────────────────────────────────────────────
 #  CONFIG & TEMA
@@ -179,41 +183,68 @@ footer { display: none !important; }
 
 # ──────────────────────────────────────────────
 #  HELPERS SHEETS
-# ──────────────────────────────────────────────
 from utils.sheets import (
     sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque,
-    tg_send, tg_media, gerar_id, parse_date,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-_norm_tipo = norm_tipo_mov
-conectar_sheets = sheet
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
 
 def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return sheet()
+def _sheet(): return sheet()
+def _conectar(): return sheet()
 
-_fmt_brl = brl
-
-def _safe_load(aba):
+@st.cache_data(ttl=15, show_spinner=False)
+def _carregar(aba):
     return carregar_aba(aba)
 
+def _safe_load(aba):
+    try: return _carregar(aba)
+    except: return pd.DataFrame()
+
+def _pick(df, *cands):
+    if df is None or df.empty: return None
+    for c in cands:
+        if c in df.columns: return c
+    return None
+
+def _to_f(x) -> float:
+    if x is None: return 0.0
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"): return 0.0
+    s = s.replace(",",".")
+    import re as _re2
+    s = _re2.sub(r"[^0-9.\-]","",s)
+    try: return float(s)
+    except: return 0.0
+
+def _norm_tipo(t):
+    import unicodedata as _ud2, re as _re2
+    raw = str(t or "")
+    low = "".join(ch for ch in _ud2.normalize("NFKD", raw.lower()) if _ud2.category(ch) != "Mn")
+    if "fracion" in low:
+        return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
+    lowc = _re2.sub(r"[^a-z]","",low)
+    if "contagem" in lowc or "inventario" in lowc: return "ajuste"
+    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
+    if "saida" in lowc or "venda" in lowc or "baixa" in lowc: return "saida"
+    if "ajuste" in lowc: return "ajuste"
+    return "outro"
+
 def _append_row(ws, row):
-    append_rows(ws, [row])
+    hdrs = [h.strip() for h in ws.row_values(1)]
+    ws.append_rows([[row.get(h,"") for h in hdrs]], value_input_option="USER_ENTERED")
+
+def _ensure_ws(name, headers=None):
+    return garantir_aba(name, headers or [])
+
 
 # ──────────────────────────────────────────────
 #  SALDO DE ESTOQUE — mesma lógica da Contagem Estoque
