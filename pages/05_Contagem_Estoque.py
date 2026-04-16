@@ -722,7 +722,7 @@ def _render_contagem():
             for i in range(0, len(df_audit), 3):
                 chunk = df_audit.iloc[i:i+3]
                 cols3 = st.columns(3)
-                for ci, (_, prod_row) in zip(cols3, chunk.iterrows()):
+                for _ci_idx, (ci, (_, prod_row)) in enumerate(zip(cols3, chunk.iterrows())):
                     with ci:
                         chave   = prod_row["__key"]
                         nome_p  = prod_row["_nome"]
@@ -747,7 +747,7 @@ def _render_contagem():
                         </div>
                         """, unsafe_allow_html=True)
 
-                        if st.button("Selecionar", key=f"sel_{chave}_{_gi}", use_container_width=True):
+                        if st.button("Selecionar", key=f"sel_{i}_{_ci_idx}", use_container_width=True):
                             st.session_state["prod_sel"] = chave
                             st.rerun()
 
