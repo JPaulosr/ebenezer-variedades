@@ -145,6 +145,13 @@ def _canon_id(x):
     import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
 def conectar_sheets(): return sheet()
 
+# Aliases locais para funções do utils/sheets (evita NameError)
+def _garantir_aba(sh, nome, colunas=None):
+    return garantir_aba(nome, colunas)
+
+def _append_rows(ws, rows):
+    return append_rows(ws, rows)
+
 ABA_CLIENTES = "Clientes"
 
 def _strip_acc(s):
@@ -185,6 +192,7 @@ ABA_PROD, ABA_VEND = "Produtos", "Vendas"
 ABA_COMPRAS, ABA_AJUSTES, ABA_MOVS, ABA_FIADO = "Compras","Ajustes","MovimentosEstoque","Fiado"
 COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _build_catalogo():
     try: dfp = carregar_aba(ABA_PROD)
     except: st.error("Erro ao abrir aba Produtos."); st.stop()
