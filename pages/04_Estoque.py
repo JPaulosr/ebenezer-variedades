@@ -200,21 +200,6 @@ with right:
 st.markdown("<div class='badge'>Quantidade = Entradas − Saídas + Ajustes • Custo: Produtos.CustoAtual ➜ Última Compra</div>", unsafe_allow_html=True)
 st.markdown("<hr/>", unsafe_allow_html=True)
 
-# ------ Diagnóstico (útil p/ permissões/URL) ------
-with st.expander("🧩 Diagnóstico de Conexão com Google Sheets"):
-    try:
-        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email", ""))
-        st.write("**Service Account:**", client_email)
-        st.write("**PLANILHA_URL:**", st.secrets.get("PLANILHA_URL"))
-        try:
-            sh = _sheet()
-            st.write("**Título da planilha:**", getattr(sh, "title", "(desconhecido)"))
-            st.write("**Abas disponíveis:**", sorted(list(_sheet_titles())) or "(nenhuma)")
-        except Exception as e:
-            st.warning(f"Falha ao abrir planilha: {e}")
-    except Exception as e:
-        st.error(f"Não foi possível ler os segredos. Erro: {e}")
 
 # =========================
 # Busca / Filtros
