@@ -276,7 +276,11 @@ df_prod["_id"]   = df_prod[col_id]   if col_id   else ""
 df_prod["_nome"] = df_prod[col_nome] if col_nome else ""
 df_prod["_cat"]  = df_prod[col_cat]  if col_cat  else ""
 df_prod["_foto"] = df_prod[col_foto] if col_foto else ""
-df_prod["__key"] = df_prod.apply(lambda r: _prod_key(r.get(col_id,""), r.get(col_nome,"")), axis=1)
+col_preco = _first_col(df_prod, ["PreçoVenda","PrecoVenda","Preço","Preco"])
+col_custo = _first_col(df_prod, ["CustoAtual","CustoMedio","Custo"])
+df_prod["__key"]  = df_prod.apply(lambda r: _prod_key(r.get(col_id,""), r.get(col_nome,"")), axis=1)
+df_prod["_preco"] = df_prod[col_preco].apply(_to_num) if col_preco else 0.0
+df_prod["_custo"] = df_prod[col_custo].apply(_to_num) if col_custo else 0.0
 df_prod.reset_index(drop=True, inplace=True)
 
 for c in ["Tipo","Qtd","IDProduto","Produto"]:
@@ -411,6 +415,13 @@ contados_n = len(contados)
 pct        = int(contados_n / total * 100) if total else 0
 
 
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
 # ──────────────────────────────────────────────
 #  HEADER
 # ──────────────────────────────────────────────
@@ -425,6 +436,14 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+
+# ──────────────────────────────────────────────
+#  ABAS
+# ──────────────────────────────────────────────
+_tab_cnt, _tab_prec = st.tabs(["📦 Contagem de Estoque", "🏷️ Atualizar Preços"])
+
+with _tab_cnt:
+    pass  # conteúdo renderizado globalmente abaixo pelo Streamlit
 
 # ──────────────────────────────────────────────
 #  TELA A: SEM CICLO ATIVO
@@ -777,3 +796,87 @@ with col_right:
         O progresso só zera se você clicar em <strong>"Iniciar nova contagem"</strong>.
     </div>
     """, unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────
+#  ABA PREÇOS
+# ──────────────────────────────────────────────
+with _tab_prec:
+    st.markdown("""
+    <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);
+    border-radius:14px;padding:14px 18px;margin-bottom:20px;font-size:0.85rem;
+    color:rgba(255,255,255,0.65);line-height:1.6">
+    🏷️ Selecione o produto na aba <strong>Contagem de Estoque</strong> e edite os preços aqui.
+    </div>
+    """, unsafe_allow_html=True)
+
+    _sel_p = st.session_state.get("prod_sel")
+    if not _sel_p or df_prod.empty:
+        st.info("Selecione um produto na aba Contagem primeiro.")
+    else:
+        _rws = df_prod[df_prod["__key"] == _sel_p]
+        if _rws.empty:
+            st.info("Produto não encontrado.")
+        else:
+            _rp      = _rws.iloc[0]
+            _nome_p  = _nz(_rp.get("_nome",""))
+            _foto_p  = _nz(_rp.get("_foto",""))
+            _preco_p = float(_rp.get("_preco",0.0) or 0.0)
+            _custo_p = float(_rp.get("_custo",0.0) or 0.0)
+            _pid_p   = _nz(_rp.get("_id",""))
+
+            _ft = (f'<img src="{_foto_p}" style="width:70px;height:70px;object-fit:contain;border-radius:10px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);flex-shrink:0">'
+                   if _foto_p and _foto_p.startswith("http")
+                   else '<div style="width:70px;height:70px;border-radius:10px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:1.8rem;flex-shrink:0">📦</div>')
+
+            st.markdown(f"""
+            <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);
+            border-radius:16px;padding:16px 20px;display:flex;gap:16px;align-items:center;margin-bottom:20px">
+              {_ft}
+              <div>
+                <div style="font-family:Nunito;font-weight:800;font-size:1rem;color:#fff">{_nome_p}</div>
+                <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);margin-top:3px">ID: {_pid_p}</div>
+                <div style="margin-top:6px;display:flex;gap:10px">
+                  <span style="background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.3);color:#4ade80;border-radius:8px;padding:2px 10px;font-size:0.75rem;font-weight:700">Venda: R$ {_fmt_num(_preco_p).replace(".",",")}</span>
+                  <span style="background:rgba(96,165,250,0.12);border:1px solid rgba(96,165,250,0.3);color:#60a5fa;border-radius:8px;padding:2px 10px;font-size:0.75rem;font-weight:700">Custo: R$ {_fmt_num(_custo_p).replace(".",",")}</span>
+                </div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            with st.form("form_precos_prod"):
+                _pc1, _pc2 = st.columns(2)
+                with _pc1:
+                    _novo_preco = st.number_input("💰 Preço de Venda (R$)", min_value=0.0, step=0.10, format="%.2f", value=round(_preco_p,2))
+                with _pc2:
+                    _novo_custo = st.number_input("📦 Custo Unitário (R$)", min_value=0.0, step=0.10, format="%.2f", value=round(_custo_p,2))
+                _salvar = st.form_submit_button("💾 Salvar preços", type="primary", use_container_width=True)
+
+            if _salvar:
+                try:
+                    _ws_p  = _sheet().worksheet("Produtos")
+                    _hdr_p = [h.strip() for h in _ws_p.row_values(1)]
+                    _ci    = next((i+1 for i,h in enumerate(_hdr_p) if h in ["ID","Id","Codigo","Código","SKU"]), None)
+                    _cpv   = next((i+1 for i,h in enumerate(_hdr_p) if h in ["PreçoVenda","PrecoVenda","Preço","Preco"]), None)
+                    _ccu   = next((i+1 for i,h in enumerate(_hdr_p) if h in ["CustoAtual","CustoMedio","Custo"]), None)
+                    if not _ci:
+                        st.error("Coluna ID não encontrada na aba Produtos.")
+                    else:
+                        _ids = _ws_p.col_values(_ci)[1:]
+                        try:
+                            _ri = _ids.index(_pid_p) + 2
+                        except ValueError:
+                            st.error(f"Produto '{_pid_p}' não encontrado na planilha.")
+                            _ri = None
+                        if _ri:
+                            _upd = []
+                            if _cpv: _upd.append({"range": f"{_col_letter(_cpv)}{_ri}", "values": [[str(_novo_preco).replace(".",",")]]})
+                            if _ccu: _upd.append({"range": f"{_col_letter(_ccu)}{_ri}", "values": [[str(_novo_custo).replace(".",",")]]})
+                            if _upd:
+                                _ws_p.batch_update(_upd, value_input_option="USER_ENTERED")
+                                st.cache_data.clear()
+                                st.success(f"✅ **{_nome_p}** atualizado! Venda: R$ {_novo_preco:.2f} · Custo: R$ {_novo_custo:.2f}")
+                            else:
+                                st.warning("Colunas de preço/custo não encontradas.")
+                except Exception as _e:
+                    st.error(f"Erro ao salvar: {_e}")
