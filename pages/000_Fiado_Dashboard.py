@@ -178,63 +178,25 @@ PALETTE    = ["#636EFA","#EF553B","#00CC96","#AB63FA","#FFA15A","#19D3F3","#FF66
 
 # =========================
 # Helpers
-# =========================
-def _normalize_private_key(key):
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
-    return key
 
-def _load_sa():
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(str(svc["private_key"]))
-    return svc
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
 
-@st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL","")
-    if not url_or_id: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
-
-def _fmt_brl(v):
-    try: return ("R$ "+f"{float(v):,.2f}").replace(",","X").replace(".",",").replace("X",".")
-    except: return "R$ 0,00"
-
-def _to_float(x, default=0.0):
-    if x is None: return default
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return default
-    s = s.replace("R$","").replace(" ","").replace(",",".")
-    s = re.sub(r"[^0-9.\-]","",s)
-    if s.count(".")>1:
-        parts = s.split("."); s = "".join(parts[:-1])+"."+parts[-1]
-    try: return float(s)
-    except: return default
-
-def _to_date(s) -> Optional[date]:
-    for fmt in ("%d/%m/%Y","%Y-%m-%d"):
-        try: return datetime.strptime(str(s), fmt).date()
-        except: pass
-    return None
-
-@st.cache_data(ttl=30, show_spinner=False)
-def load_df(aba):
-    sh = conectar_sheets()
-    try: ws = sh.worksheet(aba)
-    except gspread.WorksheetNotFound:
-        st.error(f"🛑 Aba '{aba}' não encontrada."); st.stop()
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    base = {ABA_FIADO: COLS_FIADO, ABA_PAGT: COLS_PAGT}[aba]
-    for c in base:
-        if c not in df.columns: df[c] = ""
-    return df.fillna("").loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
 
 # =========================
 # Dados
