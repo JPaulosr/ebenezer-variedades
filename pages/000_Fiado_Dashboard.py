@@ -1,721 +1,448 @@
-# pages/00_Vendas.py — Vendas rápidas (redesenhada)
 # -*- coding: utf-8 -*-
-from __future__ import annotations
+# pages/000_Fiado_Dashboard.py — versão redesenhada para usuária leiga
 
-import json, re, unicodedata, unicodedata as _ud
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Tuple
+import json, unicodedata, re
+from datetime import datetime, date, timedelta
+from typing import Optional
 
-import gspread
 import pandas as pd
-import requests
 import streamlit as st
+import gspread
+from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
+import plotly.express as px
 
-# ──────────────────────────────────────────────
-#  CONFIG & TEMA
-# ──────────────────────────────────────────────
-import pathlib
-_cfg = pathlib.Path(".streamlit"); _cfg.mkdir(exist_ok=True)
-(_cfg / "config.toml").write_text('[theme]\nbase = "dark"\n')
-
-st.set_page_config(page_title="Vendas", page_icon="🧾", layout="wide",
-                   initial_sidebar_state="collapsed")
+# =========================
+# Config
+# =========================
+st.set_page_config(page_title="Fiado", page_icon="💳", layout="wide")
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=DM+Sans:wght@300;400;500&display=swap');
+
 html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 
-.page-header {
+/* Header */
+.fiado-header {
     background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
-    border-radius: 20px; padding: 24px 32px; margin-bottom: 24px;
-    display: flex; align-items: center; justify-content: space-between;
-    box-shadow: 0 8px 32px rgba(15,52,96,0.25);
+    border-radius: 20px;
+    padding: 28px 36px;
+    margin-bottom: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 8px 32px rgba(15,52,96,0.3);
 }
-.page-header h1 { font-family:'Nunito',sans-serif; font-weight:900; font-size:1.7rem; color:#fff; margin:0; }
-.page-header .sub { font-size:0.82rem; color:rgba(255,255,255,0.5); margin-top:4px; }
-.header-badge {
-    background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2);
-    border-radius:50px; padding:8px 18px; color:#fff; font-size:0.82rem;
-    font-weight:600; backdrop-filter:blur(10px);
+.fiado-header-title {
+    font-family: 'Nunito', sans-serif;
+    font-weight: 900;
+    font-size: 1.9rem;
+    color: #fff;
+    margin: 0;
 }
+.fiado-header-sub {
+    font-size: 0.85rem;
+    color: rgba(255,255,255,0.5);
+    margin-top: 4px;
+}
+.fiado-badge-warn {
+    background: rgba(248,113,113,0.2);
+    border: 1px solid rgba(248,113,113,0.4);
+    border-radius: 50px;
+    padding: 8px 18px;
+    color: #f87171;
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+.fiado-badge-ok {
+    background: rgba(74,222,128,0.15);
+    border: 1px solid rgba(74,222,128,0.3);
+    border-radius: 50px;
+    padding: 8px 18px;
+    color: #4ade80;
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+/* KPI Cards */
+.kpi-card {
+    background: rgba(255,255,255,0.06);
+    border-radius: 18px;
+    padding: 22px 24px;
+    border: 1px solid rgba(255,255,255,0.1);
+    height: 100%;
+    transition: transform 0.15s ease;
+}
+.kpi-card:hover { transform: translateY(-2px); }
+.kpi-icon { font-size: 1.6rem; margin-bottom: 8px; display: block; }
+.kpi-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: rgba(255,255,255,0.4);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+}
+.kpi-value {
+    font-family: 'Nunito', sans-serif;
+    font-size: 1.7rem;
+    font-weight: 900;
+    color: #fff;
+    line-height: 1.1;
+}
+.kpi-sub { font-size: 0.78rem; margin-top: 5px; }
+.kpi-red   { color: #f87171; }
+.kpi-green { color: #4ade80; }
+.kpi-blue  { color: #60a5fa; }
+.kpi-amber { color: #fbbf24; }
+
+/* Devedor card */
+.devedor-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    padding: 14px 18px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.devedor-card.vencido {
+    background: rgba(248,113,113,0.08);
+    border-color: rgba(248,113,113,0.25);
+}
+.devedor-nome {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: rgba(255,255,255,0.9);
+}
+.devedor-info {
+    font-size: 0.76rem;
+    color: rgba(255,255,255,0.4);
+    margin-top: 2px;
+}
+.devedor-valor {
+    font-family: 'Nunito', sans-serif;
+    font-weight: 800;
+    font-size: 1.05rem;
+    color: #f87171;
+}
+.devedor-valor.ok { color: #fbbf24; }
+
+/* Tags de prazo */
+.tag {
+    display: inline-block;
+    border-radius: 6px;
+    padding: 2px 9px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    margin-left: 8px;
+}
+.tag-vencido { background: rgba(248,113,113,0.2); color: #f87171; }
+.tag-hoje    { background: rgba(251,191,36,0.2); color: #fbbf24; }
+.tag-ok      { background: rgba(74,222,128,0.15); color: #4ade80; }
 
 /* Seção título */
-.sec-titulo {
-    font-family:'Nunito',sans-serif; font-weight:800; font-size:1.05rem;
-    color:rgba(255,255,255,0.9); margin:24px 0 14px 0;
-    display:flex; align-items:center; gap:8px;
+.secao {
+    font-family: 'Nunito', sans-serif;
+    font-weight: 800;
+    font-size: 1.05rem;
+    color: rgba(255,255,255,0.85);
+    margin: 28px 0 14px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
-.sec-titulo::after {
-    content:''; flex:1; height:1px;
-    background:linear-gradient(to right,rgba(255,255,255,0.15),transparent);
-    margin-left:8px; border-radius:2px;
+.secao::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(to right, rgba(255,255,255,0.12), transparent);
+    margin-left: 8px;
 }
 
-/* Card produto no selectbox */
-.prod-preview {
-    background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1);
-    border-radius:18px; padding:16px 20px; margin-bottom:16px;
-    display:flex; gap:18px; align-items:center;
-}
-.prod-preview img {
-    width:80px; height:80px; border-radius:12px;
-    object-fit:contain; background:rgba(255,255,255,0.06);
-    border:1px solid rgba(255,255,255,0.08); flex-shrink:0;
-}
-.prod-preview-ph {
-    width:80px; height:80px; border-radius:12px;
-    background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08);
-    display:flex; align-items:center; justify-content:center;
-    font-size:2rem; flex-shrink:0;
-}
-.prod-preview-info .nome { font-family:'Nunito',sans-serif; font-weight:800; font-size:1rem; color:#fff; }
-.prod-preview-info .preco { font-size:1.2rem; font-weight:700; color:#4ade80; margin-top:4px; }
-.prod-preview-info .est { font-size:0.75rem; color:rgba(255,255,255,0.4); margin-top:2px; }
-.est-ok  { color:#4ade80 !important; }
-.est-low { color:#fbbf24 !important; }
-.est-neg { color:#f87171 !important; }
-
-/* Cards do carrinho */
-.cart-card {
-    background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.09);
-    border-radius:16px; padding:14px 16px; margin-bottom:10px;
-    display:flex; gap:14px; align-items:center;
-}
-.cart-img { width:62px; height:62px; border-radius:10px; object-fit:contain;
-    background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); flex-shrink:0; }
-.cart-img-ph { width:62px; height:62px; border-radius:10px; background:rgba(255,255,255,0.06);
-    display:flex; align-items:center; justify-content:center; font-size:1.6rem; flex-shrink:0; }
-.cart-nome { font-weight:700; font-size:0.9rem; color:#fff; }
-.cart-sub  { font-size:0.75rem; color:rgba(255,255,255,0.4); margin-top:2px; }
-
-/* Totalizador */
-.total-box {
-    background:linear-gradient(135deg,rgba(74,222,128,0.12),rgba(34,211,238,0.08));
-    border:1px solid rgba(74,222,128,0.25); border-radius:18px; padding:20px 24px;
-}
-.total-label { font-size:0.75rem; color:rgba(255,255,255,0.5); text-transform:uppercase; letter-spacing:0.5px; }
-.total-val   { font-family:'Nunito',sans-serif; font-size:2rem; font-weight:900; color:#4ade80; }
-.total-sub   { font-size:0.8rem; color:rgba(255,255,255,0.4); margin-top:2px; }
-
-/* Histórico */
-.hist-card {
-    background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
-    border-radius:14px; padding:14px 18px; margin-bottom:10px;
-}
-.hist-card.estorno { border-color:rgba(248,113,113,0.3); background:rgba(248,113,113,0.05); }
-.hist-data  { font-size:0.8rem; color:rgba(255,255,255,0.45); }
-.hist-id    { font-family:'Nunito',sans-serif; font-size:0.85rem; font-weight:700; color:#fff; }
-.hist-valor { font-family:'Nunito',sans-serif; font-size:1.1rem; font-weight:800; color:#4ade80; }
-.hist-forma { display:inline-block; background:rgba(96,165,250,0.15); color:#60a5fa;
-    border:1px solid rgba(96,165,250,0.3); border-radius:8px;
-    padding:2px 10px; font-size:0.72rem; font-weight:700; }
-.hist-forma.fiado { background:rgba(251,191,36,0.15); color:#fbbf24; border-color:rgba(251,191,36,0.3); }
-.hist-forma.estorno-badge { background:rgba(248,113,113,0.15); color:#f87171; border-color:rgba(248,113,113,0.3); }
-
-/* Forma pagamento chips */
-.forma-chip { cursor:pointer; }
-
-button[kind="primary"] { border-radius:12px !important; font-weight:700 !important; }
-div[data-testid="stNumberInput"] input { border-radius:10px !important; }
+footer { display: none !important; }
+#MainMenu { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# =========================
+# Constantes
+# =========================
+ABA_FIADO = "Fiado"
+ABA_PAGT  = "Fiado_Pagamentos"
+COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
+COLS_PAGT  = ["PagamentoID","DataPagamento","Cliente","Forma","TotalPago","IDsFiado","Obs"]
+PALETTE    = ["#636EFA","#EF553B","#00CC96","#AB63FA","#FFA15A","#19D3F3","#FF6692","#B6E880"]
 
-# ──────────────────────────────────────────────
-#  HELPERS GOOGLE SHEETS
-# ──────────────────────────────────────────────
-#  CONEXÃO / HELPERS  (centralizados em utils/sheets.py)
-# ──────────────────────────────────────────────
+# =========================
+# Helpers
 from utils.sheets import (
-    sheet as _sheet_obj, carregar_aba, garantir_aba, append_rows,
+    sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
     norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
-    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases de compatibilidade
 _to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
 _first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
 _tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
 _gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date  # alias que existia localmente
+ABA_FIADO = "Fiado"; ABA_PAGT = "Fiado_Pagamentos"
 def _canon_id(x):
     import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
-def conectar_sheets(): return _sheet_obj()
+def conectar_sheets(): return sheet()
 
-ABA_CLIENTES = "Clientes"
 
-def _strip_acc(s):
-    return "".join(ch for ch in _ud.normalize("NFD",str(s or "")) if _ud.category(ch) != "Mn")
-
-def _norm_cli(n): return re.sub(r"\s+"," ",(n or "").strip()).title()
-def _cli_key(n):  return re.sub(r"\s+"," ",_strip_acc(_norm_cli(n)).lower()).strip()
-
-def _carregar_clientes():
-    try:
-        dfc = carregar_aba(ABA_CLIENTES)
-        if dfc.empty: return []
-        col = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        vistos = {}
-        for raw in dfc[col].dropna().astype(str):
-            n = _norm_cli(raw); k = _cli_key(n)
-            if k and k not in vistos: vistos[k] = n
-        return sorted(vistos.values())
-    except: return []
-
-def _ensure_cliente(nome):
-    nome = _norm_cli(nome)
-    if not nome: return
+@st.cache_data(ttl=30, show_spinner=False)
+def load_df(aba):
     sh = conectar_sheets()
-    ws = _garantir_aba(sh, ABA_CLIENTES, ["Cliente","Telefone","Obs"])
-    try: dfc = carregar_aba(ABA_CLIENTES)
-    except: dfc = pd.DataFrame(columns=["Cliente","Telefone","Obs"])
-    if not dfc.empty:
-        col = "Cliente" if "Cliente" in dfc.columns else dfc.columns[0]
-        if any(_cli_key(r) == _cli_key(nome) for r in dfc[col].dropna().astype(str)): return
-    _append_rows(ws, [{"Cliente":nome,"Telefone":"","Obs":""}])
+    try: ws = sh.worksheet(aba)
+    except gspread.WorksheetNotFound:
+        st.error(f"🛑 Aba '{aba}' não encontrada."); st.stop()
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
+    base = {ABA_FIADO: COLS_FIADO, ABA_PAGT: COLS_PAGT}[aba]
+    for c in base:
+        if c not in df.columns: df[c] = ""
+    return df.fillna("").loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
 
+# =========================
+# Dados
+# =========================
+df_fiado = load_df(ABA_FIADO)
+df_pagt  = load_df(ABA_PAGT)
 
-# ──────────────────────────────────────────────
-#  CATÁLOGO + ESTOQUE
-# ──────────────────────────────────────────────
-ABA_PROD, ABA_VEND = "Produtos", "Vendas"
-ABA_COMPRAS, ABA_AJUSTES, ABA_MOVS, ABA_FIADO = "Compras","Ajustes","MovimentosEstoque","Fiado"
-COLS_FIADO = ["ID","Data","Cliente","Valor","Vencimento","Status","Obs","DataPagamento","FormaPagamento","ValorPago"]
+df_fiado["ValorNum"]    = df_fiado["Valor"].apply(_to_float)
+df_fiado["ValorPagoNum"]= df_fiado["ValorPago"].apply(_to_float)
+df_fiado["Data_d"]      = df_fiado["Data"].apply(_to_date)
+df_fiado["Venc_d"]      = df_fiado["Vencimento"].apply(_to_date)
+df_fiado["Status_norm"] = df_fiado["Status"].astype(str).str.strip().str.lower()
+df_pagt["TotalPagoNum"] = df_pagt["TotalPago"].apply(_to_float)
+df_pagt["DataPag_d"]    = df_pagt["DataPagamento"].apply(_to_date)
 
-def _build_catalogo():
-    try: dfp = carregar_aba(ABA_PROD)
-    except: st.error("Erro ao abrir aba Produtos."); st.stop()
+hoje = date.today()
 
-    col_id    = _first_col(dfp, ["ID","Codigo","Código","SKU"])
-    col_nome  = _first_col(dfp, ["Nome","Produto","Descrição"])
-    col_preco = _first_col(dfp, ["PreçoVenda","PrecoVenda","Preço","Preco"])
-    col_unid  = _first_col(dfp, ["Unidade","Und"])
-    col_custo = _first_col(dfp, ["Custo","PreçoCusto","PrecoCusto","CustoUnit","CustoMedio","CustoAtual"])
-    col_foto  = _first_col(dfp, ["Foto","Imagem","Image","Photo","FotoURL","ImagemURL"])
-    col_cat   = _first_col(dfp, ["Categoria","categoria"])
-    col_emin  = _first_col(dfp, ["EstoqueMin","Estoque Min","EstMinimo"])
+# =========================
+# Filtro de período — sidebar simples
+# =========================
+with st.sidebar:
+    st.markdown("### 📅 Período")
+    ini_default = hoje - timedelta(days=90)
+    periodo = st.date_input("", value=(ini_default, hoje), format="DD/MM/YYYY", label_visibility="collapsed")
+    dt_ini = periodo[0] if isinstance(periodo, tuple) and len(periodo) > 0 else ini_default
+    dt_fim = periodo[1] if isinstance(periodo, tuple) and len(periodo) > 1 else hoje
 
-    if not col_id or not col_nome: st.error("Aba Produtos precisa de ID e Nome."); st.stop()
+    st.markdown("---")
+    ver_todos = st.checkbox("Ver também os já pagos", value=False)
 
-    # Dedupe labels
-    dfp["_label"] = dfp[col_nome].astype(str).str.strip()
-    cnt: Dict[str,int] = {}
-    def _dd(l):
-        c = cnt.get(l,0); cnt[l] = c+1
-        return l if c == 0 else f"{l} ({c+1})"
-    dfp["_label"] = dfp["_label"].map(_dd)
+# =========================
+# Filtragem
+# =========================
+mask = df_fiado["Data_d"].apply(lambda d: d is not None and dt_ini <= d <= dt_fim)
+if not ver_todos:
+    mask &= df_fiado["Status_norm"].eq("em aberto")
+base = df_fiado[mask].copy()
+base["AtrasoDias"] = base["Venc_d"].apply(lambda d: max(0, (hoje - d).days) if d and hoje > d else 0)
 
-    use_cols = [c for c in [col_id,col_nome,col_preco,col_unid,col_foto,col_cat,col_custo,col_emin] if c]
-    cat_map = dfp.set_index("_label")[use_cols].to_dict("index")
-    labels  = ["(selecione)"] + sorted(cat_map.keys(), key=str.lower)
+mask_p = df_pagt["DataPag_d"].apply(lambda d: d is not None and dt_ini <= d <= dt_fim)
+pagt_periodo = df_pagt[mask_p].copy()
 
-    id_nome: Dict[str,str]  = {}
-    id_custo: Dict[str,float] = {}
-    id_img: Dict[str,str]   = {}
-    id_emin: Dict[str,float] = {}
+# =========================
+# Totais
+# =========================
+total_aberto    = float(base["ValorNum"].sum())
+total_pago      = float(pagt_periodo["TotalPagoNum"].sum())
+qtd_clientes    = base["Cliente"].nunique()
+qtd_vencidos    = int((base["AtrasoDias"] > 0).sum())
+valor_vencido   = float(base[base["AtrasoDias"] > 0]["ValorNum"].sum())
 
-    for _, r in dfp.iterrows():
-        pid = str(r[col_id]).strip()
-        if not pid: continue
-        id_nome[pid]  = str(r.get(col_nome,"") or "").strip()
-        if col_custo: id_custo[pid] = _to_num(r.get(col_custo))
-        if col_foto:  id_img[pid]   = str(r.get(col_foto,"") or "").strip()
-        if col_emin:  id_emin[pid]  = _to_num(r.get(col_emin))
-
-    # ── Estoque — lê MovimentosEstoque (mesma fonte que Contagem de Estoque) ──
-    def _norm_tipo_mov(t: str) -> str:
-        """Classifica o tipo de movimento igual ao 05_Contagem_Estoque."""
-        import re as _re
-        raw = str(t or ""); low = "".join(ch for ch in unicodedata.normalize("NFKD", raw.lower()) if unicodedata.category(ch) != "Mn")
-        if "fracion" in low:
-            return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
-        lowc = _re.sub(r"[^a-z]","",low)
-        if "contagem" in lowc or "inventario" in lowc: return "ajuste"
-        if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
-        if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
-        if "ajuste"  in lowc: return "ajuste"
-        return "outro"
-
-    id_stock: Dict[str,float] = {}
-    try:
-        dmov = carregar_aba(ABA_MOVS)
-        c_pid  = _first_col(dmov, ["IDProduto","ProdutoID","ID"])
-        c_qtd  = _first_col(dmov, ["Qtd","Quantidade"])
-        c_tipo = _first_col(dmov, ["Tipo","tipo"])
-        if c_pid and c_qtd and c_tipo:
-            for _, r in dmov.iterrows():
-                pid   = str(r.get(c_pid,"")).strip()
-                if not pid: continue
-                tipo  = _norm_tipo_mov(r.get(c_tipo,""))
-                qtd   = _to_num(r.get(c_qtd))
-                cur   = id_stock.get(pid, 0.0)
-                if tipo == "entrada":
-                    id_stock[pid] = cur + qtd
-                elif tipo == "saida":
-                    id_stock[pid] = cur - qtd
-                elif tipo == "ajuste":
-                    id_stock[pid] = cur + qtd
-    except: pass
-
-    return dfp, cat_map, labels, id_nome, id_custo, id_stock, col_id, col_nome, col_preco, col_unid, id_img, id_emin
-
-dfp, cat_map, labels, id_nome, id_custo, id_stock, col_id, col_nome_col, col_preco_col, col_unid_col, id_img, id_emin = _build_catalogo()
-
-
-# ──────────────────────────────────────────────
-#  IMAGEM
-# ──────────────────────────────────────────────
-def _resolve_img(raw):
-    if not isinstance(raw, str) or not raw.strip(): return None
-    v = raw.strip()
-    if v.lower().startswith(("http://","https://")):
-        if "drive.google.com" in v:
-            m = re.search(r"/file/d/([^/]+)/view", v) or re.search(r"[?&]id=([^&]+)", v)
-            return f"https://drive.google.com/uc?export=view&id={m.group(1)}" if m else v
-        return v
-    m = re.fullmatch(r"[A-Za-z0-9_-]{20,}", v)
-    return f"https://drive.google.com/uc?export=view&id={v}" if m else None
-
-
-# ──────────────────────────────────────────────
-#  SESSION STATE
-# ──────────────────────────────────────────────
-_ss = st.session_state
-for k, d in [("cart",[]),("forma","Dinheiro"),("obs",""),("data_venda",date.today()),
-              ("desc",0.0),("cliente",""),("venc_fiado",date.today()+timedelta(days=30))]:
-    if k not in _ss: _ss[k] = d
-
-def _rerun():
-    st.rerun()
-
-
-# ──────────────────────────────────────────────
-#  HEADER
-# ──────────────────────────────────────────────
-n_cart = len(_ss["cart"])
-total_cart = sum(i["qtd"]*i["preco"] for i in _ss["cart"])
+# =========================
+# HEADER
+# =========================
+badge = (f'<span class="fiado-badge-warn">⚠️ {qtd_vencidos} vencido{"s" if qtd_vencidos!=1 else ""}</span>'
+         if qtd_vencidos > 0
+         else '<span class="fiado-badge-ok">✅ Tudo no prazo</span>')
 
 st.markdown(f"""
-<div class="page-header">
-  <div>
-    <h1>🧾 Vendas Rápidas</h1>
-    <div class="sub">Ebenezér Variedades · {datetime.now().strftime("%d/%m/%Y")}</div>
-  </div>
-  <div class="header-badge">🛒 {n_cart} {"item" if n_cart==1 else "itens"} · {_brl(total_cart)}</div>
+<div class="fiado-header">
+    <div>
+        <div class="fiado-header-title">💳 Fiado</div>
+        <div class="fiado-header-sub">Acompanhamento de {dt_ini.strftime('%d/%m/%Y')} a {dt_fim.strftime('%d/%m/%Y')}</div>
+    </div>
+    {badge}
 </div>
 """, unsafe_allow_html=True)
 
+# =========================
+# KPI CARDS
+# =========================
+c1, c2, c3, c4 = st.columns(4)
 
-# ──────────────────────────────────────────────
-#  LAYOUT PRINCIPAL
-# ──────────────────────────────────────────────
-col_esq, col_dir = st.columns([1.15, 1], gap="large")
+def kpi(icon, label, value, sub="", sub_class=""):
+    return f"""<div class="kpi-card">
+        <span class="kpi-icon">{icon}</span>
+        <div class="kpi-label">{label}</div>
+        <div class="kpi-value">{value}</div>
+        {'<div class="kpi-sub ' + sub_class + '">' + sub + '</div>' if sub else ''}
+    </div>"""
 
+with c1:
+    st.markdown(kpi("💰", "Total em aberto", _fmt_brl(total_aberto),
+                f"{qtd_clientes} cliente{'s' if qtd_clientes!=1 else ''}", "kpi-blue"), unsafe_allow_html=True)
+with c2:
+    st.markdown(kpi("✅", "Recebido no período", _fmt_brl(total_pago), "Pagamentos confirmados", "kpi-green"), unsafe_allow_html=True)
+with c3:
+    cor = "kpi-red" if qtd_vencidos > 0 else "kpi-green"
+    sub = _fmt_brl(valor_vencido) + " em atraso" if qtd_vencidos > 0 else "Tudo no prazo"
+    st.markdown(kpi("⚠️", "Vencidos", str(qtd_vencidos), sub, cor), unsafe_allow_html=True)
+with c4:
+    # próximo vencimento
+    proximos = base[base["AtrasoDias"] == 0].sort_values("Venc_d")
+    if not proximos.empty and proximos["Venc_d"].notna().any():
+        prox_venc = proximos["Venc_d"].dropna().iloc[0]
+        dias_prox = (prox_venc - hoje).days
+        prox_txt  = prox_venc.strftime("%d/%m")
+        prox_sub  = f"daqui {dias_prox} dia{'s' if dias_prox!=1 else ''}" if dias_prox > 0 else "hoje"
+        st.markdown(kpi("📅", "Próximo vencimento", prox_txt, prox_sub, "kpi-amber"), unsafe_allow_html=True)
+    else:
+        st.markdown(kpi("📅", "Próximo vencimento", "—", "Sem datas futuras", ""), unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════
-#  COLUNA ESQUERDA — Adicionar produto + Carrinho
-# ═══════════════════════════════════════════════
-with col_esq:
-    st.markdown('<div class="sec-titulo">🔍 Adicionar produto</div>', unsafe_allow_html=True)
+st.markdown("<br>", unsafe_allow_html=True)
 
-    # Data
-    _ss["data_venda"] = st.date_input("Data da venda", value=_ss["data_venda"])
+# =========================
+# QUEM ESTÁ DEVENDO (cards por cliente)
+# =========================
+st.markdown('<div class="secao">👥 Quem está com fiado em aberto</div>', unsafe_allow_html=True)
 
-    # Selectbox de produto
-    sel = st.selectbox("Produto", labels, index=0, label_visibility="collapsed",
-                       placeholder="Buscar produto...")
+if not base.empty:
+    por_cliente = (base.groupby("Cliente", as_index=False)
+                   .agg(Total=("ValorNum","sum"), MaxAtraso=("AtrasoDias","max"), Qtd=("ID","count"))
+                   .sort_values("Total", ascending=False))
 
-    # ── Preview do produto selecionado ──
-    if sel != "(selecione)":
-        info  = cat_map[sel]
-        pid_s = str(info[col_id])
-        foto_raw = info.get("Foto") or info.get("Imagem") or info.get("FotoURL") or ""
-        img_url  = _resolve_img(str(foto_raw or ""))
-        est_s    = id_stock.get(pid_s, 0.0)
-        emin_s   = id_emin.get(pid_s, 0.0)
-        preco_s  = _to_num(info.get(col_preco_col)) if col_preco_col else 0.0
+    for _, row in por_cliente.iterrows():
+        nome     = str(row["Cliente"]).strip().title()
+        total    = row["Total"]
+        atraso   = int(row["MaxAtraso"])
+        qtd      = int(row["Qtd"])
+        vencido  = atraso > 0
 
-        est_class = "est-ok" if est_s > emin_s else ("est-low" if est_s > 0 else "est-neg")
-        est_icon  = "✅" if est_s > emin_s else ("⚠️" if est_s > 0 else "❌")
-
-        if img_url:
-            foto_tag = f'<img src="{img_url}" onerror="this.style.display=\'none\'">'
+        if vencido:
+            tag = f'<span class="tag tag-vencido">⚠️ {atraso}d atraso</span>'
+            card_class = "devedor-card vencido"
         else:
-            foto_tag = '<div class="prod-preview-ph">📦</div>'
+            tag = '<span class="tag tag-ok">✅ No prazo</span>'
+            card_class = "devedor-card"
 
         st.markdown(f"""
-        <div class="prod-preview">
-          {foto_tag}
-          <div class="prod-preview-info">
-            <div class="nome">{sel}</div>
-            <div class="preco">{_brl(preco_s)}</div>
-            <div class="est {est_class}">{est_icon} Estoque: {int(est_s) if float(est_s).is_integer() else est_s}</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Qtd + Preço + Botão
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            qtd_add = st.number_input("Quantidade", min_value=1, step=1, value=1, key=f"qtd_add_{pid_s}")
-        with c2:
-            preco_add = st.number_input("Preço unit. (R$)", min_value=0.0,
-                                        value=float(preco_s), step=0.10, format="%.2f", key=f"preco_add_{pid_s}")
-
-        if st.button("➕  Adicionar ao carrinho", type="primary", use_container_width=True):
-            _ss["cart"].append({
-                "id":    pid_s,
-                "nome":  str(info.get(col_nome_col, sel)),
-                "unid":  str(info.get(col_unid_col, "un") or "un"),
-                "foto":  str(foto_raw or ""),
-                "qtd":   int(qtd_add),
-                "preco": float(preco_add),
-            })
-            st.success(f"✅ {sel} adicionado!")
-            _rerun()
-    else:
-        st.markdown("""
-        <div style="background:rgba(255,255,255,0.03);border:1px dashed rgba(255,255,255,0.12);
-        border-radius:16px;padding:32px;text-align:center;color:rgba(255,255,255,0.3);font-size:0.9rem">
-          👆 Selecione um produto acima
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ── Carrinho ──
-    st.markdown('<div class="sec-titulo">🛒 Carrinho</div>', unsafe_allow_html=True)
-
-    if not _ss["cart"]:
-        st.markdown("""
-        <div style="background:rgba(255,255,255,0.03);border:1px dashed rgba(255,255,255,0.1);
-        border-radius:14px;padding:28px;text-align:center;color:rgba(255,255,255,0.3);font-size:0.88rem">
-          Carrinho vazio — adicione produtos acima
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        for idx, it in enumerate(_ss["cart"]):
-            img_c = _resolve_img(it.get("foto",""))
-            if img_c:
-                foto_tag = f'<img src="{img_c}" class="cart-img" onerror="this.style.display=\'none\'">'
-            else:
-                foto_tag = '<div class="cart-img-ph">📦</div>'
-
-            subtotal = it["qtd"] * it["preco"]
-            st.markdown(f"""
-            <div class="cart-card">
-              {foto_tag}
-              <div style="flex:1;min-width:0">
-                <div class="cart-nome">{it['nome']}</div>
-                <div class="cart-sub">x{it['qtd']} · {_brl(it['preco'])} = <b style="color:#4ade80">{_brl(subtotal)}</b></div>
-              </div>
+        <div class="{card_class}">
+            <div>
+                <div class="devedor-nome">{nome}{tag}</div>
+                <div class="devedor-info">{qtd} lançamento{"s" if qtd!=1 else ""}</div>
             </div>
-            """, unsafe_allow_html=True)
-
-            ci1, ci2, ci3, ci4 = st.columns([1.2, 1.4, 0.6, 0.6])
-            with ci1:
-                _ss["cart"][idx]["qtd"] = st.number_input(
-                    "Qtd", key=f"q_{idx}", min_value=1, step=1,
-                    value=int(it["qtd"]), label_visibility="collapsed")
-            with ci2:
-                _ss["cart"][idx]["preco"] = st.number_input(
-                    "Preço", key=f"p_{idx}", min_value=0.0, step=0.10,
-                    value=float(it["preco"]), format="%.2f", label_visibility="collapsed")
-            with ci3:
-                st.caption(f"Est: {int(id_stock.get(it['id'],0))}")
-            with ci4:
-                if st.button("🗑️", key=f"rm_{idx}"):
-                    _ss["cart"].pop(idx); _rerun()
-
-
-# ═══════════════════════════════════════════════
-#  COLUNA DIREITA — Pagamento + Totais + Registrar
-# ═══════════════════════════════════════════════
-with col_dir:
-    st.markdown('<div class="sec-titulo">💳 Pagamento</div>', unsafe_allow_html=True)
-
-    formas = ["Dinheiro","Pix","Cartão Débito","Cartão Crédito","Fiado","Outros"]
-    idx_f  = formas.index(_ss["forma"]) if _ss["forma"] in formas else 0
-    _ss["forma"] = st.radio("Forma de pagamento", formas, index=idx_f, horizontal=True,
-                             label_visibility="collapsed")
-
-    # Cliente
-    clientes_list = _carregar_clientes()
-    if _ss["forma"] == "Fiado":
-        st.markdown("**👤 Cliente** *(obrigatório para fiado)*")
-        sel_cli = st.selectbox("Cliente cadastrado", ["(selecione)"] + clientes_list,
-                               index=0, key="sel_cli_fiado")
-        novo_cli = st.text_input("Ou cadastrar novo", key="novo_cli_fiado")
-        escolhido = (novo_cli.strip() or (sel_cli if sel_cli != "(selecione)" else "")).strip()
-        _ss["venc_fiado"] = st.date_input("Vencimento do fiado", value=_ss["venc_fiado"])
-    else:
-        sel_cli  = st.selectbox("Cliente (opcional)", ["(sem cliente)"] + clientes_list,
-                                index=0, key="sel_cli_opt")
-        novo_cli = st.text_input("Ou cadastrar novo", key="novo_cli_opt")
-        escolhido = (novo_cli.strip() or (sel_cli if sel_cli != "(sem cliente)" else "")).strip()
-    _ss["cliente"] = _norm_cli(escolhido)
-
-    _ss["obs"]  = st.text_input("Observações", value=_ss["obs"], placeholder="Opcional...")
-    _ss["desc"] = st.number_input("Desconto (R$)", min_value=0.0,
-                                   value=float(_ss["desc"]), step=0.5, format="%.2f")
-
-    # ── Totalizador visual ──
-    total_bruto = sum(i["qtd"]*i["preco"] for i in _ss["cart"])
-    total_liq   = max(0.0, total_bruto - float(_ss["desc"]))
-    n_itens     = sum(i["qtd"] for i in _ss["cart"])
-
-    _label_itens = "item" if n_itens == 1 else "itens"
-    _desc_txt    = f"· Desconto {_brl(_ss['desc'])}" if _ss["desc"] > 0 else ""
-    _forma_val   = _ss["forma"]
-    if _forma_val == "Dinheiro":   _forma_emoji = "💸"
-    elif _forma_val == "Pix":      _forma_emoji = "📱"
-    elif "Cart" in _forma_val:     _forma_emoji = "💳"
-    elif _forma_val == "Fiado":    _forma_emoji = "📒"
-    else:                          _forma_emoji = "💰"
-
-    st.markdown(f"""
-    <div class="total-box" style="margin-top:16px">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end">
-        <div>
-          <div class="total-label">Total a receber</div>
-          <div class="total-val">{_brl(total_liq)}</div>
-          <div class="total-sub">{n_itens} {_label_itens} {_desc_txt}</div>
+            <div class="devedor-valor {'ok' if not vencido else ''}">{_fmt_brl(total)}</div>
         </div>
-        <div style="text-align:right">
-          <div style="font-size:1.8rem">{_forma_emoji}</div>
-          <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);margin-top:4px">{_forma_val}</div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+else:
+    st.info("Nenhum fiado em aberto no período.")
 
-    st.markdown("<br>", unsafe_allow_html=True)
+st.markdown("<br>", unsafe_allow_html=True)
 
-    col_btn1, col_btn2 = st.columns([1.6, 1])
-    btn_registrar = col_btn1.button("🧾  Registrar venda", type="primary", use_container_width=True)
-    btn_limpar    = col_btn2.button("🧹  Limpar", use_container_width=True)
+# =========================
+# GRÁFICO: Por faixa de atraso
+# =========================
+if not base.empty:
+    st.markdown('<div class="secao">📊 Situação dos valores em aberto</div>', unsafe_allow_html=True)
 
-    if btn_limpar:
-        _ss["cart"] = []; st.info("Carrinho limpo."); _rerun()
+    def bucket(dias):
+        if dias <= 0: return "No prazo"
+        if dias <= 7: return "1–7 dias"
+        if dias <= 30: return "8–30 dias"
+        if dias <= 60: return "31–60 dias"
+        return "Mais de 60 dias"
 
-    # ── Registrar venda ──
-    if btn_registrar:
-        if not _ss["cart"]:
-            st.warning("Carrinho vazio.")
-        elif _ss["forma"] == "Fiado" and not _ss["cliente"].strip():
-            st.error("Informe o cliente para registrar fiado.")
-        else:
-            cli_nome = _ss["cliente"].strip()
-            if cli_nome: _ensure_cliente(cli_nome)
+    base["Faixa"] = base["AtrasoDias"].apply(bucket)
+    aging = base.groupby("Faixa", as_index=False)["ValorNum"].sum().rename(columns={"ValorNum":"Valor"})
+    ordem = ["No prazo","1–7 dias","8–30 dias","31–60 dias","Mais de 60 dias"]
+    aging["Faixa"] = pd.Categorical(aging["Faixa"], categories=ordem, ordered=True)
+    aging = aging.sort_values("Faixa")
 
-            sh = conectar_sheets()
-            try: ws_v = sh.worksheet(ABA_VEND)
-            except:
-                ws_v = sh.add_worksheet(title=ABA_VEND, rows=2000, cols=20)
-                ws_v.update("A1:K1",[["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha",
-                                       "FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"]])
+    cor_map = {
+        "No prazo":        "#4ade80",
+        "1–7 dias":        "#fbbf24",
+        "8–30 dias":       "#fb923c",
+        "31–60 dias":      "#f87171",
+        "Mais de 60 dias": "#dc2626",
+    }
 
-            ws_v = garantir_aba(ABA_VEND)
+    figA = px.bar(
+        aging, x="Faixa", y="Valor",
+        text=aging["Valor"].apply(_fmt_brl),
+        color="Faixa",
+        color_discrete_map=cor_map,
+        template="plotly_dark",
+    )
+    figA.update_traces(textposition="outside", marker_line_width=0)
+    figA.update_layout(
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font_color="rgba(255,255,255,0.7)",
+        font_family="DM Sans",
+        yaxis=dict(title=None, showgrid=True, gridcolor="rgba(255,255,255,0.06)"),
+        xaxis=dict(title=None),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=280,
+    )
+    st.plotly_chart(figA, use_container_width=True)
 
-            try: ws_m = sh.worksheet(ABA_MOVS)
-            except: ws_m = _garantir_aba(sh, ABA_MOVS,
-                ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"])
+# =========================
+# GRÁFICO: Recebimentos por forma de pagamento
+# =========================
+if not pagt_periodo.empty:
+    st.markdown('<div class="secao">💳 Como os pagamentos foram feitos</div>', unsafe_allow_html=True)
 
-            venda_id  = "V-" + datetime.now().strftime("%Y%m%d%H%M%S")
-            data_str  = _ss["data_venda"].strftime("%d/%m/%Y")
-            desconto  = float(_ss["desc"])
-            tot_cupom = max(0.0, total_bruto - desconto)
+    dist = (pagt_periodo.groupby("Forma", as_index=False)["TotalPagoNum"]
+            .sum().rename(columns={"TotalPagoNum":"Pago"})
+            .sort_values("Pago", ascending=False))
 
-            # Fiado
-            fiado_id = ""; fiado_msg = ""
-            if _ss["forma"] == "Fiado":
-                ws_f   = _garantir_aba(sh, ABA_FIADO, COLS_FIADO)
-                fiado_id = _gerar_id("F")
-                venc_s = _ss["venc_fiado"].strftime("%d/%m/%Y") if isinstance(_ss["venc_fiado"], date) else ""
-                _append_rows(ws_f, [{"ID":fiado_id,"Data":data_str,"Cliente":cli_nome,
-                    "Valor":float(tot_cupom),"Vencimento":venc_s,"Status":"Em aberto",
-                    "Obs":_ss.get("obs",""),"DataPagamento":"","FormaPagamento":"","ValorPago":""}])
-                fiado_msg = f"\n💳 <b>Fiado</b> — <b>{cli_nome}</b> · venc: {venc_s}"
+    col1, col2 = st.columns([1.3, 1])
+    with col1:
+        figP = px.bar(dist, x="Forma", y="Pago",
+                      text=dist["Pago"].apply(_fmt_brl),
+                      color="Forma",
+                      color_discrete_sequence=PALETTE,
+                      template="plotly_dark")
+        figP.update_traces(textposition="outside", marker_line_width=0, showlegend=False)
+        figP.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font_color="rgba(255,255,255,0.7)", font_family="DM Sans",
+            yaxis=dict(title=None, showgrid=True, gridcolor="rgba(255,255,255,0.06)"),
+            xaxis=dict(title=None), showlegend=False,
+            margin=dict(l=0, r=0, t=10, b=0), height=260,
+        )
+        st.plotly_chart(figP, use_container_width=True)
+    with col2:
+        figPie = px.pie(dist, names="Forma", values="Pago",
+                        color="Forma", color_discrete_sequence=PALETTE,
+                        hole=0.45)
+        figPie.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font_color="rgba(255,255,255,0.7)", font_family="DM Sans",
+            showlegend=True, margin=dict(l=0, r=0, t=10, b=0), height=260,
+            legend=dict(orientation="v", font_size=12),
+        )
+        figPie.update_traces(textinfo="percent", textfont_size=13)
+        st.plotly_chart(figPie, use_container_width=True)
 
-            novas = []; movs = []
-            sba   = {}   # stock before/after
-            lucro = 0.0
-
-            for it in _ss["cart"]:
-                pid  = str(it["id"])
-                qtd  = int(it["qtd"])
-                pru  = float(it["preco"])
-                sub  = qtd * pru
-                lucro += qtd * (pru - id_custo.get(pid, 0.0))
-                bef = id_stock.get(pid, 0.0)
-                aft = bef - qtd
-                sba[pid] = (bef, aft)
-                id_stock[pid] = aft
-
-                novas.append({"Data":data_str,"VendaID":venda_id,"IDProduto":pid,
-                    "Qtd":str(qtd),"PrecoUnit":f"{pru:.2f}".replace(".",","),
-                    "TotalLinha":f"{sub:.2f}".replace(".",","),"FormaPagto":_ss["forma"],
-                    "Obs":_ss["obs"],"Desconto":f"{desconto:.2f}".replace(".",","),
-                    "TotalCupom":f"{tot_cupom:.2f}".replace(".",","),
-                    "CupomStatus":"OK","Cliente":cli_nome,"FiadoID":fiado_id})
-
-                movs.append({"Data":data_str,"IDProduto":pid,"Produto":id_nome.get(pid,pid),
-                    "Tipo":"B saída","Qtd":str(qtd),"Obs":_ss.get("obs",""),
-                    "ID":venda_id,"Documento/NF":"","Origem":"Vendas rápidas",
-                    "SaldoApós":str(int(aft))})
-
-            append_rows(ws_v, novas)
-            append_rows(ws_m, movs)
-
-            # Telegram
-            media_tg = []
-            for it in _ss["cart"][:10]:
-                pid  = str(it["id"])
-                foto = id_img.get(pid,"") or it.get("foto","")
-                if not foto: continue
-                bef, aft = sba.get(pid,("–","–"))
-                cap = f"{id_nome.get(pid,pid)}\nx{it['qtd']} @ R$ {it['preco']:.2f} = <b>R$ {it['qtd']*it['preco']:.2f}</b>\nEstoque: {int(bef) if bef!='–' else '–'} → <b>{int(aft) if aft!='–' else '–'}</b>"
-                media_tg.append({"type":"photo","media":foto,"caption":cap.replace(".",","),"parse_mode":"HTML"})
-            if media_tg: _tg_media(media_tg)
-
-            itens_txt = "\n".join(
-                f"• <b>{id_nome.get(str(x['IDProduto']),str(x['IDProduto']))}</b> — x{x['Qtd']} @ {_brl(_to_num(x['PrecoUnit']))} = <b>{_brl(_to_num(x['Qtd'])*_to_num(x['PrecoUnit']))}</b>"
-                for x in novas)
-            _tg_send(
-                f"🧾 <b>Venda registrada</b>\n{data_str}\nForma: <b>{_ss['forma']}</b>"
-                + (f"\n👤 {cli_nome}" if cli_nome else "")
-                + f"\n{'─'*22}\n{itens_txt}\n{'─'*22}\n"
-                + (f"Desconto: {_brl(desconto)}\n" if desconto > 0 else "")
-                + f"Total: <b>{_brl(tot_cupom)}</b>"
-                + (f"\n💰 Lucro est.: <b>{_brl(lucro)}</b>" if id_custo else "")
-                + fiado_msg)
-
-            _ss["cart"] = []
-            st.cache_data.clear()
-            st.success(f"✅ Venda registrada! Total: {_brl(tot_cupom)}")
-            _rerun()
-
-    # ── Histórico ──
-    st.markdown('<div class="sec-titulo">📜 Últimas vendas</div>', unsafe_allow_html=True)
-
-    try: vend = carregar_aba(ABA_VEND)
-    except: vend = pd.DataFrame()
-
-    if vend.empty:
-        st.info("Nenhuma venda ainda.")
-    else:
-        cv_data  = _first_col(vend, ["Data"])
-        cv_idp   = _first_col(vend, ["IDProduto","ProdutoID","ID"])
-        cv_qtd   = _first_col(vend, ["Qtd","Quantidade"])
-        cv_preco = _first_col(vend, ["PrecoUnit","PreçoUnitário","Preço","Preco"])
-        cv_vid   = _first_col(vend, ["VendaID","Pedido","Cupom"])
-        cv_forma = _first_col(vend, ["FormaPagto","FormaPagamento","Pagamento","Forma"])
-        cv_cli   = _first_col(vend, ["Cliente"])
-
-        vend["_bruto"] = vend.apply(lambda r:
-            _to_num(r.get("TotalLinha")) if "TotalLinha" in vend.columns
-            else (_to_num(r.get(cv_qtd))*_to_num(r.get(cv_preco)) if cv_qtd and cv_preco else 0.0), axis=1)
-        vend["_desc"]  = vend["Desconto"].map(_to_num)  if "Desconto"  in vend.columns else 0.0
-        vend["_total"] = vend["TotalCupom"].map(_to_num) if "TotalCupom" in vend.columns else vend["_bruto"]
-
-        agg_cols = {cv_data:"first","_bruto":"sum","_desc":"max","_total":"max"}
-        if cv_forma: agg_cols[cv_forma] = "first"
-        if cv_cli:   agg_cols[cv_cli]   = "first"
-        if "Obs" in vend.columns: agg_cols["Obs"] = "first"
-
-        grp = vend.groupby(cv_vid, dropna=False).agg(agg_cols).reset_index()
-        grp.rename(columns={cv_vid:"VendaID", cv_data:"Data"}, inplace=True)
-        if cv_forma: grp.rename(columns={cv_forma:"Forma"}, inplace=True)
-        if cv_cli:   grp.rename(columns={cv_cli:"Cliente"}, inplace=True)
-
-        try: grp["_ord"] = pd.to_datetime(grp["Data"], format="%d/%m/%Y", errors="coerce")
-        except: grp["_ord"] = pd.NaT
-        grp = grp.sort_values(["_ord","VendaID"], ascending=[False,False]).head(10).reset_index(drop=True)
-
-        for i, row in grp.iterrows():
-            vid       = str(row["VendaID"])
-            forma     = str(row.get("Forma","")) if "Forma" in row else "—"
-            cli_h     = str(row.get("Cliente","")) if "Cliente" in row else ""
-            total_h   = row["_total"] if row["_total"] > 0 else (row["_bruto"] - row["_desc"])
-            cancelado = vid.startswith("CN-") or str(row.get("Obs","")).upper().startswith("ESTORNO")
-
-            forma_class = "fiado" if forma=="Fiado" else ("estorno-badge" if cancelado else "")
-            forma_icon  = "📒" if forma=="Fiado" else ("⛔" if cancelado else "")
-
-            st.markdown(f"""
-            <div class="hist-card {"estorno" if cancelado else ""}">
-              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-                <div>
-                  <div class="hist-data">{row['Data']}</div>
-                  <div class="hist-id">{vid[:22]}{"…" if len(vid)>22 else ""}</div>
-                  {f'<div style="font-size:0.75rem;color:rgba(255,255,255,0.4);margin-top:2px">👤 {cli_h}</div>' if cli_h else ""}
-                </div>
-                <div style="text-align:right">
-                  <div class="hist-valor">{"⛔ " if cancelado else ""}{_brl(total_h)}</div>
-                  <div style="margin-top:4px"><span class="hist-forma {forma_class}">{forma_icon} {forma}</span></div>
-                </div>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            # Botões duplicar / cancelar
-            def _load_cart(vid=vid):
-                linhas = vend[vend[cv_vid]==vid].copy()
-                cart = []
-                for _, r in linhas.iterrows():
-                    pid = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID",""))
-                    cart.append({"id":pid,"nome":id_nome.get(pid,""),"unid":"un",
-                                 "foto":id_img.get(pid,""),
-                                 "qtd":int(_to_num(r[cv_qtd])) if cv_qtd else 1,
-                                 "preco":float(_to_num(r[cv_preco])) if cv_preco else 0.0})
-                _ss["cart"]       = cart
-                _ss["forma"]      = str(row.get("Forma","Dinheiro"))
-                _ss["obs"]        = ""
-                _ss["data_venda"] = date.today()
-                _ss["desc"]       = float(row["_desc"]) if pd.notna(row["_desc"]) else 0.0
-
-            def _cancelar(vid=vid):
-                if vid.startswith("CN-"): st.warning("Já é estorno."); return
-                if any(str(x).startswith(f"CN-{vid}") for x in vend[cv_vid].unique()):
-                    st.warning("Estorno já lançado."); return
-                linhas = vend[vend[cv_vid]==vid].copy()
-                if linhas.empty: st.warning("Cupom não encontrado."); return
-                sh2 = conectar_sheets()
-                ws2 = sh2.worksheet(ABA_VEND)
-                dfv2 = get_as_dataframe(ws2, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
-                dfv2.columns = [c.strip() for c in dfv2.columns]
-                for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
-                    if c not in dfv2.columns: dfv2[c] = None
-                cn = f"CN-{vid}"; ds2 = date.today().strftime("%d/%m/%Y"); novas2 = []; tot_est = 0.0
-                for _, r in linhas.iterrows():
-                    pid  = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID",""))
-                    qtd2 = -abs(_to_num(r[cv_qtd])) if cv_qtd else -1
-                    pru2 = _to_num(r[cv_preco]) if cv_preco else 0.0
-                    tot_est += qtd2 * pru2
-                    novas2.append({"Data":ds2,"VendaID":cn,"IDProduto":pid,
-                        "Qtd":str(int(qtd2)),"PrecoUnit":f"{pru2:.2f}".replace(".",","),
-                        "TotalLinha":f"{qtd2*pru2:.2f}".replace(".",","),
-                        "FormaPagto":f"Estorno - {forma}","Obs":f"ESTORNO DE {vid}",
-                        "Desconto":"0,00","TotalCupom":"0,00","CupomStatus":"ESTORNO",
-                        "Cliente":str(r.get("Cliente","")),"FiadoID":""})
-                append_rows(ws2, novas2)
-                try: ws_m2 = sh2.worksheet(ABA_MOVS)
-                except: ws_m2 = _garantir_aba(sh2, ABA_MOVS,
-                    ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"])
-                movs2 = []
-                for _, r in linhas.iterrows():
-                    pid  = str(r.get("IDProduto") or r.get("ProdutoID") or r.get("ID",""))
-                    qtd2 = int(abs(_to_num(r[cv_qtd]))) if cv_qtd else 1
-                    bef2 = id_stock.get(pid, 0.0); aft2 = bef2 + qtd2
-                    id_stock[pid] = aft2
-                    movs2.append({"Data":ds2,"IDProduto":pid,"Produto":id_nome.get(pid,pid),
-                        "Tipo":"B entrada","Qtd":str(qtd2),"Obs":f"ESTORNO DE {vid}",
-                        "ID":cn,"Documento/NF":"","Origem":"Vendas rápidas","SaldoApós":str(int(aft2))})
-                _append_rows(ws_m2, movs2)
-                _tg_send(f"⛔ <b>Estorno lançado</b>\n{ds2}\n{_brl(abs(tot_est))}\nCupom: {vid}")
-                st.cache_data.clear(); st.success("Estorno lançado."); _rerun()
-
-            cb1, cb2 = st.columns([1, 1])
-            cb1.button("🔁 Duplicar", key=f"dup_{i}", on_click=_load_cart, use_container_width=True)
-            cb2.button("⛔ Cancelar", key=f"cn_{i}", disabled=cancelado,
-                       on_click=_cancelar, use_container_width=True)
+# =========================
+# PRÓXIMOS VENCIMENTOS (tabela limpa)
+# =========================
+prox_tabela = base[(base["AtrasoDias"] == 0) & (base["Venc_d"].notna())].sort_values("Venc_d").head(20)
+if not prox_tabela.empty:
+    st.markdown('<div class="secao">📅 Próximos vencimentos</div>', unsafe_allow_html=True)
+    df_show = prox_tabela[["Cliente","Valor","Vencimento","Obs"]].copy()
+    df_show["Cliente"] = df_show["Cliente"].str.title()
+    df_show["Valor"]   = prox_tabela["ValorNum"].apply(_fmt_brl)
+    df_show["Dias para vencer"] = prox_tabela["Venc_d"].apply(lambda d: f"{(d-hoje).days}d" if d else "—")
+    st.dataframe(df_show, use_container_width=True, hide_index=True)
