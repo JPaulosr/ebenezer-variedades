@@ -93,7 +93,7 @@ button[kind="primary"] { border-radius:12px !important; font-weight:700 !importa
 # ──────────────────────────────────────────────
 #  HELPERS SHEETS
 from utils.sheets import (
-    sheet as _sheet_obj, carregar_aba, garantir_aba, append_rows,
+    sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
     norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
@@ -102,9 +102,25 @@ _to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
 _first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
 _tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
 _gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
+
 def _canon_id(x):
     import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
-def conectar_sheets(): return _sheet_obj()
+def conectar_sheets(): return sheet()
+def _sheet(): return sheet()
+
+def _to_int(x):
+    if x is None or str(x).strip() == "": return ""
+    try: return int(float(str(x).strip().replace(",",".")))
+    except: return ""
+
+@st.cache_data(show_spinner=False)
+def _load_df(aba):
+    return carregar_aba(aba)
+
+def _safe_load(aba):
+    try: return _load_df(aba)
+    except: return pd.DataFrame()
 
 
 def _gen_id(): return "P-" + datetime.now().strftime("%Y%m%d%H%M%S")
