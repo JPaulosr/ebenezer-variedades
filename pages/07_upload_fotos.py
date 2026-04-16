@@ -1,9 +1,13 @@
 # pages/upload_fotos.py
 # -*- coding: utf-8 -*-
+import json, re, unicodedata as _ud
 from typing import Optional
 
 import streamlit as st
 import pandas as pd
+import gspread
+from gspread_dataframe import get_as_dataframe
+from google.oauth2.service_account import Credentials
 
 # >>> Cloudinary (SDK oficial, assinatura automática)
 import cloudinary
@@ -15,37 +19,28 @@ st.title("🖼️ Upload/URL de Foto para Produtos")
 
 # ======================================================================
 # Config / Conexão
-
+# ──────────────────────────────────────────────
+#  CONEXÃO / HELPERS  (centralizados em utils/sheets.py)
+# ──────────────────────────────────────────────
 from utils.sheets import (
     sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque,
-    tg_send, tg_media, gerar_id, parse_date,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-_norm_tipo = norm_tipo_mov
-conectar_sheets = sheet
-
+# Aliases de compatibilidade
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
 def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
-
-
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return sheet()
 
 ABA_PRODUTOS = "Produtos"  # nome da sua aba de catálogo
+
+def _sheet():
+    return sheet()
 
 def _headers(ws) -> list[str]:
     try:
