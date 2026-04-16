@@ -1,9 +1,13 @@
 # pages/05_Contagem_Estoque.py
 # -*- coding: utf-8 -*-
 
+import json, re, unicodedata as _ud
 from datetime import datetime
 import streamlit as st
 import pandas as pd
+import gspread
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from google.oauth2.service_account import Credentials
 
 # ──────────────────────────────────────────────
 #  CONFIG & TEMA
@@ -152,34 +156,98 @@ with st.container():
             st.page_link(path, label=label)
 
 
-
+# ──────────────────────────────────────────────
+#  HELPERS GOOGLE SHEETS
 from utils.sheets import (
     sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque,
-    tg_send, tg_media, gerar_id, parse_date,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-_norm_tipo = norm_tipo_mov
-conectar_sheets = sheet
-
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
 def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return sheet()
+def _sheet(): return sheet()
 
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _aba(nome):
+    ws = _sheet().worksheet(nome)
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
+    return df.fillna("")
+
+def _first_col(df, cands):
+    for c in cands:
+        if c in df.columns: return c
+    lower = {c.lower(): c for c in df.columns}
+    for c in cands:
+        if c.lower() in lower: return lower[c.lower()]
+    return None
+
+
+# ──────────────────────────────────────────────
+#  HELPERS NUMÉRICOS
+# ──────────────────────────────────────────────
+def _strip(s):
+    s = _ud.normalize("NFKD", str(s or ""))
+    return "".join(ch for ch in s if _ud.category(ch) != "Mn").lower().strip()
+
+def _to_num(x) -> float:
+    if x is None: return 0.0
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan","none"): return 0.0
+    neg = False
+    s = s.replace("−","-").replace("\u2212","-")
+    if s.startswith("(") and s.endswith(")"): s = s[1:-1]; neg = True
+    s = s.replace("R$","").replace(" ","")
+    if s.startswith("-"): neg = True; s = s[1:]
+    if "," in s and "." in s:
+        s = s.replace(".","").replace(",",".")
+    elif "," in s:
+        s = s.replace(",",".")
+    s = re.sub(r"[^0-9.]","",s)
+    if s.count(".") > 1:
+        p = s.split(".")
+        s = "".join(p[:-1]) + "." + p[-1]
+    try: v = float(s)
+    except: return 0.0
+    return -v if neg else v
+
+def _norm_tipo(t) -> str:
+    raw = str(t or ""); low = _strip(raw)
+    if "fracion" in low:
+        return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
+    lowc = re.sub(r"[^a-z]","",low)
+    if "contagem" in lowc or "inventario" in lowc: return "ajuste"
+    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
+    if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
+    if "ajuste"  in lowc: return "ajuste"
+    return "outro"
+
+def _nz(x):
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except: pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan","none") else s
+
+def _prod_key(pid, pnome):
+    p = _nz(pid)
+    return p if p else f"nm:{_strip(_nz(pnome))}"
+
+def _fmt_num(v):
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else f"{f:.2f}"
+    except:
+        return str(v)
 
 
 # ──────────────────────────────────────────────
@@ -270,7 +338,8 @@ def _salvar_config(chave: str, valor: str):
             nova = {c: "" for c in cur.columns}
             nova[col_p] = chave; nova[col_v] = valor
             cur = pd.concat([cur, pd.DataFrame([nova])], ignore_index=True)
-        append_rows(ws, [row])  # seguro: só acrescenta
+        ws.clear()
+        set_with_dataframe(ws, cur.fillna(""), include_index=False, include_column_header=True, resize=True)
         _ler_config.clear()
         _aba.clear()
     except Exception as e:
