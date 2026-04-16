@@ -443,345 +443,25 @@ st.markdown(f"""
 _tab_cnt, _tab_prec = st.tabs(["📦 Contagem de Estoque", "🏷️ Atualizar Preços"])
 
 with _tab_cnt:
-    pass  # conteúdo renderizado globalmente abaixo pelo Streamlit
-
-# ──────────────────────────────────────────────
-#  TELA A: SEM CICLO ATIVO
-# ──────────────────────────────────────────────
-if not ciclo_id and not ciclo_done:
-    st.markdown("""
-    <div style="background:rgba(96,165,250,0.08);border:1.5px solid rgba(96,165,250,0.25);
-    border-radius:18px;padding:36px;text-align:center;margin-top:10px">
-        <div style="font-size:3rem;margin-bottom:14px">📋</div>
-        <div style="font-family:Nunito;font-size:1.3rem;font-weight:800;color:#fff;margin-bottom:10px">
-            Nenhuma contagem em andamento
-        </div>
-        <div style="color:rgba(255,255,255,0.55);font-size:0.9rem;margin-bottom:24px;line-height:1.6">
-            Clique abaixo para começar.<br>
-            Você vai contar um produto de cada vez e o progresso fica salvo automaticamente.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("▶️ Iniciar contagem de estoque", type="primary", use_container_width=True):
-        novo = _iniciar_ciclo()
-        st.session_state["cnt_ciclo_id"]   = novo
-        st.session_state["cnt_contados"]   = set()
-        st.session_state["cnt_ciclo_done"] = False
-        st.cache_data.clear()
-        st.rerun()
-
-    if historico:
-        st.markdown('<div class="sec-titulo" style="margin-top:32px">📅 Histórico de contagens</div>', unsafe_allow_html=True)
-        for h in historico:
-            st.markdown(f"""
-            <div class="hist-card">
-              <div class="hist-icone">✅</div>
-              <div>
-                <div class="hist-data">Iniciada em {h.get('ciclo_id','?')}</div>
-                <div class="hist-detalhe">Concluída em {h.get('data_conclusao','?')} · {h.get('total','?')} produtos</div>
-              </div>
-              <div class="hist-badge">100% ✓</div>
+    # ──────────────────────────────────────────────
+    #  TELA A: SEM CICLO ATIVO
+    # ──────────────────────────────────────────────
+    if not ciclo_id and not ciclo_done:
+        st.markdown("""
+        <div style="background:rgba(96,165,250,0.08);border:1.5px solid rgba(96,165,250,0.25);
+        border-radius:18px;padding:36px;text-align:center;margin-top:10px">
+            <div style="font-size:3rem;margin-bottom:14px">📋</div>
+            <div style="font-family:Nunito;font-size:1.3rem;font-weight:800;color:#fff;margin-bottom:10px">
+                Nenhuma contagem em andamento
             </div>
-            """, unsafe_allow_html=True)
-    st.stop()
-
-
-# ──────────────────────────────────────────────
-#  TELA B: CICLO CONCLUÍDO
-# ──────────────────────────────────────────────
-if ciclo_done:
-    st.balloons()
-    st.markdown(f"""
-    <div class="ciclo-ok">
-      <h2>🎉 Contagem concluída!</h2>
-      <p>
-        Todos os <strong>{total} produtos</strong> foram verificados e o estoque está atualizado.<br>
-        A contagem foi registrada no histórico abaixo.<br><br>
-        Quando quiser fazer uma nova contagem, clique em <strong>"Iniciar nova contagem"</strong>.
-      </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if historico:
-        st.markdown('<div class="sec-titulo">📅 Histórico de contagens</div>', unsafe_allow_html=True)
-        for h in historico:
-            st.markdown(f"""
-            <div class="hist-card">
-              <div class="hist-icone">✅</div>
-              <div>
-                <div class="hist-data">Iniciada em {h.get('ciclo_id','?')}</div>
-                <div class="hist-detalhe">Concluída em {h.get('data_conclusao','?')} · {h.get('total','?')} produtos</div>
-              </div>
-              <div class="hist-badge">100% ✓</div>
+            <div style="color:rgba(255,255,255,0.55);font-size:0.9rem;margin-bottom:24px;line-height:1.6">
+                Clique abaixo para começar.<br>
+                Você vai contar um produto de cada vez e o progresso fica salvo automaticamente.
             </div>
-            """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("▶️ Iniciar nova contagem", type="primary", use_container_width=True):
-        novo = _iniciar_ciclo()
-        st.session_state["cnt_ciclo_id"]   = novo
-        st.session_state["cnt_contados"]   = set()
-        st.session_state["cnt_ciclo_done"] = False
-        st.cache_data.clear()
-        st.rerun()
-    st.stop()
-
-
-# ──────────────────────────────────────────────
-#  BARRA DE PROGRESSO
-# ──────────────────────────────────────────────
-st.markdown(f"""
-<div class="progresso-wrap">
-  <div class="prog-label">Progresso da contagem</div>
-  <div class="prog-bar-bg">
-    <div class="prog-bar-fill" style="width:{pct}%"></div>
-  </div>
-  <div class="prog-nums">
-    <span>✅ {contados_n} produtos contados</span>
-    <span>⏳ {total - contados_n} pendentes &nbsp;·&nbsp; {pct}%</span>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ──────────────────────────────────────────────
-#  LAYOUT PRINCIPAL
-# ──────────────────────────────────────────────
-col_left, col_right = st.columns([1.1, 1], gap="large")
-
-# ══════════════════════════════════
-#  ESQUERDA — Seleciona e conta
-# ══════════════════════════════════
-with col_left:
-    st.markdown('<div class="sec-titulo">🔍 Selecionar produto</div>', unsafe_allow_html=True)
-
-    busca = st.text_input("", placeholder="🔎  Digite o nome do produto...", label_visibility="collapsed")
-
-    df_filtrado = df_prod.copy()
-    if busca.strip():
-        b = _strip(busca)
-        df_filtrado = df_filtrado[df_filtrado["_nome"].apply(lambda x: b in _strip(x))]
-
-    if df_filtrado.empty:
-        st.warning("Nenhum produto encontrado.")
-        st.stop()
-
-    opts   = df_filtrado["__key"].tolist()
-    labels = {
-        r["__key"]: ("✅ " if r["__key"] in contados else "") + r["_nome"]
-        for _, r in df_filtrado.iterrows()
-    }
-
-    sel = st.session_state["prod_sel"]
-    idx = opts.index(sel) if sel in opts else 0
-
-    sel_key = st.selectbox(
-        "Produto", options=opts,
-        format_func=lambda k: labels.get(k, k),
-        index=idx, label_visibility="collapsed",
-    )
-    st.session_state["prod_sel"] = sel_key
-
-    row_p      = df_prod[df_prod["__key"] == sel_key].iloc[0]
-    prod_id    = _nz(row_p.get("_id",""))
-    prod_nome  = _nz(row_p.get("_nome",""))
-    prod_cat   = _nz(row_p.get("_cat",""))
-    prod_foto  = _nz(row_p.get("_foto",""))
-    est_atual  = estoque_atual(sel_key)
-    ja_contado = sel_key in contados
-
-    status_badge = (
-        '<span class="prod-badge-ok">✅ Já contado</span>' if ja_contado
-        else '<span class="prod-badge-pend">⏳ Pendente</span>'
-    )
-    if prod_foto and prod_foto.startswith("http"):
-        foto_html = f'<img src="{prod_foto}" class="prod-foto" onerror="this.style.display=\'none\'">'
-    else:
-        foto_html = '<div class="prod-foto-ph">📦</div>'
-
-    st.markdown(f"""
-    <div class="prod-card">
-      {foto_html}
-      <div style="flex:1">
-        <div class="prod-nome">{prod_nome}</div>
-        <div class="prod-cat">{prod_cat or "Sem categoria"}</div>
-        {status_badge}
-        <div class="est-item">
-          <div class="est-val">{_fmt_num(est_atual)}</div>
-          <div class="est-lab">Estoque no sistema</div>
         </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown('<div class="sec-titulo">✏️ Quantidade contada fisicamente</div>', unsafe_allow_html=True)
-
-    alvo = st.number_input(
-        "Quantas unidades você contou na prateleira?",
-        min_value=0.0, step=1.0,
-        value=max(0.0, float(est_atual)),
-        key=f"alvo_{sel_key}",
-    )
-    delta = alvo - est_atual
-
-    if delta > 0:
-        st.markdown(f'<div class="delta-plus">▲ Vai adicionar {delta:.0f} unidades ao estoque</div>', unsafe_allow_html=True)
-    elif delta < 0:
-        st.markdown(f'<div class="delta-minus">▼ Vai remover {abs(delta):.0f} unidades do estoque</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="delta-zero">— Estoque correto, nenhuma alteração necessária</div>', unsafe_allow_html=True)
-
-    responsavel = st.text_input("Responsável (opcional)", placeholder="Seu nome")
-
-    btn_salvar = st.button("💾  Salvar contagem", type="primary", use_container_width=True)
-
-    if btn_salvar:
-        data_str  = datetime.now().strftime("%d/%m/%Y")
-        resp_txt  = responsavel.strip() if responsavel.strip() else "—"
-        obs_final = f"Contagem por {resp_txt}"
-
-        try:
-            ws_mov = _sheet().worksheet("MovimentosEstoque")
-            hdrs   = ws_mov.row_values(1) or ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
-
-            # Só grava ajuste se houve diferença
-            if delta != 0:
-                qtd_str  = str(int(delta) if float(delta).is_integer() else delta).replace(".",",")
-                row_data = {
-                    "Data": data_str, "IDProduto": prod_id, "Produto": prod_nome,
-                    "Tipo": "Ajuste", "Qtd": qtd_str, "Obs": obs_final,
-                }
-                ws_mov.append_row([row_data.get(h,"") for h in hdrs], value_input_option="USER_ENTERED")
-
-            # Marca como contado e persiste
-            contados.add(sel_key)
-            st.session_state["cnt_contados"] = contados
-            _salvar_contados(contados)
-            st.cache_data.clear()
-
-            # Chegou a 100%?
-            if len(contados) >= total:
-                _concluir_ciclo(total, contados, ciclo_id)
-                st.session_state["cnt_ciclo_done"] = True
-                _, novo_hist, _, _ = _carregar_estado()
-                st.session_state["cnt_historico"] = novo_hist
-                st.balloons()
-                st.rerun()
-            else:
-                if delta != 0:
-                    sinal = "+" if delta > 0 else ""
-                    st.success(f"✅ Salvo! Ajuste de {sinal}{_fmt_num(delta)} → estoque: {_fmt_num(alvo)}")
-                else:
-                    st.success(f"✅ Contagem registrada! Estoque confirmado: {_fmt_num(alvo)}")
-                st.rerun()
-
-        except Exception as e:
-            st.error("Falha ao salvar.")
-            st.code(str(e))
-
-
-# ══════════════════════════════════
-#  DIREITA — Painel visual
-# ══════════════════════════════════
-with col_right:
-    st.markdown('<div class="sec-titulo">📋 Painel da contagem</div>', unsafe_allow_html=True)
-
-    filtro = st.radio(
-        "Mostrar", ["Todos", "✅ Contados", "⏳ Pendentes"],
-        horizontal=True, label_visibility="collapsed",
-    )
-
-    df_audit = df_prod.copy()
-    if busca.strip():
-        b = _strip(busca)
-        df_audit = df_audit[df_audit["_nome"].apply(lambda x: b in _strip(x))]
-    if filtro == "✅ Contados":
-        df_audit = df_audit[df_audit["__key"].isin(contados)]
-    elif filtro == "⏳ Pendentes":
-        df_audit = df_audit[~df_audit["__key"].isin(contados)]
-
-    k1, k2, k3 = st.columns(3)
-    for col_k, val, label, cor in [
-        (k1, contados_n,           "Contados",  "#4ade80"),
-        (k2, total - contados_n,   "Pendentes", "#fbbf24"),
-        (k3, f"{pct}%",            "Progresso", "#60a5fa"),
-    ]:
-        with col_k:
-            st.markdown(f"""
-            <div style="background:rgba(255,255,255,0.05);border-radius:12px;padding:12px;
-            text-align:center;border:1px solid rgba(255,255,255,0.08)">
-              <div style="font-family:Nunito;font-size:1.4rem;font-weight:800;color:{cor}">{val}</div>
-              <div style="font-size:0.7rem;color:rgba(255,255,255,0.4);text-transform:uppercase">{label}</div>
-            </div>""", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    if df_audit.empty:
-        st.info("Nenhum produto neste filtro.")
-    else:
-        for i in range(0, len(df_audit), 3):
-            chunk = df_audit.iloc[i:i+3]
-            cols3 = st.columns(3)
-            for ci, (_, prod_row) in zip(cols3, chunk.iterrows()):
-                with ci:
-                    chave   = prod_row["__key"]
-                    nome_p  = prod_row["_nome"]
-                    foto_p  = prod_row["_foto"]
-                    est_p   = estoque_atual(chave)
-                    is_done = chave in contados
-
-                    borda = "rgba(74,222,128,0.4)" if is_done else "rgba(255,255,255,0.08)"
-                    bg    = "rgba(74,222,128,0.05)" if is_done else "rgba(255,255,255,0.03)"
-                    check = "✅ " if is_done else ""
-
-                    if foto_p and foto_p.startswith("http"):
-                        foto_tag = f'<img src="{foto_p}" style="width:100%;height:60px;object-fit:contain;border-radius:8px;background:rgba(255,255,255,0.06);margin-bottom:6px" onerror="this.style.display=\'none\'">'
-                    else:
-                        foto_tag = '<div style="width:100%;height:60px;border-radius:8px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:1.4rem;margin-bottom:6px">📦</div>'
-
-                    st.markdown(f"""
-                    <div style="background:{bg};border:1px solid {borda};border-radius:12px;padding:10px;margin-bottom:4px">
-                      {foto_tag}
-                      <div style="font-size:0.72rem;font-weight:700;color:rgba(255,255,255,0.85);line-height:1.3">{check}{nome_p}</div>
-                      <div style="font-size:0.65rem;color:rgba(255,255,255,0.35);margin-top:3px">Sistema: {_fmt_num(est_p)}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    if st.button("Selecionar", key=f"sel_{chave}", use_container_width=True):
-                        st.session_state["prod_sel"] = chave
-                        st.rerun()
-
-    if historico:
+        """, unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="sec-titulo">📅 Contagens anteriores</div>', unsafe_allow_html=True)
-        for h in historico:
-            st.markdown(f"""
-            <div class="hist-card">
-              <div class="hist-icone">📋</div>
-              <div>
-                <div class="hist-data">Iniciada em {h.get('ciclo_id','?')}</div>
-                <div class="hist-detalhe">Concluída em {h.get('data_conclusao','?')} · {h.get('total','?')} produtos</div>
-              </div>
-              <div class="hist-badge">100% ✓</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    col_r1, col_r2 = st.columns(2)
-    with col_r1:
-        if st.button("🔄 Recarregar progresso", use_container_width=True,
-                     help="Busca o progresso salvo na planilha — útil se outra pessoa está contando junto"):
-            c2, h2, cid2, done2 = _carregar_estado()
-            st.session_state["cnt_contados"]   = c2
-            st.session_state["cnt_historico"]  = h2
-            st.session_state["cnt_ciclo_id"]   = cid2
-            st.session_state["cnt_ciclo_done"] = done2
-            st.cache_data.clear()
-            st.rerun()
-    with col_r2:
-        if st.button("🆕 Iniciar nova contagem", use_container_width=True,
-                     help="Zera o progresso e começa do zero. Use só quando quiser fazer uma nova contagem."):
+        if st.button("▶️ Iniciar contagem de estoque", type="primary", use_container_width=True):
             novo = _iniciar_ciclo()
             st.session_state["cnt_ciclo_id"]   = novo
             st.session_state["cnt_contados"]   = set()
@@ -789,18 +469,332 @@ with col_right:
             st.cache_data.clear()
             st.rerun()
 
-    st.markdown("""
-    <div class="info-box">
-        💾 O progresso é salvo automaticamente na planilha <strong>Config</strong>.<br>
-        Pode fechar o app, desligar o celular — ao reabrir, continua de onde parou.<br>
-        O progresso só zera se você clicar em <strong>"Iniciar nova contagem"</strong>.
+        if historico:
+            st.markdown('<div class="sec-titulo" style="margin-top:32px">📅 Histórico de contagens</div>', unsafe_allow_html=True)
+            for h in historico:
+                st.markdown(f"""
+                <div class="hist-card">
+                  <div class="hist-icone">✅</div>
+                  <div>
+                    <div class="hist-data">Iniciada em {h.get('ciclo_id','?')}</div>
+                    <div class="hist-detalhe">Concluída em {h.get('data_conclusao','?')} · {h.get('total','?')} produtos</div>
+                  </div>
+                  <div class="hist-badge">100% ✓</div>
+                </div>
+                """, unsafe_allow_html=True)
+        st.stop()
+
+
+    # ──────────────────────────────────────────────
+    #  TELA B: CICLO CONCLUÍDO
+    # ──────────────────────────────────────────────
+    if ciclo_done:
+        st.balloons()
+        st.markdown(f"""
+        <div class="ciclo-ok">
+          <h2>🎉 Contagem concluída!</h2>
+          <p>
+            Todos os <strong>{total} produtos</strong> foram verificados e o estoque está atualizado.<br>
+            A contagem foi registrada no histórico abaixo.<br><br>
+            Quando quiser fazer uma nova contagem, clique em <strong>"Iniciar nova contagem"</strong>.
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if historico:
+            st.markdown('<div class="sec-titulo">📅 Histórico de contagens</div>', unsafe_allow_html=True)
+            for h in historico:
+                st.markdown(f"""
+                <div class="hist-card">
+                  <div class="hist-icone">✅</div>
+                  <div>
+                    <div class="hist-data">Iniciada em {h.get('ciclo_id','?')}</div>
+                    <div class="hist-detalhe">Concluída em {h.get('data_conclusao','?')} · {h.get('total','?')} produtos</div>
+                  </div>
+                  <div class="hist-badge">100% ✓</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("▶️ Iniciar nova contagem", type="primary", use_container_width=True):
+            novo = _iniciar_ciclo()
+            st.session_state["cnt_ciclo_id"]   = novo
+            st.session_state["cnt_contados"]   = set()
+            st.session_state["cnt_ciclo_done"] = False
+            st.cache_data.clear()
+            st.rerun()
+        st.stop()
+
+
+    # ──────────────────────────────────────────────
+    #  BARRA DE PROGRESSO
+    # ──────────────────────────────────────────────
+    st.markdown(f"""
+    <div class="progresso-wrap">
+      <div class="prog-label">Progresso da contagem</div>
+      <div class="prog-bar-bg">
+        <div class="prog-bar-fill" style="width:{pct}%"></div>
+      </div>
+      <div class="prog-nums">
+        <span>✅ {contados_n} produtos contados</span>
+        <span>⏳ {total - contados_n} pendentes &nbsp;·&nbsp; {pct}%</span>
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
 
-# ──────────────────────────────────────────────
-#  ABA PREÇOS
-# ──────────────────────────────────────────────
+    # ──────────────────────────────────────────────
+    #  LAYOUT PRINCIPAL
+    # ──────────────────────────────────────────────
+    col_left, col_right = st.columns([1.1, 1], gap="large")
+
+    # ══════════════════════════════════
+    #  ESQUERDA — Seleciona e conta
+    # ══════════════════════════════════
+    with col_left:
+        st.markdown('<div class="sec-titulo">🔍 Selecionar produto</div>', unsafe_allow_html=True)
+
+        busca = st.text_input("", placeholder="🔎  Digite o nome do produto...", label_visibility="collapsed")
+
+        df_filtrado = df_prod.copy()
+        if busca.strip():
+            b = _strip(busca)
+            df_filtrado = df_filtrado[df_filtrado["_nome"].apply(lambda x: b in _strip(x))]
+
+        if df_filtrado.empty:
+            st.warning("Nenhum produto encontrado.")
+            st.stop()
+
+        opts   = df_filtrado["__key"].tolist()
+        labels = {
+            r["__key"]: ("✅ " if r["__key"] in contados else "") + r["_nome"]
+            for _, r in df_filtrado.iterrows()
+        }
+
+        sel = st.session_state["prod_sel"]
+        idx = opts.index(sel) if sel in opts else 0
+
+        sel_key = st.selectbox(
+            "Produto", options=opts,
+            format_func=lambda k: labels.get(k, k),
+            index=idx, label_visibility="collapsed",
+        )
+        st.session_state["prod_sel"] = sel_key
+
+        row_p      = df_prod[df_prod["__key"] == sel_key].iloc[0]
+        prod_id    = _nz(row_p.get("_id",""))
+        prod_nome  = _nz(row_p.get("_nome",""))
+        prod_cat   = _nz(row_p.get("_cat",""))
+        prod_foto  = _nz(row_p.get("_foto",""))
+        est_atual  = estoque_atual(sel_key)
+        ja_contado = sel_key in contados
+
+        status_badge = (
+            '<span class="prod-badge-ok">✅ Já contado</span>' if ja_contado
+            else '<span class="prod-badge-pend">⏳ Pendente</span>'
+        )
+        if prod_foto and prod_foto.startswith("http"):
+            foto_html = f'<img src="{prod_foto}" class="prod-foto" onerror="this.style.display=\'none\'">'
+        else:
+            foto_html = '<div class="prod-foto-ph">📦</div>'
+
+        st.markdown(f"""
+        <div class="prod-card">
+          {foto_html}
+          <div style="flex:1">
+            <div class="prod-nome">{prod_nome}</div>
+            <div class="prod-cat">{prod_cat or "Sem categoria"}</div>
+            {status_badge}
+            <div class="est-item">
+              <div class="est-val">{_fmt_num(est_atual)}</div>
+              <div class="est-lab">Estoque no sistema</div>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-titulo">✏️ Quantidade contada fisicamente</div>', unsafe_allow_html=True)
+
+        alvo = st.number_input(
+            "Quantas unidades você contou na prateleira?",
+            min_value=0.0, step=1.0,
+            value=max(0.0, float(est_atual)),
+            key=f"alvo_{sel_key}",
+        )
+        delta = alvo - est_atual
+
+        if delta > 0:
+            st.markdown(f'<div class="delta-plus">▲ Vai adicionar {delta:.0f} unidades ao estoque</div>', unsafe_allow_html=True)
+        elif delta < 0:
+            st.markdown(f'<div class="delta-minus">▼ Vai remover {abs(delta):.0f} unidades do estoque</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="delta-zero">— Estoque correto, nenhuma alteração necessária</div>', unsafe_allow_html=True)
+
+        responsavel = st.text_input("Responsável (opcional)", placeholder="Seu nome")
+
+        btn_salvar = st.button("💾  Salvar contagem", type="primary", use_container_width=True)
+
+        if btn_salvar:
+            data_str  = datetime.now().strftime("%d/%m/%Y")
+            resp_txt  = responsavel.strip() if responsavel.strip() else "—"
+            obs_final = f"Contagem por {resp_txt}"
+
+            try:
+                ws_mov = _sheet().worksheet("MovimentosEstoque")
+                hdrs   = ws_mov.row_values(1) or ["Data","IDProduto","Produto","Tipo","Qtd","Obs"]
+
+                # Só grava ajuste se houve diferença
+                if delta != 0:
+                    qtd_str  = str(int(delta) if float(delta).is_integer() else delta).replace(".",",")
+                    row_data = {
+                        "Data": data_str, "IDProduto": prod_id, "Produto": prod_nome,
+                        "Tipo": "Ajuste", "Qtd": qtd_str, "Obs": obs_final,
+                    }
+                    ws_mov.append_row([row_data.get(h,"") for h in hdrs], value_input_option="USER_ENTERED")
+
+                # Marca como contado e persiste
+                contados.add(sel_key)
+                st.session_state["cnt_contados"] = contados
+                _salvar_contados(contados)
+                st.cache_data.clear()
+
+                # Chegou a 100%?
+                if len(contados) >= total:
+                    _concluir_ciclo(total, contados, ciclo_id)
+                    st.session_state["cnt_ciclo_done"] = True
+                    _, novo_hist, _, _ = _carregar_estado()
+                    st.session_state["cnt_historico"] = novo_hist
+                    st.balloons()
+                    st.rerun()
+                else:
+                    if delta != 0:
+                        sinal = "+" if delta > 0 else ""
+                        st.success(f"✅ Salvo! Ajuste de {sinal}{_fmt_num(delta)} → estoque: {_fmt_num(alvo)}")
+                    else:
+                        st.success(f"✅ Contagem registrada! Estoque confirmado: {_fmt_num(alvo)}")
+                    st.rerun()
+
+            except Exception as e:
+                st.error("Falha ao salvar.")
+                st.code(str(e))
+
+
+    # ══════════════════════════════════
+    #  DIREITA — Painel visual
+    # ══════════════════════════════════
+    with col_right:
+        st.markdown('<div class="sec-titulo">📋 Painel da contagem</div>', unsafe_allow_html=True)
+
+        filtro = st.radio(
+            "Mostrar", ["Todos", "✅ Contados", "⏳ Pendentes"],
+            horizontal=True, label_visibility="collapsed",
+        )
+
+        df_audit = df_prod.copy()
+        if busca.strip():
+            b = _strip(busca)
+            df_audit = df_audit[df_audit["_nome"].apply(lambda x: b in _strip(x))]
+        if filtro == "✅ Contados":
+            df_audit = df_audit[df_audit["__key"].isin(contados)]
+        elif filtro == "⏳ Pendentes":
+            df_audit = df_audit[~df_audit["__key"].isin(contados)]
+
+        k1, k2, k3 = st.columns(3)
+        for col_k, val, label, cor in [
+            (k1, contados_n,           "Contados",  "#4ade80"),
+            (k2, total - contados_n,   "Pendentes", "#fbbf24"),
+            (k3, f"{pct}%",            "Progresso", "#60a5fa"),
+        ]:
+            with col_k:
+                st.markdown(f"""
+                <div style="background:rgba(255,255,255,0.05);border-radius:12px;padding:12px;
+                text-align:center;border:1px solid rgba(255,255,255,0.08)">
+                  <div style="font-family:Nunito;font-size:1.4rem;font-weight:800;color:{cor}">{val}</div>
+                  <div style="font-size:0.7rem;color:rgba(255,255,255,0.4);text-transform:uppercase">{label}</div>
+                </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if df_audit.empty:
+            st.info("Nenhum produto neste filtro.")
+        else:
+            for i in range(0, len(df_audit), 3):
+                chunk = df_audit.iloc[i:i+3]
+                cols3 = st.columns(3)
+                for ci, (_, prod_row) in zip(cols3, chunk.iterrows()):
+                    with ci:
+                        chave   = prod_row["__key"]
+                        nome_p  = prod_row["_nome"]
+                        foto_p  = prod_row["_foto"]
+                        est_p   = estoque_atual(chave)
+                        is_done = chave in contados
+
+                        borda = "rgba(74,222,128,0.4)" if is_done else "rgba(255,255,255,0.08)"
+                        bg    = "rgba(74,222,128,0.05)" if is_done else "rgba(255,255,255,0.03)"
+                        check = "✅ " if is_done else ""
+
+                        if foto_p and foto_p.startswith("http"):
+                            foto_tag = f'<img src="{foto_p}" style="width:100%;height:60px;object-fit:contain;border-radius:8px;background:rgba(255,255,255,0.06);margin-bottom:6px" onerror="this.style.display=\'none\'">'
+                        else:
+                            foto_tag = '<div style="width:100%;height:60px;border-radius:8px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:1.4rem;margin-bottom:6px">📦</div>'
+
+                        st.markdown(f"""
+                        <div style="background:{bg};border:1px solid {borda};border-radius:12px;padding:10px;margin-bottom:4px">
+                          {foto_tag}
+                          <div style="font-size:0.72rem;font-weight:700;color:rgba(255,255,255,0.85);line-height:1.3">{check}{nome_p}</div>
+                          <div style="font-size:0.65rem;color:rgba(255,255,255,0.35);margin-top:3px">Sistema: {_fmt_num(est_p)}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        if st.button("Selecionar", key=f"sel_{chave}", use_container_width=True):
+                            st.session_state["prod_sel"] = chave
+                            st.rerun()
+
+        if historico:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="sec-titulo">📅 Contagens anteriores</div>', unsafe_allow_html=True)
+            for h in historico:
+                st.markdown(f"""
+                <div class="hist-card">
+                  <div class="hist-icone">📋</div>
+                  <div>
+                    <div class="hist-data">Iniciada em {h.get('ciclo_id','?')}</div>
+                    <div class="hist-detalhe">Concluída em {h.get('data_conclusao','?')} · {h.get('total','?')} produtos</div>
+                  </div>
+                  <div class="hist-badge">100% ✓</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            if st.button("🔄 Recarregar progresso", use_container_width=True,
+                         help="Busca o progresso salvo na planilha — útil se outra pessoa está contando junto"):
+                c2, h2, cid2, done2 = _carregar_estado()
+                st.session_state["cnt_contados"]   = c2
+                st.session_state["cnt_historico"]  = h2
+                st.session_state["cnt_ciclo_id"]   = cid2
+                st.session_state["cnt_ciclo_done"] = done2
+                st.cache_data.clear()
+                st.rerun()
+        with col_r2:
+            if st.button("🆕 Iniciar nova contagem", use_container_width=True,
+                         help="Zera o progresso e começa do zero. Use só quando quiser fazer uma nova contagem."):
+                novo = _iniciar_ciclo()
+                st.session_state["cnt_ciclo_id"]   = novo
+                st.session_state["cnt_contados"]   = set()
+                st.session_state["cnt_ciclo_done"] = False
+                st.cache_data.clear()
+                st.rerun()
+
+        st.markdown("""
+        <div class="info-box">
+            💾 O progresso é salvo automaticamente na planilha <strong>Config</strong>.<br>
+            Pode fechar o app, desligar o celular — ao reabrir, continua de onde parou.<br>
+            O progresso só zera se você clicar em <strong>"Iniciar nova contagem"</strong>.
+        </div>
+        """, unsafe_allow_html=True)
+
 with _tab_prec:
     st.markdown("""
     <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);
@@ -825,9 +819,11 @@ with _tab_prec:
             _custo_p = float(_rp.get("_custo",0.0) or 0.0)
             _pid_p   = _nz(_rp.get("_id",""))
 
-            _ft = (f'<img src="{_foto_p}" style="width:70px;height:70px;object-fit:contain;border-radius:10px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);flex-shrink:0">'
-                   if _foto_p and _foto_p.startswith("http")
-                   else '<div style="width:70px;height:70px;border-radius:10px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:1.8rem;flex-shrink:0">📦</div>')
+            _ft = (
+                f'<img src="{_foto_p}" style="width:70px;height:70px;object-fit:contain;border-radius:10px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);flex-shrink:0">'
+                if _foto_p and _foto_p.startswith("http")
+                else '<div style="width:70px;height:70px;border-radius:10px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:1.8rem;flex-shrink:0">📦</div>'
+            )
 
             st.markdown(f"""
             <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);
@@ -837,8 +833,12 @@ with _tab_prec:
                 <div style="font-family:Nunito;font-weight:800;font-size:1rem;color:#fff">{_nome_p}</div>
                 <div style="font-size:0.75rem;color:rgba(255,255,255,0.4);margin-top:3px">ID: {_pid_p}</div>
                 <div style="margin-top:6px;display:flex;gap:10px">
-                  <span style="background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.3);color:#4ade80;border-radius:8px;padding:2px 10px;font-size:0.75rem;font-weight:700">Venda: R$ {_fmt_num(_preco_p).replace(".",",")}</span>
-                  <span style="background:rgba(96,165,250,0.12);border:1px solid rgba(96,165,250,0.3);color:#60a5fa;border-radius:8px;padding:2px 10px;font-size:0.75rem;font-weight:700">Custo: R$ {_fmt_num(_custo_p).replace(".",",")}</span>
+                  <span style="background:rgba(74,222,128,0.12);border:1px solid rgba(74,222,128,0.3);color:#4ade80;border-radius:8px;padding:2px 10px;font-size:0.75rem;font-weight:700">
+                    Venda: R$ {_fmt_num(_preco_p).replace(".",",")}
+                  </span>
+                  <span style="background:rgba(96,165,250,0.12);border:1px solid rgba(96,165,250,0.3);color:#60a5fa;border-radius:8px;padding:2px 10px;font-size:0.75rem;font-weight:700">
+                    Custo: R$ {_fmt_num(_custo_p).replace(".",",")}
+                  </span>
                 </div>
               </div>
             </div>
@@ -847,10 +847,18 @@ with _tab_prec:
             with st.form("form_precos_prod"):
                 _pc1, _pc2 = st.columns(2)
                 with _pc1:
-                    _novo_preco = st.number_input("💰 Preço de Venda (R$)", min_value=0.0, step=0.10, format="%.2f", value=round(_preco_p,2))
+                    _novo_preco = st.number_input(
+                        "💰 Preço de Venda (R$)", min_value=0.0,
+                        step=0.10, format="%.2f", value=round(_preco_p, 2)
+                    )
                 with _pc2:
-                    _novo_custo = st.number_input("📦 Custo Unitário (R$)", min_value=0.0, step=0.10, format="%.2f", value=round(_custo_p,2))
-                _salvar = st.form_submit_button("💾 Salvar preços", type="primary", use_container_width=True)
+                    _novo_custo = st.number_input(
+                        "📦 Custo Unitário (R$)", min_value=0.0,
+                        step=0.10, format="%.2f", value=round(_custo_p, 2)
+                    )
+                _salvar = st.form_submit_button(
+                    "💾 Salvar preços", type="primary", use_container_width=True
+                )
 
             if _salvar:
                 try:
@@ -870,13 +878,15 @@ with _tab_prec:
                             _ri = None
                         if _ri:
                             _upd = []
-                            if _cpv: _upd.append({"range": f"{_col_letter(_cpv)}{_ri}", "values": [[str(_novo_preco).replace(".",",")]]})
-                            if _ccu: _upd.append({"range": f"{_col_letter(_ccu)}{_ri}", "values": [[str(_novo_custo).replace(".",",")]]})
+                            if _cpv:
+                                _upd.append({"range": f"{_col_letter(_cpv)}{_ri}", "values": [[str(_novo_preco).replace(".",",")]]})
+                            if _ccu:
+                                _upd.append({"range": f"{_col_letter(_ccu)}{_ri}", "values": [[str(_novo_custo).replace(".",",")]]})
                             if _upd:
                                 _ws_p.batch_update(_upd, value_input_option="USER_ENTERED")
                                 st.cache_data.clear()
                                 st.success(f"✅ **{_nome_p}** atualizado! Venda: R$ {_novo_preco:.2f} · Custo: R$ {_novo_custo:.2f}")
                             else:
-                                st.warning("Colunas de preço/custo não encontradas.")
+                                st.warning("Colunas de preço/custo não encontradas na planilha.")
                 except Exception as _e:
                     st.error(f"Erro ao salvar: {_e}")
