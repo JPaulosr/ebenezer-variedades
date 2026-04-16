@@ -747,7 +747,7 @@ def _render_contagem():
                         </div>
                         """, unsafe_allow_html=True)
 
-                        if st.button("Selecionar", key=f"sel_{chave}", use_container_width=True):
+                        if st.button("Selecionar", key=f"sel_{chave}_{_gi}", use_container_width=True):
                             st.session_state["prod_sel"] = chave
                             st.rerun()
 
