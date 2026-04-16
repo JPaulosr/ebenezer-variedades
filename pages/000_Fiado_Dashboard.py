@@ -178,36 +178,33 @@ PALETTE    = ["#636EFA","#EF553B","#00CC96","#AB63FA","#FFA15A","#19D3F3","#FF66
 
 # =========================
 # Helpers
-
 from utils.sheets import (
-    sheet, carregar_aba, garantir_aba, append_rows,
+    sheet as _sheet_obj, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque,
-    tg_send, tg_media, gerar_id, parse_date,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-_norm_tipo = norm_tipo_mov
-conectar_sheets = sheet
-
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
 def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return _sheet_obj()
 
-_fmt_brl = brl
 
+@st.cache_data(ttl=30, show_spinner=False)
+def load_df(aba):
+    sh = conectar_sheets()
+    try: ws = sh.worksheet(aba)
+    except gspread.WorksheetNotFound:
+        st.error(f"🛑 Aba '{aba}' não encontrada."); st.stop()
+    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
+    df.columns = [c.strip() for c in df.columns]
+    base = {ABA_FIADO: COLS_FIADO, ABA_PAGT: COLS_PAGT}[aba]
+    for c in base:
+        if c not in df.columns: df[c] = ""
+    return df.fillna("").loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
 
 # =========================
 # Dados
