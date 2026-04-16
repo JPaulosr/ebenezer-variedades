@@ -101,6 +101,19 @@ def _canon_id(x):
     import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
 def conectar_sheets(): return _sheet_obj()
 
+# BUMP = token de cache — força recarregamento quando cache_data é limpo
+BUMP = st.session_state.get("_bump", 0)
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_df(aba: str, _bump: int = 0):
+    return carregar_aba(aba)
+
+def _pick(df, candidates):
+    if df is None or df.empty: return None
+    for c in candidates:
+        if c in df.columns: return c
+    return None
+
 ABA_PROD = "Produtos"
 ABA_COMP = "Compras"
 ABA_MOVS = "MovimentosEstoque"
