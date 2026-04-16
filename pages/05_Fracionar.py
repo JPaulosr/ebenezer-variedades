@@ -533,7 +533,12 @@ pos_frac = opcoes_frac.index(frac_sel)
 row_f    = df_frac.iloc[pos_frac].to_dict()
 pid_f    = str(row_f.get(c_id, "") or "")
 nome_f   = str(row_f.get(c_nome, "") or "")
-unid_f   = str(row_f.get(c_unid, "") or "").strip()
+_unid_f_raw = str(row_f.get(c_unid, "") or "").strip()
+# Se a unidade cadastrada for um tamanho (ex: 2L, 500ml, 1l) e não uma unidade de venda,
+# força 'un' — o produto é vendido por unidade, não por litro
+import re as _re_unid
+_e_tamanho = bool(_re_unid.fullmatch(r"\d+[\.,]?\d*\s*(l|L|ml|ML|g|G|kg|KG)", _unid_f_raw))
+unid_f   = "un" if _e_tamanho else (_unid_f_raw or "un")
 foto_f   = str(row_f.get(c_foto, "") or "").strip()
 preco_f  = _to_f(row_f.get(c_preco, 0))
 
