@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 # pages/04_estoque.py — Estoque (MovimentosEstoque como fonte única) + busca + auto-refresh (UI moderna com cards)
 
+import json, unicodedata as _ud, re
 from datetime import date, datetime
 from pathlib import Path
 
 import streamlit as st
 import pandas as pd
+import gspread
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from google.oauth2.service_account import Credentials
 
 # =========================
 # UI BASE / TEMA
@@ -39,35 +43,61 @@ if st.session_state.pop("_first_load_estoque", True):
     st.cache_data.clear()
 st.session_state.setdefault("_first_load_estoque", False)
 
-
+# =========================
+# Credenciais / Conexão
+# ──────────────────────────────────────────────
+#  CONEXÃO / HELPERS  (centralizados em utils/sheets.py)
+# ──────────────────────────────────────────────
 from utils.sheets import (
     sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque,
-    tg_send, tg_media, gerar_id, parse_date,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-_norm_tipo = norm_tipo_mov
-conectar_sheets = sheet
+# Aliases de compatibilidade
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
 
 def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return sheet()
+def _sheet(): return sheet()
 
+@st.cache_resource
+def _sheet_titles():
+    try: return {ws.title for ws in sheet().worksheets()}
+    except: return set()
 
+@st.cache_data(ttl=1, show_spinner=False)
+def _load_df(aba):
+    return carregar_aba(aba)
+
+def _nz(x):
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except: pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan","none") else s
+
+def _strip_accents_low(s):
+    import unicodedata as _ud2
+    s = _ud2.normalize("NFKD", str(s or ""))
+    return "".join(ch for ch in s if _ud2.category(ch) != "Mn").lower().strip()
+
+def _prod_key_from(prod_id, prod_nome):
+    pid = _nz(prod_id)
+    return pid if pid else f"nm:{_strip_accents_low(_nz(prod_nome))}"
+
+def _append_row(ws, row):
+    hdrs = [h.strip() for h in ws.row_values(1)]
+    ws.append_rows([[row.get(h, "") for h in hdrs]], value_input_option="USER_ENTERED")
+
+def _ensure_ws(name, headers):
+    return garantir_aba(name, headers)
 
 # =========================
 # Abas & Headers
