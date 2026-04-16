@@ -288,87 +288,25 @@ if st.session_state.get("_force_refresh", False):
     st.cache_data.clear()
     st.rerun()
 
-# =========================
-# Auth & Conexão
-# =========================
-def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
-    return key
 
-def _load_sa() -> dict:
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None:
-        st.error("🛑 Segredo GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    if not isinstance(svc, Mapping):
-        st.error("🛑 GCP_SERVICE_ACCOUNT inválido."); st.stop()
-    pk = str(svc.get("private_key",""))
-    if "BEGIN PRIVATE KEY" not in pk:
-        st.error("🛑 private_key inválida."); st.stop()
-    svc = {**svc, "private_key": _normalize_private_key(pk)}
-    return svc
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
 
-@st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds  = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc     = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL", "")
-    if not url_or_id:
-        st.error("🛑 PLANILHA_URL não está no Secrets."); st.stop()
-    return gc.open_by_url(url_or_id) if url_or_id.startswith("http") else gc.open_by_key(url_or_id)
-
-@st.cache_data(ttl=120, show_spinner=False)
-def carregar_aba(nome: str) -> pd.DataFrame:
-    ws = conectar_sheets().worksheet(nome)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-# =========================
-# Utils
-# =========================
-def _to_float(x, default=0.0):
-    if x is None: return default
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return default
-    s = s.replace("R$","").replace(" ","").replace("\u00A0","")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.\-]", "", s)
-    if s.count(".") > 1:
-        parts = s.split("."); s = "".join(parts[:-1]) + "." + parts[-1]
-    try: return float(s)
-    except: return default
-
-def _parse_date_any(s):
-    if s is None or (isinstance(s, float) and pd.isna(s)): return None
-    txt = str(s).strip()
-    for fmt in ("%d/%m/%Y","%Y-%m-%d","%d/%m/%y"):
-        try: return datetime.strptime(txt, fmt).date()
-        except: pass
-    try:
-        return pd.to_datetime(txt, dayfirst=True, errors="coerce").date()
-    except: return None
-
-def _first_col(df: pd.DataFrame, candidates) -> str | None:
-    if df is None or df.empty: return None
-    cols = list(df.columns)
-    for c in candidates:
-        if c in cols: return c
-    low = {c.lower(): c for c in cols}
-    for c in candidates:
-        if c.lower() in low: return low[c.lower()]
-    return None
-
-def _fmt_brl(v):
-    try:
-        return ("R$ " + f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
-    except: return "R$ 0,00"
-
-def _canon_id(x):
-    return re.sub(r"[^0-9]", "", str(x or ""))
 
 # =========================
 # Abas
