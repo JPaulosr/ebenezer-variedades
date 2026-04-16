@@ -4,6 +4,9 @@ from __future__ import annotations
 import json, unicodedata, re, time
 import streamlit as st
 import pandas as pd
+import gspread
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from google.oauth2.service_account import Credentials
 from datetime import date
 
 # ──────────────────────────────────────────────
@@ -78,36 +81,65 @@ button[kind="primary"] { border-radius:12px !important; font-weight:700 !importa
 """, unsafe_allow_html=True)
 
 
-
+# ──────────────────────────────────────────────
+#  HELPERS SHEETS
+# ──────────────────────────────────────────────
+#  CONEXÃO / HELPERS  (centralizados em utils/sheets.py)
+# ──────────────────────────────────────────────
 from utils.sheets import (
     sheet, carregar_aba, garantir_aba, append_rows,
     to_num, brl, safe_cost, first_col, fmt_num,
-    norm_tipo_mov, calcular_estoque,
-    tg_send, tg_media, gerar_id, parse_date,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id, parse_date,
     ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
 )
-# Aliases completos para compatibilidade com código existente
-_to_num = to_num
-_to_float = to_num        # mesma função, nome diferente que era usado em algumas páginas
-_brl = brl
-_fmt_brl = brl
-_first_col = first_col
-_fmt_num = fmt_num
-_tg_send = tg_send
-_tg_media = tg_media
-_gerar_id = gerar_id
-_parse_date = parse_date
-_parse_date_any = parse_date
-_norm_tipo_mov = norm_tipo_mov
-_norm_tipo = norm_tipo_mov
-conectar_sheets = sheet
+# Aliases de compatibilidade
+_to_num = to_num; _to_float = to_num; _brl = brl; _fmt_brl = brl
+_first_col = first_col; _fmt_num = fmt_num; _parse_date_any = parse_date
+_tg_send = tg_send; _tg_media = tg_media; _norm_tipo_mov = norm_tipo_mov
+_gerar_id = gerar_id; _parse_date = parse_date; _norm_tipo = norm_tipo_mov
+_to_date = parse_date
 
 def _canon_id(x):
-    import re as _re
-    return _re.sub(r"[^0-9]", "", str(x or ""))
+    import re as _re; return _re.sub(r"[^0-9]", "", str(x or ""))
+def conectar_sheets(): return sheet()
+def _sheet(): return sheet()
 
-_to_float = to_num
+BUMP = st.session_state.get("_refresh_ts", 0)
 
+@st.cache_data(ttl=60)
+def _load_df(aba, _bump=0):
+    return carregar_aba(aba)
+
+def _safe_load(aba):
+    try: return _load_df(aba)
+    except: return pd.DataFrame()
+
+def _nz(x):
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except: pass
+    s = str(x).strip()
+    return "" if s.lower() in ("nan","none") else s
+
+def _pick(df, cands):
+    if df is None or df.empty: return None
+    for c in cands:
+        if c in df.columns: return c
+    return None
+
+def _refresh():
+    st.session_state["_refresh_ts"] = __import__("time").time()
+    st.cache_data.clear()
+    st.rerun()
+
+def _append_row(ws, row):
+    hdrs = [h.strip() for h in ws.row_values(1)]
+    ws.append_rows([[row.get(h, "") for h in hdrs]], value_input_option="USER_ENTERED")
+
+def _ensure_ws(name, headers=None):
+    headers = headers or []
+    return garantir_aba(name, headers)
 
 ABA_PROD = "Produtos"
 ABA_COMP = "Compras"
