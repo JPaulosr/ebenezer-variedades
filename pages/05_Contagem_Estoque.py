@@ -442,7 +442,8 @@ st.markdown(f"""
 # ──────────────────────────────────────────────
 _tab_cnt, _tab_prec = st.tabs(["📦 Contagem de Estoque", "🏷️ Atualizar Preços"])
 
-with _tab_cnt:
+def _render_contagem():
+
     # ──────────────────────────────────────────────
     #  TELA A: SEM CICLO ATIVO
     # ──────────────────────────────────────────────
@@ -482,7 +483,7 @@ with _tab_cnt:
                   <div class="hist-badge">100% ✓</div>
                 </div>
                 """, unsafe_allow_html=True)
-        st.stop()
+        return
 
 
     # ──────────────────────────────────────────────
@@ -523,7 +524,7 @@ with _tab_cnt:
             st.session_state["cnt_ciclo_done"] = False
             st.cache_data.clear()
             st.rerun()
-        st.stop()
+        return
 
 
     # ──────────────────────────────────────────────
@@ -563,7 +564,7 @@ with _tab_cnt:
 
         if df_filtrado.empty:
             st.warning("Nenhum produto encontrado.")
-            st.stop()
+            return
 
         opts   = df_filtrado["__key"].tolist()
         labels = {
@@ -794,6 +795,11 @@ with _tab_cnt:
             O progresso só zera se você clicar em <strong>"Iniciar nova contagem"</strong>.
         </div>
         """, unsafe_allow_html=True)
+
+
+
+with _tab_cnt:
+    _render_contagem()
 
 with _tab_prec:
     st.markdown("""
