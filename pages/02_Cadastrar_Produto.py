@@ -114,6 +114,22 @@ def _pick(df, candidates):
         if c in df.columns: return c
     return None
 
+def _nz(x) -> str:
+    """Converte para string limpa, retorna '' se None/NaN.""";
+    if x is None: return ""
+    s = str(x).strip()
+    return "" if s.lower() in ("nan","none","<na>") else s
+
+def _ensure_ws(nome, headers=None):
+    return garantir_aba(nome, headers or [])
+
+def _append_row(ws, row: dict):
+    append_rows(ws, [row])
+
+def _refresh():
+    st.cache_data.clear()
+    st.rerun()
+
 ABA_PROD = "Produtos"
 ABA_COMP = "Compras"
 ABA_MOVS = "MovimentosEstoque"
