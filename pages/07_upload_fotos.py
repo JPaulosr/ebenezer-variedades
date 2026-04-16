@@ -1,13 +1,9 @@
 # pages/upload_fotos.py
 # -*- coding: utf-8 -*-
-import json, re, unicodedata as _ud
 from typing import Optional
 
 import streamlit as st
 import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe
-from google.oauth2.service_account import Credentials
 
 # >>> Cloudinary (SDK oficial, assinatura automática)
 import cloudinary
@@ -19,36 +15,27 @@ st.title("🖼️ Upload/URL de Foto para Produtos")
 
 # ======================================================================
 # Config / Conexão
-# ======================================================================
+
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
+
+
 ABA_PRODUTOS = "Produtos"  # nome da sua aba de catálogo
-
-def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    return "".join(ch for ch in key if _ud.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
-
-def _load_sa():
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None:
-        st.error("🛑 Falta o secret GCP_SERVICE_ACCOUNT.")
-        st.stop()
-    if isinstance(svc, str):
-        svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
-
-@st.cache_resource
-def _sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL") or st.secrets.get("PLANILHA_ID")
-    if not url_or_id:
-        st.error("🛑 Coloque PLANILHA_URL ou PLANILHA_ID nos Secrets.")
-        st.stop()
-    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
 
 def _headers(ws) -> list[str]:
     try:

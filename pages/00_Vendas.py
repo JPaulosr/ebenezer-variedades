@@ -2,16 +2,21 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json, re, unicodedata, unicodedata as _ud
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
-import gspread
 import pandas as pd
 import requests
 import streamlit as st
-from google.oauth2.service_account import Credentials
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque, tg_send, tg_media, gerar_id,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+_to_num = to_num; _brl = brl; _first_col = first_col; conectar_sheets = sheet
+_tg_send = tg_send; _tg_media = tg_media; _gerar_id = gerar_id
+
 
 # ──────────────────────────────────────────────
 #  CONFIG & TEMA
@@ -127,32 +132,7 @@ div[data-testid="stNumberInput"] input { border-radius:10px !important; }
 # ──────────────────────────────────────────────
 #  HELPERS GOOGLE SHEETS
 # ──────────────────────────────────────────────
-def _normalize_private_key(key):
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    return "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
-
-def _load_sa():
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    return {**svc, "private_key": _normalize_private_key(svc["private_key"])}
-
-@st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url = st.secrets.get("PLANILHA_URL","")
-    if not url: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url) if str(url).startswith("http") else gc.open_by_key(url)
-
-@st.cache_data(ttl=10, show_spinner=False)
-def carregar_aba(nome):
-    ws = conectar_sheets().worksheet(nome)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df
+# carregar_aba importado de utils.sheets
 
 def _first_col(df, cands):
     if df is None or df.empty: return None
@@ -593,13 +573,8 @@ with col_dir:
                 ws_v.update("A1:K1",[["Data","VendaID","IDProduto","Qtd","PrecoUnit","TotalLinha",
                                        "FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"]])
 
-            dfv = get_as_dataframe(ws_v, evaluate_formulas=False, dtype=str, header=0).dropna(how="all")
-            if dfv.empty:
-                dfv = pd.DataFrame(columns=["Data","VendaID","IDProduto","Qtd","PrecoUnit",
-                                             "TotalLinha","FormaPagto","Obs","Desconto","TotalCupom","CupomStatus"])
-            dfv.columns = [c.strip() for c in dfv.columns]
-            for c in ["Desconto","TotalCupom","CupomStatus","Cliente","FiadoID"]:
-                if c not in dfv.columns: dfv[c] = None
+            # Garante que a aba tem os cabeçalhos certos (sem recarregar tudo)
+            ws_v = garantir_aba(ABA_VEND)
 
             try: ws_m = sh.worksheet(ABA_MOVS)
             except: ws_m = _garantir_aba(sh, ABA_MOVS,
@@ -648,9 +623,9 @@ with col_dir:
                     "ID":venda_id,"Documento/NF":"","Origem":"Vendas rápidas",
                     "SaldoApós":str(int(aft))})
 
-            ws_v.clear()
-            set_with_dataframe(ws_v, pd.concat([dfv, pd.DataFrame(novas)], ignore_index=True))
-            _append_rows(ws_m, movs)
+            # SEGURO: nunca faz clear() + reescrita completa — só acrescenta linhas
+            append_rows(ws_v, novas)
+            append_rows(ws_m, movs)
 
             # Telegram
             media_tg = []
@@ -783,8 +758,8 @@ with col_dir:
                         "FormaPagto":f"Estorno - {forma}","Obs":f"ESTORNO DE {vid}",
                         "Desconto":"0,00","TotalCupom":"0,00","CupomStatus":"ESTORNO",
                         "Cliente":str(r.get("Cliente","")),"FiadoID":""})
-                ws2.clear()
-                set_with_dataframe(ws2, pd.concat([dfv2, pd.DataFrame(novas2)], ignore_index=True))
+                # SEGURO: só acrescenta linhas de estorno
+                append_rows(ws2, novas2)
                 try: ws_m2 = sh2.worksheet(ABA_MOVS)
                 except: ws_m2 = _garantir_aba(sh2, ABA_MOVS,
                     ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"])

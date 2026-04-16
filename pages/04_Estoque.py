@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 # pages/04_estoque.py — Estoque (MovimentosEstoque como fonte única) + busca + auto-refresh (UI moderna com cards)
 
-import json, unicodedata as _ud, re
 from datetime import date, datetime
 from pathlib import Path
 
 import streamlit as st
 import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
-from google.oauth2.service_account import Credentials
 
 # =========================
 # UI BASE / TEMA
@@ -43,152 +39,25 @@ if st.session_state.pop("_first_load_estoque", True):
     st.cache_data.clear()
 st.session_state.setdefault("_first_load_estoque", False)
 
-# =========================
-# Credenciais / Conexão
-# =========================
-def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str):
-        return key
-    key = key.replace("\\n", "\n")
-    key = "".join(ch for ch in key if _ud.category(ch)[0] != "C" or ch in ("\n", "\r", "\t"))
-    return key
 
-def _load_sa() -> dict:
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None:
-        st.error("🛑 Segredo GCP_SERVICE_ACCOUNT ausente.")
-        st.stop()
-    if isinstance(svc, str):
-        svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
 
-@st.cache_resource
-def _client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    return gspread.authorize(creds)
-
-@st.cache_resource
-def _sheet():
-    gc = _client()
-    url_or_id = st.secrets.get("PLANILHA_URL")
-    if not url_or_id:
-        st.error("🛑 Segredo PLANILHA_URL ausente em st.secrets.")
-        st.stop()
-    try:
-        sh = gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
-        return sh
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error("🛑 Planilha não encontrada. Verifique o ID/URL em PLANILHA_URL.")
-        st.stop()
-    except gspread.exceptions.APIError as e:
-        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
-        st.error(f"🛑 Sem acesso à planilha (403). Compartilhe com: **{client_email}** (Editor).")
-        st.caption(f"Detalhe técnico: {e}")
-        st.stop()
-
-@st.cache_resource
-def _sheet_titles() -> set[str]:
-    try:
-        return {ws.title for ws in _sheet().worksheets()}
-    except gspread.exceptions.APIError as e:
-        st.error("Falha ao listar abas.")
-        st.caption(f"Detalhe técnico: {e}")
-        return set()
-
-@st.cache_data(ttl=1, show_spinner=False)
-def _load_df(aba: str) -> pd.DataFrame:
-    """Carrega uma aba e devolve DataFrame; se não existir, devolve vazio sem quebrar o app."""
-    try:
-        ws = _sheet().worksheet(aba)
-        df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-        df.columns = [c.strip() for c in df.columns]
-        return df.fillna("")
-    except gspread.exceptions.WorksheetNotFound:
-        return pd.DataFrame().fillna("")
-    except gspread.exceptions.APIError as e:
-        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-        client_email = (json.loads(svc)["client_email"] if isinstance(svc, str) else svc.get("client_email"))
-        st.error(f"🛑 Erro de acesso ao Sheets. Compartilhe com **{client_email}** e confira PLANILHA_URL.")
-        st.caption(f"Aba pedida: {aba} • Detalhe técnico: {e}")
-        st.stop()
-
-def _ensure_ws(name: str, headers: list[str]):
-    sh = _sheet()
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            df_head = pd.DataFrame(columns=cols)
-            ws.clear()
-            set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-    except Exception:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        df_head = pd.DataFrame(columns=headers)
-        set_with_dataframe(ws, df_head, include_index=False, include_column_header=True, resize=True)
-        return ws
-
-def _append_row(ws, row: dict):
-    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0).fillna("")
-    for col in cur.columns:
-        row.setdefault(col, "")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
-# =========================
-# Utilidades
-# =========================
-def _to_num(x) -> float:
-    """Converte para float preservando negativos; aceita vírgula, R$, parênteses."""
-    if x is None: return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("−","-")
-    neg_paren = s.startswith("(") and s.endswith(")")
-    if neg_paren: s = s[1:-1]
-    s = s.replace("R$","").replace(" ","")
-    if "," in s: s = s.replace(".","").replace(",",".")
-    s = re.sub(r"(?<!^)-","",s)        # remove traços extras
-    s = re.sub(r"[^0-9.\-]","",s)
-    try: v=float(s)
-    except: v=0.0
-    if neg_paren: v=-abs(v)
-    return v
-
-def _nz(x):
-    if x is None: return ""
-    try:
-        if pd.isna(x): return ""
-    except: pass
-    s=str(x).strip()
-    return "" if s.lower() in ("nan","none") else s
-
-def _strip_accents_low(s: str) -> str:
-    s=_ud.normalize("NFKD", str(s or ""))
-    s="".join(ch for ch in s if _ud.category(ch)!="Mn")
-    return s.lower().strip()
-
-def _norm_tipo(t: str) -> str:
-    raw=str(t or ""); low=_strip_accents_low(raw)
-    if "fracion" in low:
-        if "+" in raw: return "entrada"
-        if "-" in raw: return "saida"
-        return "outro"
-    low_clean=re.sub(r"[^a-z]","",low)
-    if "entrada" in low_clean or "compra" in low_clean or "estorno" in low_clean: return "entrada"
-    if "saida" in low_clean or "venda" in low_clean or "baixa" in low_clean: return "saida"
-    if "ajuste" in low_clean: return "ajuste"
-    return "outro"
-
-def _prod_key_from(prod_id, prod_nome):
-    pid=_nz(prod_id)
-    return pid if pid else f"nm:{_strip_accents_low(_nz(prod_nome))}"
 
 # =========================
 # Abas & Headers

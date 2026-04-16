@@ -3,14 +3,10 @@
 # Visual idêntico ao Dashboard e Vendas (Ebenezér Variedades)
 from __future__ import annotations
 
-import hashlib, json, re, unicodedata
 from datetime import date, datetime
 
-import gspread
 import pandas as pd
 import streamlit as st
-from google.oauth2.service_account import Credentials
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
 # ──────────────────────────────────────────────
 #  CONFIG & TEMA
@@ -184,116 +180,30 @@ footer { display: none !important; }
 # ──────────────────────────────────────────────
 #  HELPERS SHEETS
 # ──────────────────────────────────────────────
-def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    return "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
+_fmt_brl = brl
 
-def _load_sa() -> dict:
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    return {**svc, "private_key": _normalize_private_key(svc["private_key"])}
+def _safe_load(aba):
+    return carregar_aba(aba)
 
-@st.cache_resource
-def _conectar():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url = st.secrets.get("PLANILHA_URL", "")
-    if not url: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url) if str(url).startswith("http") else gc.open_by_key(url)
-
-@st.cache_data(ttl=15, show_spinner=False)
-def _carregar(aba: str) -> pd.DataFrame:
-    ws = _conectar().worksheet(aba)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def _safe_load(aba: str) -> pd.DataFrame:
-    try: return _carregar(aba)
-    except Exception: return pd.DataFrame()
-
-def _pick(df: pd.DataFrame, *candidates) -> str | None:
-    for c in candidates:
-        if c in df.columns: return c
-    return None
-
-def _strip_txt(s: str) -> str:
-    """Remove acentos e normaliza pra lowercase."""
-    import unicodedata as _ud
-    s = _ud.normalize("NFKD", str(s or ""))
-    s = "".join(c for c in s if not _ud.combining(c))
-    return s.lower().strip()
-
-def _to_f(x) -> float:
-    """Converte string BR para float preservando sinal negativo — mesma lógica da Contagem."""
-    if x is None: return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"): return 0.0
-    neg = False
-    s = s.replace("−", "-").replace("\u2212", "-")
-    if s.startswith("(") and s.endswith(")"): s = s[1:-1]; neg = True
-    s = s.replace("R$", "").replace(" ", "")
-    if s.startswith("-"): neg = True; s = s[1:]
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.]", "", s)
-    if s.count(".") > 1:
-        p = s.split(".")
-        s = "".join(p[:-1]) + "." + p[-1]
-    try: v = float(s)
-    except: return 0.0
-    return -v if neg else v
-
-def _norm_tipo(t: str) -> str:
-    """Classifica o tipo de movimento — mesma lógica da Contagem Estoque."""
-    raw = str(t or "")
-    low = _strip_txt(raw)
-    if "fracion" in low:
-        return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
-    lowc = re.sub(r"[^a-z]", "", low)
-    if "contagem" in lowc or "inventario" in lowc: return "ajuste"
-    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
-    if "saida"   in lowc or "venda"  in lowc or "baixa"   in lowc: return "saida"
-    if "ajuste"  in lowc: return "ajuste"
-    return "outro"
-
-def _fmt_brl(v: float) -> str:
-    return ("R$ " + f"{v:,.2f}").replace(",","X").replace(".",",").replace("X",".")
-
-def _ensure_ws(name: str, headers: list):
-    sh = _conectar()
-    try:
-        ws = sh.worksheet(name)
-    except Exception:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10, len(headers)))
-        set_with_dataframe(ws, pd.DataFrame(columns=headers),
-                           include_index=False, include_column_header=True, resize=True)
-        return ws
-    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
-    cur.columns = [c.strip() for c in cur.columns]
-    miss = [h for h in headers if h not in cur.columns]
-    if miss:
-        for h in miss: cur[h] = ""
-        ws.clear()
-        set_with_dataframe(ws, cur.fillna(""), include_index=False, include_column_header=True, resize=True)
-    return ws
-
-def _append_row(ws, row: dict):
-    cur = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0)
-    if cur is None or cur.empty:
-        cur = pd.DataFrame(columns=list(row.keys()))
-    for c in cur.columns:
-        row.setdefault(c, "")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
+def _append_row(ws, row):
+    append_rows(ws, [row])
 
 # ──────────────────────────────────────────────
 #  SALDO DE ESTOQUE — mesma lógica da Contagem Estoque

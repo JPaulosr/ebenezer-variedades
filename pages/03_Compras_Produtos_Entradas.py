@@ -4,9 +4,6 @@ from __future__ import annotations
 import json, unicodedata, re, time
 import streamlit as st
 import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
-from google.oauth2.service_account import Credentials
 from datetime import date
 
 # ──────────────────────────────────────────────
@@ -81,127 +78,27 @@ button[kind="primary"] { border-radius:12px !important; font-weight:700 !importa
 """, unsafe_allow_html=True)
 
 
-# ──────────────────────────────────────────────
-#  HELPERS SHEETS
-# ──────────────────────────────────────────────
-def _normalize_private_key(key):
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    return "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
 
-def _load_sa():
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
-
-@st.cache_resource
-def _sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds  = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc     = gspread.authorize(creds)
-    url    = st.secrets.get("PLANILHA_URL")
-    if not url: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url) if str(url).startswith("http") else gc.open_by_key(url)
-
-BUMP = st.session_state.get("_refresh_ts", 0)
-
-@st.cache_data(ttl=60)
-def _load_df(aba, _bump=0):
-    ws = _sheet().worksheet(aba)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df.fillna("")
-
-def _ensure_ws(name, headers=None):
-    headers = headers or []
-    sh = _sheet()
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if headers and (cur.empty or any(h not in cur.columns for h in headers)):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            ws.clear()
-            set_with_dataframe(ws, pd.DataFrame(columns=cols), include_index=False,
-                               include_column_header=True, resize=True)
-        return ws
-    except:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10,len(headers)))
-        if headers:
-            set_with_dataframe(ws, pd.DataFrame(columns=headers), include_index=False,
-                               include_column_header=True, resize=True)
-        return ws
-
-def _append_row(ws, row):
-    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-    for col in cur.columns: row.setdefault(col, "")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
-def _refresh():
-    st.session_state["_refresh_ts"] = time.time()
-    st.cache_data.clear()
-    st.rerun()
-
-def _to_float(x):
-    if x is None: return None
-    # Se já é número (vindo do pandas/sheets como float/int), retorna direto
-    if isinstance(x, (int, float)):
-        import math
-        return None if math.isnan(x) else float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return None
-    s = s.replace("R$","").replace(" ","").replace("\u00A0","")
-    # Formato BR (tem vírgula): remove pontos de milhar, troca vírgula por ponto
-    if "," in s:
-        s = s.replace(".","").replace(",",".")
-    # Formato US / já numérico: mantém o ponto decimal como está
-    s = s.replace("-","") if s.count("-") > 1 else s
-    try: return float(s)
-    except: return None
-
-def _nz(x):
-    if x is None: return ""
-    try:
-        if pd.isna(x): return ""
-    except: pass
-    s = str(x).strip()
-    return "" if s.lower() in ("nan","none") else s
-
-def _brl(v):
-    try: return f"R$ {float(v):,.2f}".replace(",","X").replace(".",",").replace("X",".")
-    except: return "—"
-
-def _pick(df, cands):
-    for c in cands:
-        if c in df.columns: return c
-    return None
-
-# ──────────────────────────────────────────────
-#  TELEGRAM
-# ──────────────────────────────────────────────
-def _tg_on():
-    try: return str(st.secrets.get("TELEGRAM_ENABLED","0")) == "1"
-    except: return False
-
-def _tg_send(msg):
-    if not _tg_on(): return
-    token   = st.secrets.get("TELEGRAM_TOKEN","")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA","") or st.secrets.get("TELEGRAM_CHAT_ID","")
-    if not token or not chat_id: return
-    try:
-        import requests
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id":str(chat_id),"text":msg,"parse_mode":"HTML",
-                  "disable_web_page_preview":True}, timeout=6)
-    except: pass
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
+_to_float = to_num
 
 
-# ──────────────────────────────────────────────
-#  CONSTANTES
-# ──────────────────────────────────────────────
 ABA_PROD = "Produtos"
 ABA_COMP = "Compras"
 ABA_MOVS = "MovimentosEstoque"

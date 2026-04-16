@@ -1,106 +1,36 @@
 # pages/06_fiado.py — Fiado simples para Ebenezér Variedades (com checkbox p/ clientes cadastrados e dedupe)
 # -*- coding: utf-8 -*-
-import json, unicodedata, re, difflib
 from datetime import datetime, date, timedelta
 
 import streamlit as st
 import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe
 from gspread.utils import rowcol_to_a1
-from google.oauth2.service_account import Credentials
 
 # ---- Config UI ----
 st.set_page_config(page_title="Fiado — Ebenezér Variedades", page_icon="💳", layout="wide")
 st.title("💳 Fiado — lançar, quitar e acompanhar")
 
-# =========================
-# Autenticação / Sheets
-# =========================
-def _normalize_private_key(key: str) -> str:
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    # remove controles invisíveis (mantém \n \r \t)
-    key = "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
-    return key
 
-def _load_sa() -> dict:
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None:
-        st.error("🛑 GCP_SERVICE_ACCOUNT ausente no Secrets."); st.stop()
-    if isinstance(svc, str):
-        svc = json.loads(svc)
-    svc = dict(svc)
-    svc["private_key"] = _normalize_private_key(str(svc["private_key"]))
-    return svc
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
+_to_float = to_num
+_fmt_brl = brl
 
-@st.cache_resource
-def conectar_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc = gspread.authorize(creds)
-    url_or_id = st.secrets.get("PLANILHA_URL", "")
-    if not url_or_id:
-        st.error("🛑 PLANILHA_URL ausente no Secrets."); st.stop()
-    return gc.open_by_url(url_or_id) if str(url_or_id).startswith("http") else gc.open_by_key(url_or_id)
-
-# =========================
-# Telegram
-# =========================
-def _tg_enabled() -> bool:
-    try:
-        return str(st.secrets.get("TELEGRAM_ENABLED", "0")) == "1"
-    except Exception:
-        return False
-
-def _tg_conf():
-    token = st.secrets.get("TELEGRAM_TOKEN", "")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA", "") or st.secrets.get("TELEGRAM_CHAT_ID", "")
-    return token, chat_id
-
-def _tg_send(msg: str):
-    if not _tg_enabled(): return
-    token, chat_id = _tg_conf()
-    if not token or not chat_id: return
-    try:
-        import requests
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": str(chat_id), "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        requests.post(url, json=payload, timeout=6)
-    except Exception:
-        pass
-
-# =========================
-# Utils
-# =========================
-def _norm_key(s: str) -> str:
-    return unicodedata.normalize("NFKC", str(s or "")).strip().casefold()
-
-def _strip_accents_lower(s: str) -> str:
-    s = unicodedata.normalize("NFKD", str(s or "").strip())
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    # normaliza espaços internos (ex.: "  Maria  da  Silva " -> "maria da silva")
-    s = " ".join(s.split())
-    return s.casefold()
-
-def _fmt_brl(v) -> str:
-    try:
-        return ("R$ "+f"{float(v):,.2f}").replace(",", "X").replace(".", ",").replace("X",".")
-    except:
-        return "R$ 0,00"
-
-def _to_float(x, default=0.0):
-    if x is None: return default
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return default
-    s = s.replace("R$","").replace(" ","")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.\-]","", s)
-    if s.count(".")>1:
-        parts = s.split("."); s = "".join(parts[:-1]) + "." + parts[-1]
-    try: return float(s)
-    except: return default
 
 # =========================
 # Abas da planilha

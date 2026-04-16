@@ -1,13 +1,9 @@
 # pages/02_Cadastrar_Produto.py — Cadastro/edição de produto (redesenhado)
 # -*- coding: utf-8 -*-
-import json, unicodedata, math, re
 from datetime import datetime, timedelta, date
 
 import streamlit as st
 import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
-from google.oauth2.service_account import Credentials
 import requests
 
 # ──────────────────────────────────────────────
@@ -90,156 +86,25 @@ button[kind="primary"] { border-radius:12px !important; font-weight:700 !importa
 """, unsafe_allow_html=True)
 
 
-# ──────────────────────────────────────────────
-#  HELPERS SHEETS
-# ──────────────────────────────────────────────
-def _normalize_private_key(key):
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    return "".join(ch for ch in key if unicodedata.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
 
-def _load_sa():
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
-
-@st.cache_resource
-def _sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds  = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc     = gspread.authorize(creds)
-    url    = st.secrets.get("PLANILHA_URL")
-    if not url: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url) if str(url).startswith("http") else gc.open_by_key(url)
-
-@st.cache_data
-def _load_df(aba):
-    ws = _sheet().worksheet(aba)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def _safe_load(aba):
-    try: return _load_df(aba)
-    except: return pd.DataFrame()
-
-def _to_float(x):
-    if x is None or str(x).strip() == "": return ""
-    s = str(x).strip().replace("R$","").replace(".","").replace(",",".")
-    try: return float(s)
-    except: return ""
-
-def _to_int(x):
-    if x is None or str(x).strip() == "": return ""
-    try: return int(float(str(x).strip().replace(",",".")))
-    except: return ""
-
-def _gen_id(): return "P-" + datetime.now().strftime("%Y%m%d%H%M%S")
-
-def _msg_ok(msg):
-    st.success(msg)
-    try: st.cache_data.clear()
-    except: pass
-
-def _ensure_ws(name, headers):
-    sh = _sheet()
-    try:
-        ws = sh.worksheet(name)
-        cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-        if cur.empty or any(h not in cur.columns for h in headers):
-            cols = list(dict.fromkeys(headers + cur.columns.tolist()))
-            ws.clear()
-            set_with_dataframe(ws, pd.DataFrame(columns=cols), include_index=False,
-                               include_column_header=True, resize=True)
-        return ws
-    except:
-        ws = sh.add_worksheet(title=name, rows=2, cols=max(10,len(headers)))
-        set_with_dataframe(ws, pd.DataFrame(columns=headers), include_index=False,
-                           include_column_header=True, resize=True)
-        return ws
-
-def _append_row(ws, row):
-    cur = get_as_dataframe(ws, evaluate_formulas=False, header=0)
-    for col in cur.columns: row.setdefault(col,"")
-    out = pd.concat([cur, pd.DataFrame([row])], ignore_index=True)
-    ws.clear()
-    set_with_dataframe(ws, out.fillna(""), include_index=False, include_column_header=True, resize=True)
-
-
-# ──────────────────────────────────────────────
-#  TELEGRAM
-# ──────────────────────────────────────────────
-def _tg_on():
-    try: return str(st.secrets.get("TELEGRAM_ENABLED","0")) == "1"
-    except: return False
-
-def _tg_send(msg):
-    if not _tg_on(): return
-    token   = st.secrets.get("TELEGRAM_TOKEN","")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID_LOJINHA","") or st.secrets.get("TELEGRAM_CHAT_ID","")
-    if not token or not chat_id: return
-    try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id":str(chat_id),"text":msg,"parse_mode":"HTML",
-              "disable_web_page_preview":True}, timeout=6)
-    except: pass
-
-
-# ──────────────────────────────────────────────
-#  MAPEAMENTO DE COLUNAS
-# ──────────────────────────────────────────────
-def _pick(df, cands):
-    for c in cands:
-        if c in df.columns: return c
-    low = {c.lower(): c for c in df.columns}
-    for c in cands:
-        if c.lower() in low: return low[c.lower()]
-    return None
-
-def _map_prod(df):
-    return {
-        "id":        _pick(df, ["ID","Id","Codigo","Código"]),
-        "nome":      _pick(df, ["Nome","Produto","Descrição","Descricao"]),
-        "categoria": _pick(df, ["Categoria","Grupo"]),
-        "unidade":   _pick(df, ["Unidade","Unid"]),
-        "forn":      _pick(df, ["Fornecedor","FornecedorNome"]),
-        "custo":     _pick(df, ["CustoAtual","Custo","CustoMedio"]),
-        "preco":     _pick(df, ["PreçoVenda","PrecoVenda","Preço","Valor"]),
-        "estoque":   _pick(df, ["EstoqueAtual","Estoque","QtdEstoque"]),
-        "est_min":   _pick(df, ["EstoqueMin","Estoque Min","Minimo"]),
-        "lead":      _pick(df, ["LeadTimeDias","LeadTime","Lead Time"]),
-        "ativo":     _pick(df, ["Ativo?","Ativo","Status"]),
-        "foto":      _pick(df, ["Foto","Imagem","URLImagem","ImagemURL"]),
-        "atualizado":_pick(df, ["AtualizadoEm","Atualizado Em","Atualizado"]),
-    }
-
-def _map_comp(df):
-    return {
-        "data": _pick(df, ["Data"]), "nome": _pick(df, ["Produto","Nome"]),
-        "unid": _pick(df, ["Unidade"]), "forn": _pick(df, ["Fornecedor"]),
-        "qtd":  _pick(df, ["Qtd","Quantidade"]),
-        "cu":   _pick(df, ["Custo Unitário","CustoUnit","Custo"]),
-        "total":_pick(df, ["Total","ValorTotal"]),
-        "id":   _pick(df, ["IDProduto","ID"]),
-    }
-
-def _map_mov(df):
-    return {
-        "data": _pick(df, ["Data"]), "id": _pick(df, ["IDProduto","ID"]),
-        "nome": _pick(df, ["Produto","Nome"]),
-        "tipo": _pick(df, ["Tipo","Movimento"]), "qtd": _pick(df, ["Qtd","Quantidade"]),
-    }
-
-def _map_ven(df):
-    return {
-        "data": _pick(df, ["Data"]), "id": _pick(df, ["IDProduto","ID"]),
-        "nome": _pick(df, ["Produto","Nome"]), "qtd": _pick(df, ["Qtd","Quantidade"]),
-    }
-
-def _map_forn(df):
-    return {"forn": _pick(df, ["Fornecedor","Nome"]),
-            "lead": _pick(df, ["LeadTimeDias","Lead Time","Lead"])}
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
+_to_float = to_num
 
 
 # ──────────────────────────────────────────────

@@ -196,6 +196,7 @@ _tg_media = tg_media
 _gerar_id = gerar_id
 _parse_date = parse_date
 conectar_sheets = sheet
+_fmt_brl = brl
 
 
 # =========================

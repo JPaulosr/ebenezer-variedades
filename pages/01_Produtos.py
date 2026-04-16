@@ -1,11 +1,7 @@
 # pages/01_Produtos.py — Catálogo de Produtos (redesenhado)
 # -*- coding: utf-8 -*-
-import json, unicodedata as _ud, re
 import streamlit as st
 import pandas as pd
-import gspread
-from gspread_dataframe import get_as_dataframe
-from google.oauth2.service_account import Credentials
 from streamlit.components.v1 import html as sthtml
 
 # ──────────────────────────────────────────────
@@ -54,99 +50,24 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 """, unsafe_allow_html=True)
 
 
-# ──────────────────────────────────────────────
-#  HELPERS
-# ──────────────────────────────────────────────
-def _normalize_private_key(key):
-    if not isinstance(key, str): return key
-    key = key.replace("\\n", "\n")
-    return "".join(ch for ch in key if _ud.category(ch)[0] != "C" or ch in ("\n","\r","\t"))
 
-def _load_sa():
-    svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    if svc is None: st.error("🛑 GCP_SERVICE_ACCOUNT ausente."); st.stop()
-    if isinstance(svc, str): svc = json.loads(svc)
-    svc = dict(svc); svc["private_key"] = _normalize_private_key(svc["private_key"])
-    return svc
-
-@st.cache_resource
-def _sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds  = Credentials.from_service_account_info(_load_sa(), scopes=scopes)
-    gc     = gspread.authorize(creds)
-    url    = st.secrets.get("PLANILHA_URL")
-    if not url: st.error("🛑 PLANILHA_URL ausente."); st.stop()
-    return gc.open_by_url(url) if str(url).startswith("http") else gc.open_by_key(url)
-
-@st.cache_data(ttl=10, show_spinner=False)
-def carregar_aba(nome):
-    ws = _sheet().worksheet(nome)
-    df = get_as_dataframe(ws, evaluate_formulas=True, dtype=str, header=0).dropna(how="all")
-    df.columns = [c.strip() for c in df.columns]
-    return df.fillna("")
-
-def _first_col(df, cands):
-    for c in cands:
-        if c in df.columns: return c
-    lower = {c.lower(): c for c in df.columns}
-    for c in cands:
-        if c.lower() in lower: return lower[c.lower()]
-    return None
-
-def _to_num(x):
-    if x is None: return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan","none"): return 0.0
-    s = s.replace("−","-")
-    neg = False
-    if s.startswith("(") and s.endswith(")"): s = s[1:-1]; neg = True
-    s = s.replace("R$","").replace(" ","")
-    if "," in s: s = s.replace(".","").replace(",",".")
-    s = re.sub(r"(?<!^)-","",s); s = re.sub(r"[^0-9.\-]","",s)
-    if s.count("-") > 1: s = "-" + s.replace("-","")
-    if s.count(".") > 1:
-        p = s.split("."); s = "".join(p[:-1]) + "." + p[-1]
-    try: v = float(s)
-    except: v = 0.0
-    return -abs(v) if neg else v
-
-def _nz(x):
-    if x is None: return ""
-    try:
-        if pd.isna(x): return ""
-    except: pass
-    s = str(x).strip()
-    return "" if s.lower() in ("nan","none") else s
-
-def _strip_low(s):
-    s = _ud.normalize("NFKD", str(s or ""))
-    return "".join(ch for ch in s if _ud.category(ch) != "Mn").lower().strip()
-
-def _norm_tipo(t):
-    raw = str(t or ""); low = _strip_low(raw)
-    if "fracion" in low: return "entrada" if "+" in raw else "saida" if "-" in raw else "outro"
-    lowc = re.sub(r"[^a-z]","",low)
-    if "entrada" in lowc or "compra" in lowc or "estorno" in lowc: return "entrada"
-    if "saida" in lowc or "venda" in lowc or "baixa" in lowc: return "saida"
-    if "ajuste" in lowc or "contagem" in lowc or "inventario" in lowc: return "ajuste"
-    return "outro"
-
-def _prod_key(pid, pnome):
-    p = _nz(pid)
-    return p if p else f"nm:{_strip_low(_nz(pnome))}"
-
-def _brl(v):
-    try:
-        f = float(v)
-        s = f"{abs(f):,.2f}".replace(",","X").replace(".",",").replace("X",".")
-        return ("-R$ " if f < 0 else "R$ ") + s
-    except: return "R$ 0,00"
-
-def _fmt_num(v):
-    try:
-        f = float(v)
-        return str(int(round(f))) if abs(f - round(f)) < 1e-9 else f"{f:.2f}".rstrip("0").rstrip(".")
-    except: return str(v)
+from utils.sheets import (
+    sheet, carregar_aba, garantir_aba, append_rows,
+    to_num, brl, safe_cost, first_col, fmt_num,
+    norm_tipo_mov, calcular_estoque,
+    tg_send, tg_media, gerar_id, parse_date,
+    ABA_PROD, ABA_VEND, ABA_COMP, ABA_MOVS, ABA_CLIEN, ABA_FIADO, ABA_FPAGT,
+)
+# Aliases para compatibilidade com código existente
+_to_num = to_num
+_brl = brl
+_first_col = first_col
+_fmt_num = fmt_num
+_tg_send = tg_send
+_tg_media = tg_media
+_gerar_id = gerar_id
+_parse_date = parse_date
+conectar_sheets = sheet
 
 
 # ──────────────────────────────────────────────
