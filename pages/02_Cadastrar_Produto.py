@@ -136,6 +136,43 @@ ABA_MOVS = "MovimentosEstoque"
 
 COMPRAS_HDR = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
 MOV_HDR     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"]
+PROD_HDR    = ["ID","Nome","Unidade","Fornecedor","Categoria","CustoAtual","PrecoVenda","EstoqueMinimo","Foto","Obs","Ativo","DataCadastro"]
+
+def _ensure_header_cols(ws, desired_cols: list[str]) -> list[str]:
+    try:
+        header = [str(c).strip() for c in ws.row_values(1) if str(c).strip()]
+    except Exception:
+        header = []
+    if not header:
+        ws.update("A1", [desired_cols])
+        return desired_cols
+    faltantes = [c for c in desired_cols if c not in header]
+    if faltantes:
+        header = header + faltantes
+        ws.update("A1", [header])
+    return header
+
+def _header_like(headers: list[str], candidates: list[str], default: str) -> str:
+    mapa = {str(h).strip().lower(): str(h).strip() for h in headers if str(h).strip()}
+    for c in candidates:
+        k = str(c).strip().lower()
+        if k in mapa:
+            return mapa[k]
+    for c in candidates:
+        k = str(c).strip().lower()
+        for hk, hv in mapa.items():
+            if hk.endswith(k) or k in hk:
+                return hv
+    return default
+
+def _norm_prod_key(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s or "").strip())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^0-9a-zA-Z]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+def _novo_prod_id() -> str:
+    return f"PROD-{time.strftime('%Y%m%d%H%M%S')}-{str(int(time.time() * 1000))[-4:]}"
 
 # ──────────────────────────────────────────────
 #  CARREGAR DADOS
@@ -230,9 +267,136 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Tabs principais
-aba_compra, aba_frac, aba_corrigir = st.tabs([
-    "📥 Nova compra", "🧪 Fracionar granel", "🛠️ Corrigir lançamento"
+aba_cadastro, aba_compra, aba_frac, aba_corrigir = st.tabs([
+    "🆕 Cadastrar produto", "📥 Nova compra", "🧪 Fracionar granel", "🛠️ Corrigir lançamento"
 ])
+
+
+# ══════════════════════════════════════════════
+#  ABA 0 — CADASTRAR PRODUTO
+# ══════════════════════════════════════════════
+with aba_cadastro:
+    st.markdown('<div class="sec-titulo">🆕 Cadastrar novo produto</div>', unsafe_allow_html=True)
+    st.info("Cadastre o produto aqui. Depois ele aparece na aba Nova compra para registrar entradas futuras.")
+
+    with st.form("form_cadastrar_produto", clear_on_submit=True):
+        p1, p2, p3 = st.columns([1.4, 1, 1])
+        with p1:
+            nome_novo = st.text_input("🏷️ Nome do produto", placeholder="Ex: ALTO MOTIVO KIT 4 EM 1")
+            fornecedor_novo = st.text_input("🚚 Fornecedor", placeholder="Ex: CAMPINEIRA")
+            foto_novo = st.text_input("🖼️ URL da foto (opcional)", placeholder="https://...")
+        with p2:
+            unidades_opt_cad = ["un", "L", "kg", "g", "ml", "cx", "pct", "Outro…"]
+            unid_cad_sel = st.selectbox("📏 Unidade", unidades_opt_cad, index=0, key="cad_unidade")
+            unid_cad_out = ""
+            if unid_cad_sel == "Outro…":
+                unid_cad_out = st.text_input("Qual unidade?", placeholder="Ex: rolo, par")
+            categoria_nova = st.text_input("📂 Categoria (opcional)", placeholder="Ex: Cosméticos")
+            estoque_min = st.number_input("⚠️ Estoque mínimo", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+        with p3:
+            custo_atual = st.number_input("💰 Custo atual/unitário (R$)", min_value=0.0, value=0.0, step=0.10, format="%.2f")
+            preco_venda = st.number_input("🏷️ Preço de venda (R$) opcional", min_value=0.0, value=0.0, step=0.10, format="%.2f")
+            qtd_inicial = st.number_input("📦 Estoque inicial/entrada agora", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+
+        obs_prod = st.text_input("💬 Observações (opcional)")
+        cadastrar_prod = st.form_submit_button("✅ Cadastrar produto", type="primary", use_container_width=True)
+
+    if cadastrar_prod:
+        nome_limpo = str(nome_novo or "").strip()
+        fornecedor_limpo = str(fornecedor_novo or "").strip()
+        unid_final_cad = str(unid_cad_out or "").strip() if unid_cad_sel == "Outro…" else unid_cad_sel
+
+        if not nome_limpo:
+            st.error("Informe o nome do produto."); st.stop()
+        if not unid_final_cad:
+            st.error("Informe a unidade do produto."); st.stop()
+        if qtd_inicial > 0 and custo_atual <= 0:
+            st.error("Para registrar estoque inicial, informe o custo unitário."); st.stop()
+
+        try:
+            nome_key = _norm_prod_key(nome_limpo)
+            forn_key = _norm_prod_key(fornecedor_limpo)
+            if prod_df is not None and not prod_df.empty and COL_NOME:
+                df_dup = prod_df.copy()
+                df_dup["__nome_key"] = df_dup[COL_NOME].astype(str).map(_norm_prod_key)
+                if COL_FORN:
+                    df_dup["__forn_key"] = df_dup[COL_FORN].astype(str).map(_norm_prod_key)
+                    existe = df_dup[(df_dup["__nome_key"] == nome_key) & (df_dup["__forn_key"] == forn_key)]
+                else:
+                    existe = df_dup[df_dup["__nome_key"] == nome_key]
+                if not existe.empty:
+                    st.error("Produto já cadastrado com esse nome/fornecedor. Use a aba Nova compra para registrar entrada.")
+                    st.stop()
+
+            ws_p = _ensure_ws(ABA_PROD, PROD_HDR)
+            headers_p = _ensure_header_cols(ws_p, PROD_HDR)
+
+            col_id_p = _header_like(headers_p, ["ID", "Codigo", "Código", "SKU", "IDProduto"], "ID")
+            col_nome_p = _header_like(headers_p, ["Nome", "Produto", "Descrição", "Descricao"], "Nome")
+            col_unid_p = _header_like(headers_p, ["Unidade", "Unid", "Und"], "Unidade")
+            col_forn_p = _header_like(headers_p, ["Fornecedor", "FornecedorNome"], "Fornecedor")
+            col_foto_p = _header_like(headers_p, ["Foto", "Imagem", "URLImagem"], "Foto")
+            col_cat_p = _header_like(headers_p, ["Categoria", "Grupo"], "Categoria")
+            col_custo_p = _header_like(headers_p, ["CustoAtual", "Custo Atual", "Custo", "CustoUnit"], "CustoAtual")
+            col_preco_p = _header_like(headers_p, ["PrecoVenda", "Preço Venda", "Preco Venda", "Preço", "Preco"], "PrecoVenda")
+            col_estmin_p = _header_like(headers_p, ["EstoqueMinimo", "Estoque Mínimo", "EstoqueMin"], "EstoqueMinimo")
+            col_obs_p = _header_like(headers_p, ["Obs", "Observação", "Observacao"], "Obs")
+            col_ativo_p = _header_like(headers_p, ["Ativo", "Status"], "Ativo")
+            col_dt_p = _header_like(headers_p, ["DataCadastro", "Data Cadastro", "CriadoEm"], "DataCadastro")
+
+            produto_id_novo = _novo_prod_id()
+            row_prod = {
+                col_id_p: produto_id_novo,
+                col_nome_p: nome_limpo.upper(),
+                col_unid_p: unid_final_cad,
+                col_forn_p: fornecedor_limpo.upper(),
+                col_cat_p: categoria_nova.strip(),
+                col_custo_p: f"{float(custo_atual):.2f}".replace(".", ",") if custo_atual > 0 else "",
+                col_preco_p: f"{float(preco_venda):.2f}".replace(".", ",") if preco_venda > 0 else "",
+                col_estmin_p: str(int(estoque_min)) if estoque_min == int(estoque_min) else f"{estoque_min:.2f}".replace(".", ","),
+                col_foto_p: foto_novo.strip(),
+                col_obs_p: obs_prod.strip(),
+                col_ativo_p: "Sim",
+                col_dt_p: date.today().strftime("%d/%m/%Y"),
+            }
+            _append_row(ws_p, row_prod)
+
+            if qtd_inicial > 0:
+                ws_c = _ensure_ws(ABA_COMP, COMPRAS_HDR)
+                ws_m = _ensure_ws(ABA_MOVS, MOV_HDR)
+                data_str = date.today().strftime("%d/%m/%Y")
+                qtd_str = str(int(qtd_inicial)) if qtd_inicial == int(qtd_inicial) else f"{qtd_inicial:.3f}".replace(".", ",")
+                total = round(float(qtd_inicial) * float(custo_atual), 2)
+                _append_row(ws_c, {
+                    "Data": data_str, "Produto": nome_limpo.upper(), "Unidade": unid_final_cad,
+                    "Fornecedor": fornecedor_limpo.upper(), "Qtd": qtd_str,
+                    "Custo Unitário": f"{float(custo_atual):.2f}".replace(".", ","),
+                    "Total": f"{total:.2f}".replace(".", ","),
+                    "IDProduto": produto_id_novo,
+                    "Obs": "Cadastro inicial" + ((" — " + obs_prod.strip()) if obs_prod.strip() else "")
+                })
+                _append_row(ws_m, {
+                    "Data": data_str, "IDProduto": produto_id_novo, "Produto": nome_limpo.upper(),
+                    "Tipo": "B entrada", "Qtd": qtd_str,
+                    "Obs": "Entrada inicial no cadastro",
+                    "ID": "", "Documento/NF": "", "Origem": "Cadastro de Produto",
+                    "SaldoApós": qtd_str
+                })
+
+            try:
+                msg = f"🆕 <b>Produto cadastrado</b>\nProduto: <b>{nome_limpo.upper()}</b>\nUnidade: {unid_final_cad}"
+                if fornecedor_limpo:
+                    msg += f"\nFornecedor: {fornecedor_limpo.upper()}"
+                if qtd_inicial > 0:
+                    msg += f"\n📦 Entrada inicial: <b>{qtd_str} {unid_final_cad}</b> · Custo {_brl(custo_atual)}"
+                _tg_send(msg)
+            except Exception:
+                pass
+
+            st.success(f"✅ Produto cadastrado: {nome_limpo.upper()}")
+            _refresh()
+        except Exception as e:
+            st.error(f"Erro ao cadastrar produto: {e}")
 
 
 # ══════════════════════════════════════════════
