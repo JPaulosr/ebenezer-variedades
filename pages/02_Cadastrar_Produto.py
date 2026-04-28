@@ -136,7 +136,27 @@ ABA_MOVS = "MovimentosEstoque"
 
 COMPRAS_HDR = ["Data","Produto","Unidade","Fornecedor","Qtd","Custo Unitário","Total","IDProduto","Obs"]
 MOV_HDR     = ["Data","IDProduto","Produto","Tipo","Qtd","Obs","ID","Documento/NF","Origem","SaldoApós"]
-PROD_HDR    = ["ID","Nome","Unidade","Fornecedor","Categoria","CustoAtual","PrecoVenda","EstoqueMinimo","Foto","Obs","Ativo","DataCadastro"]
+# Cabeçalho compatível com a base atual da aba Produtos.
+# Importante: a base antiga usa PreçoVenda, EstoqueMin e Ativo?.
+# Não usar PrecoVenda/EstoqueMinimo/Ativo aqui, senão o código cria colunas duplicadas.
+PROD_HDR    = ["ID","Nome","Categoria","Unidade","Fornecedor","PreçoVenda","EstoqueMin","LeadTimeDias","Ativo?","EstoqueCalc","CustoMedio","Foto","CustoAtual","Obs","DataCadastro"]
+
+def _header_key(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s or "").strip())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^0-9a-zA-Z]+", "", s).lower()
+    aliases = {
+        "precovenda": "precovenda",
+        "preco": "precovenda",
+        "precodevenda": "precovenda",
+        "estoqueminimo": "estoquemin",
+        "estoquemin": "estoquemin",
+        "ativop": "ativo",
+        "ativo": "ativo",
+        "datacadastro": "datacadastro",
+        "criadoem": "datacadastro",
+    }
+    return aliases.get(s, s)
 
 def _ensure_header_cols(ws, desired_cols: list[str]) -> list[str]:
     try:
@@ -146,23 +166,36 @@ def _ensure_header_cols(ws, desired_cols: list[str]) -> list[str]:
     if not header:
         ws.update("A1", [desired_cols])
         return desired_cols
-    faltantes = [c for c in desired_cols if c not in header]
+
+    # Não cria coluna nova se já existir uma coluna equivalente.
+    # Ex.: se já existe "PreçoVenda", não cria "PrecoVenda";
+    # se já existe "EstoqueMin", não cria "EstoqueMinimo";
+    # se já existe "Ativo?", não cria "Ativo".
+    keys_existentes = {_header_key(c) for c in header}
+    faltantes = [c for c in desired_cols if _header_key(c) not in keys_existentes]
     if faltantes:
         header = header + faltantes
         ws.update("A1", [header])
     return header
 
 def _header_like(headers: list[str], candidates: list[str], default: str) -> str:
-    mapa = {str(h).strip().lower(): str(h).strip() for h in headers if str(h).strip()}
+    # Guarda a primeira ocorrência equivalente para preferir a coluna antiga/correta
+    # quando a planilha já tem duplicatas lógicas.
+    mapa = {}
+    for h in headers:
+        h_limpo = str(h).strip()
+        if not h_limpo:
+            continue
+        mapa.setdefault(_header_key(h_limpo), h_limpo)
+
     for c in candidates:
-        k = str(c).strip().lower()
+        k = _header_key(c)
         if k in mapa:
             return mapa[k]
-    for c in candidates:
-        k = str(c).strip().lower()
-        for hk, hv in mapa.items():
-            if hk.endswith(k) or k in hk:
-                return hv
+
+    default_key = _header_key(default)
+    if default_key in mapa:
+        return mapa[default_key]
     return default
 
 def _norm_prod_key(s: str) -> str:
@@ -338,10 +371,10 @@ with aba_cadastro:
             col_foto_p = _header_like(headers_p, ["Foto", "Imagem", "URLImagem"], "Foto")
             col_cat_p = _header_like(headers_p, ["Categoria", "Grupo"], "Categoria")
             col_custo_p = _header_like(headers_p, ["CustoAtual", "Custo Atual", "Custo", "CustoUnit"], "CustoAtual")
-            col_preco_p = _header_like(headers_p, ["PrecoVenda", "Preço Venda", "Preco Venda", "Preço", "Preco"], "PrecoVenda")
-            col_estmin_p = _header_like(headers_p, ["EstoqueMinimo", "Estoque Mínimo", "EstoqueMin"], "EstoqueMinimo")
+            col_preco_p = _header_like(headers_p, ["PreçoVenda", "PrecoVenda", "Preço Venda", "Preco Venda", "Preço", "Preco"], "PreçoVenda")
+            col_estmin_p = _header_like(headers_p, ["EstoqueMin", "EstoqueMinimo", "Estoque Mínimo", "Estoque Minimo"], "EstoqueMin")
             col_obs_p = _header_like(headers_p, ["Obs", "Observação", "Observacao"], "Obs")
-            col_ativo_p = _header_like(headers_p, ["Ativo", "Status"], "Ativo")
+            col_ativo_p = _header_like(headers_p, ["Ativo?", "Ativo", "Status"], "Ativo?")
             col_dt_p = _header_like(headers_p, ["DataCadastro", "Data Cadastro", "CriadoEm"], "DataCadastro")
 
             produto_id_novo = _novo_prod_id()
@@ -356,7 +389,7 @@ with aba_cadastro:
                 col_estmin_p: str(int(estoque_min)) if estoque_min == int(estoque_min) else f"{estoque_min:.2f}".replace(".", ","),
                 col_foto_p: foto_novo.strip(),
                 col_obs_p: obs_prod.strip(),
-                col_ativo_p: "Sim",
+                col_ativo_p: "sim",
                 col_dt_p: date.today().strftime("%d/%m/%Y"),
             }
             _append_row(ws_p, row_prod)
